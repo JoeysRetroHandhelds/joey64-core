@@ -40,10 +40,17 @@ extern const uint16_t shuffle_keys[16][8];
 
 static inline __m128i rsp_vect_load_and_shuffle_operand(const uint16_t *src, unsigned element)
 {
+#if defined(__aarch64__) && !defined(RSP_NO_NATIVE_NEON)
+	// The keys are all in range, so skip the index masking SSE2NEON's _mm_shuffle_epi8 does.
+	uint8x16_t operand = vld1q_u8(reinterpret_cast<const uint8_t *>(src));
+	uint8x16_t key = vld1q_u8(reinterpret_cast<const uint8_t *>(shuffle_keys[element]));
+	return vreinterpretq_s32_u8(vqtbl1q_u8(operand, key));
+#else
 	__m128i operand = _mm_load_si128((__m128i *)src);
 	__m128i key = _mm_load_si128((__m128i *)shuffle_keys[element]);
 
 	return _mm_shuffle_epi8(operand, key);
+#endif
 }
 #else
 __m128i rsp_vect_load_and_shuffle_operand(const uint16_t *src, unsigned element);

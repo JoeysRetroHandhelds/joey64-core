@@ -5,6 +5,9 @@
 // 'LICENSE', which is part of this source code package.
 //
 
+#if defined(__aarch64__) && !defined(RSP_NO_NATIVE_NEON)
+#include "neon_mul.h"
+#else
 template <bool VMADH>
 static inline __m128i rsp_vmadh_vmudh(__m128i vs, __m128i vt, __m128i zero, __m128i *acc_lo, __m128i *acc_md,
                                       __m128i *acc_hi)
@@ -39,3 +42,4 @@ static inline __m128i rsp_vmadh_vmudh(__m128i vs, __m128i vt, __m128i zero, __m1
 
 	return rsp_sclamp_acc_tomd(*acc_md, *acc_hi);
 }
+#endif
