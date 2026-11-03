@@ -60,7 +60,7 @@ static const
 std::vector<SpecialMicrocodeInfo> specialMicrocodes =
 {
     { S2DEX2,       false,  true,   false,  true,   0x02c399dd }, // Animal Forest
-    { F3DEX095,     false,  false,  true,   true,   0x0ace4c3f }, // Mario Kart 64
+    { F3DEX095,     false,  false,  true,   true,   0x0ace4c3f }, // Mario Kart 64, F3DEX 0.95
     { F3D,          true,   false,  false,  true,   0x16c3a775 }, // AeroFighters
     { F3DEX2CBFD,   true,   true,   false,  true,   0x1b4ace88 }, // Conker's Bad Fur Day
     { F3DPD,        true,   true,   false,  true,   0x1c4f7869 }, // Perfect Dark
@@ -95,7 +95,8 @@ std::vector<SpecialMicrocodeInfo> specialMicrocodes =
     { F3D,          false,  false,  false,  true,   0xe01e14be }, // Eikou no Saint Andrews
     { F3DEX2ACCLAIM,true,   true,   false,  true,   0xe44df568 }, // Acclaim games: Turok2 & 3, Armories and South park
     { F3D,          false,  true,   false,  true,   0xe62a706d }, // Fast3D
-    { F3D,          false,  true,   false,  false,  0xfff0637d }, // Caribbean Nights
+	{ F3DEX095,     false,  false,  true,   true,   0xf89248e1 }, // Mario Kart 64, F3DLX 0.95
+	{ F3D,          false,  true,   false,  false,  0xfff0637d }, // Caribbean Nights
 };
 
 u32 G_RDPHALF_1, G_RDPHALF_2, G_RDPHALF_CONT;
@@ -138,6 +139,9 @@ u32 G_CULL_FRONT;
 u32 G_CULL_BACK;
 u32 G_CULL_BOTH;
 u32 G_CLIPPING;
+
+u32 G_ATTROFFSET_ST_ENABLE;
+u32 G_AMBOCCLUSION;
 
 u32 G_MV_VIEWPORT;
 
@@ -203,7 +207,7 @@ void GBIInfo::_makeCurrent(MicrocodeInfo * _pCurrent)
 
 		RDP_Init();
 
-		G_TRI1 = G_TRI2 = G_TRIX = G_QUAD = -1; // For correct work of gSPFlushTriangles()
+		G_TRI1 = G_TRI2 = G_TRIX = G_QUAD = G_TRISTRIP = G_TRIFAN = -1; // For correct work of gSPFlushTriangles()
 		gSP.clipRatio = 1U;
 
 		switch (m_pCurrent->type) {
@@ -432,25 +436,34 @@ void GBIInfo::loadMicrocode(u32 uc_start, u32 uc_dstart, u16 uc_dsize)
 			current.fast3DPersp = false;
 			current.combineMatrices = false;
 
+			u8 version = 0;
 			std::set<std::string> features;
 			{
 				// 0x180 is absolutely an overkill but it is ok for now
 				const char* name_end = (const char*)memchr(probe, ' ', 0x180);
 				size_t name_len = name_end - probe;
-				// It will look like F3DEX3_LVP_BrZ_NOC
+				// It will look like F3DEX3_LVP_BrZ_NOC_B
 				std::string feature;
 				std::string name = std::string(probe, name_len);
 				std::transform(name.begin(), name.end(), name.begin(), ascii_tolower);
 				std::stringstream name_stream(name);
 				while (std::getline(name_stream, feature, '_'))
 				{
-					features.emplace(std::move(feature));
+					if (feature.size() == 1)
+					{
+						version = feature[0] - 'a';
+					}
+					else
+					{
+						features.emplace(std::move(feature));
+					}
 				}
 			}
 
 			current.f3dex3.legacyVertexPipeline = features.find("lvp") != features.end();
 			current.f3dex3.noOcclusionPlane = features.find("noc") != features.end();
 			current.f3dex3.branchOnZ = features.find("brz") != features.end();
+			current.f3dex3.version = version;
 
 			LOG(LOG_VERBOSE, "Load microcode (%s) type: %d crc: 0x%08x romname: %s\n", uc_str, current.type, uc_crc, RSP.romname);
 			_makeCurrent(&current);

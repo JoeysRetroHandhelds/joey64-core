@@ -34,6 +34,7 @@ void _loadSettings(QSettings & settings)
 	config.video.fxaa= settings.value("fxaa", config.video.fxaa).toInt();
 	config.video.verticalSync = settings.value("verticalSync", config.video.verticalSync).toInt();
 	config.video.threadedVideo = settings.value("threadedVideo", config.video.threadedVideo).toInt();
+	config.video.asyncShaderCompilation = settings.value("asyncShaderCompilation", config.video.asyncShaderCompilation).toInt();
 	QString deviceName = QString::fromWCharArray(config.video.deviceName);
 	config.video.deviceName[settings.value("deviceName", deviceName).toString().toWCharArray(config.video.deviceName)] = L'\0';
 	settings.endGroup();
@@ -58,6 +59,7 @@ void _loadSettings(QSettings & settings)
 	config.generalEmulation.enableLegacyBlending = settings.value("enableLegacyBlending", config.generalEmulation.enableLegacyBlending).toInt();			 //ini only
 	config.generalEmulation.enableHybridFilter = settings.value("enableHybridFilter", config.generalEmulation.enableHybridFilter).toInt();					 //ini only
 	config.generalEmulation.enableFragmentDepthWrite = settings.value("enableFragmentDepthWrite", config.generalEmulation.enableFragmentDepthWrite).toInt(); //ini only
+	config.generalEmulation.hacks |= settings.value("hacks", config.generalEmulation.hacks).toInt();														 //ini only
 	config.generalEmulation.enableCustomSettings = settings.value("enableCustomSettings", config.generalEmulation.enableCustomSettings).toInt();
 	settings.endGroup();
 
@@ -185,6 +187,7 @@ void _writeSettingsToFile(const QString & filename)
 	settings.setValue("fxaa", config.video.fxaa);
 	settings.setValue("verticalSync", config.video.verticalSync);
 	settings.setValue("threadedVideo", config.video.threadedVideo);
+	settings.setValue("asyncShaderCompilation", config.video.asyncShaderCompilation);
 	settings.setValue("deviceName", QString::fromWCharArray(config.video.deviceName));
 	settings.endGroup();
 

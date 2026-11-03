@@ -31,6 +31,11 @@ void Config::resetToDefaults()
 	video.deviceName[0] = L'\0';
 
 	video.threadedVideo = 0;
+#if defined(OS_ANDROID)
+	video.asyncShaderCompilation = 1;
+#else
+	video.asyncShaderCompilation = 0;
+#endif
 
 	texture.anisotropy = 0;
 	texture.maxAnisotropy = 0;

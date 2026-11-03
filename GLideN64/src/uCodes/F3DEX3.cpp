@@ -5,18 +5,22 @@
 #include "F3DZEX2.h"
 #include "F3DEX3.h"
 #include "gSP.h"
+#include "RSP.h"
 
 #define	F3DEX3_BRANCH_WZ	0x04
+
+#define F3DEX3_MEMSET            0xD5
 
 #define F3DEX3_TRISTRIP          0x08
 #define F3DEX3_TRIFAN            0x09
 #define F3DEX3_LIGHTTORDP        0x0A
 #define F3DEX3_RELSEGMENT        0x0B
 
+#define F3DEX3_B_TRISNAKE        0x08
+#define F3DEX3_B_TRI_NOOP        0x09
+
 #define F3DEX3_G_MW_FX		     0x00
 #define F3DEX3_G_MW_LIGHTCOL     0x0A
-
-#define F3DEX3_G_MV_MMTX 2
 
 #define F3DEX3_G_MW_HALFWORD_FLAG 0x8000
 
@@ -28,14 +32,39 @@
 #define F3DEX3_G_MWO_FRESNEL_OFFSET     0x0E
 #define F3DEX3_G_MWO_ATTR_OFFSET_S      0x10
 #define F3DEX3_G_MWO_ATTR_OFFSET_T      0x12
-#define F3DEX3_G_MWO_ATTR_OFFSET_Z      0x14
-#define F3DEX3_G_MWO_ALPHA_COMPARE_CULL 0x16
-#define F3DEX3_G_MWO_NORMALS_MODE       0x18
-#define F3DEX3_G_MWO_LAST_MAT_DL_ADDR   0x1A
+
+#define F3DEX3_A_G_MWO_ATTR_OFFSET_Z      0x14
+#define F3DEX3_A_G_MWO_ALPHA_COMPARE_CULL 0x16
+#define F3DEX3_A_G_MWO_NORMALS_MODE       0x18
+#define F3DEX3_A_G_MWO_LAST_MAT_DL_ADDR   0x1A
+
+#define F3DEX3_B_G_MWO_ALPHA_COMPARE_CULL 0x14
+#define F3DEX3_B_G_MWO_LAST_MAT_DL_ADDR   0x16
 
 #define F3DEX3_G_MAX_LIGHTS 9
 
-// Notice how it looks like Light but the ending so there are 8 bytes of difference
+#define F3DEX3_A_G_AMBOCCLUSION          0x00000040
+#define F3DEX3_A_G_ATTROFFSET_Z_ENABLE   0x00000080
+#define F3DEX3_A_G_ATTROFFSET_ST_ENABLE  0x00000100
+
+#define F3DEX3_B_G_ATTROFFSET_ST_ENABLE  0x00000080
+#define F3DEX3_B_G_AMBOCCLUSION          0x00000100
+
+struct F3DEX3_Ambient
+{
+	u8 pad0, b, g, r;
+	u8 pad1, b2, g2, r2;
+};
+
+struct F3DEX3_Light
+{
+	u8 pad0, b, g, r;
+	u8 pad1, b2, g2, r2;
+	s8 pad2, z, y, x;
+	u8 size, pad3[3];
+};
+
+// Notice how it looks like F3DEX3_Light but the ending so there are 8 bytes of difference
 struct F3DEX3_LookAt
 {
 	s8 pad, z, y, x;
@@ -60,7 +89,7 @@ static void writeLight(int off, u32 w)
 {
 	if (0 == off)
 	{
-		// CameraWorld not supported
+		gSPCameraWorld(w);
 	}
 	if (0x8 == off)
 	{
@@ -69,7 +98,7 @@ static void writeLight(int off, u32 w)
 		gSPLookAt(w - (sizeof(F3DEX3_LookAtOld) - sizeof(F3DEX3_LookAt)) + sizeof(F3DEX3_LookAt), 1);
 	}
 
-	for (u32 i = 1; i <= gSP.numLights + 1; i++)
+	for (int i = 1; i <= 10; i++)
 	{
 		if (_LIGHT_TO_OFFSET(i) == off)
 		{
@@ -87,9 +116,6 @@ void F3DEX3_MoveMem(u32 w0, u32 w1)
 {
 	switch (_SHIFTR(w0, 0, 8))
 	{
-	case F3DEX3_G_MV_MMTX:
-		// TODO: Not supported!
-		break;
 	case F3DEX2_MV_VIEWPORT:
 		gSPViewport(w1);
 		break;
@@ -106,6 +132,50 @@ void F3DEX3_MoveMem(u32 w0, u32 w1)
 	}
 }
 
+static void handleFX(u32 mwo, u16 what)
+{
+	switch (mwo)
+	{
+	case F3DEX3_G_MWO_AO_AMBIENT:
+		gsSPAOAmbient(what);
+		break;
+	case F3DEX3_G_MWO_AO_DIRECTIONAL:
+		gsSPAODirectional(what);
+		break;
+	case F3DEX3_G_MWO_AO_POINT:
+		gsSPAOPoint(what);
+		break;
+	case F3DEX3_G_MWO_PERSPNORM:
+		gSPPerspNormalize(what);
+		break;
+	case F3DEX3_G_MWO_FRESNEL_SCALE:
+		gsSPFresnelScale(what);
+		break;
+	case F3DEX3_G_MWO_FRESNEL_OFFSET:
+		gsSPFresnelOffset(what);
+		break;
+	case F3DEX3_G_MWO_ATTR_OFFSET_S:
+		gsSPAttrOffsetS(what);
+		break;
+	case F3DEX3_G_MWO_ATTR_OFFSET_T:
+		gsSPAttrOffsetT(what);
+		break;
+	case F3DEX3_A_G_MWO_ATTR_OFFSET_Z:
+		// Not supported and likely unneeded. F3DEX3 B removed this feature.
+		break;
+	case F3DEX3_A_G_MWO_ALPHA_COMPARE_CULL:
+		gsSPAlphaCompareCull(what);
+		break;
+	case F3DEX3_A_G_MWO_NORMALS_MODE:
+		// Not supported and likely unneeded. F3DEX3 B removed this feature.
+		break;
+	case F3DEX3_A_G_MWO_LAST_MAT_DL_ADDR:
+		// TODO: Not supported. This feature removes RDP texture uploads which is a slight optimization.
+		//		 For GLideN64 this is not really needed although it might cause inaccurate output, if cmd list is incorrect.
+		break;
+	}
+}
+
 void F3DEX3_MoveWord(u32 w0, u32 w1)
 {
 	switch (_SHIFTR(w0, 16, 8))
@@ -114,39 +184,32 @@ void F3DEX3_MoveWord(u32 w0, u32 w1)
 	{
 		const u32 value = _SHIFTR(w0, 0, 16);
 		u32 what = w1;
-		if (value & F3DEX3_G_MW_HALFWORD_FLAG)
-			what &= 0xffff;
-
-		switch (value & ~F3DEX3_G_MW_HALFWORD_FLAG)
+		bool half = value & F3DEX3_G_MW_HALFWORD_FLAG;
+		u32 mwo = value & ~F3DEX3_G_MW_HALFWORD_FLAG;
+		if (GBI.f3dex3Version() > 0)
 		{
-			case F3DEX3_G_MWO_AO_AMBIENT:
+			switch (mwo)
+			{
+			case F3DEX3_B_G_MWO_ALPHA_COMPARE_CULL:
+				mwo = F3DEX3_A_G_MWO_ALPHA_COMPARE_CULL;
 				break;
-			case F3DEX3_G_MWO_AO_DIRECTIONAL:
+			case F3DEX3_B_G_MWO_LAST_MAT_DL_ADDR:
+				mwo = F3DEX3_A_G_MWO_LAST_MAT_DL_ADDR;
 				break;
-			case F3DEX3_G_MWO_AO_POINT:
-				break;
-			case F3DEX3_G_MWO_PERSPNORM:
-				gSPPerspNormalize(what);
-				break;
-			case F3DEX3_G_MWO_FRESNEL_SCALE:
-				break;
-			case F3DEX3_G_MWO_FRESNEL_OFFSET:
-				break;
-			case F3DEX3_G_MWO_ATTR_OFFSET_S:
-				break;
-			case F3DEX3_G_MWO_ATTR_OFFSET_T:
-				break;
-			case F3DEX3_G_MWO_ATTR_OFFSET_Z:
-				break;
-			case F3DEX3_G_MWO_ALPHA_COMPARE_CULL:
-				break;
-			case F3DEX3_G_MWO_NORMALS_MODE:
-				break;
-			case F3DEX3_G_MWO_LAST_MAT_DL_ADDR:
-				break;
+			}
+		}
+
+		if (half)
+		{
+			handleFX(mwo, what & 0xffff);
+		}
+		else
+		{
+			handleFX(mwo + 0, (what >> 16) & 0xffff);
+			handleFX(mwo + 2, what & 0xffff);
 		}
 	}
-		break;
+	break;
 	case G_MW_NUMLIGHT:
 		gSPNumLights(w1 / 0x10);
 		break;
@@ -168,7 +231,9 @@ struct Vertices7
 	u8 v[7];
 
 	inline bool valid(u8 i) const
-	{ return v[i] < 64; }
+	{
+		return v[i] < 64;
+	}
 };
 
 static inline Vertices7 unpackVertices7(u32 w0, u32 w1)
@@ -184,8 +249,15 @@ static inline Vertices7 unpackVertices7(u32 w0, u32 w1)
 	return v;
 }
 
+struct DeferFlush
+{
+	~DeferFlush()
+	{ gSPFlushTriangles(); }
+};
+
 static void F3DEX3_TriStrip(u32 w0, u32 w1)
 {
+	DeferFlush flush;
 	Vertices7 vertices = unpackVertices7(w0, w1);
 	// *v1 - v2 - v3, v3 - v2 - v4, v3 - v4 - v5, v5 - v4 - v6, v5 - v6 - v7
 	if (!vertices.valid(0) || !vertices.valid(1) || !vertices.valid(2)) return;
@@ -206,6 +278,7 @@ static void F3DEX3_TriStrip(u32 w0, u32 w1)
 
 static void F3DEX3_TriFan(u32 w0, u32 w1)
 {
+	DeferFlush flush;
 	Vertices7 vertices = unpackVertices7(w0, w1);
 	// *v1 - v2 - v3, v1 - v3 - v4, v1 - v4 - v5, v1 - v5 - v6, v1 - v6 - v7
 	if (!vertices.valid(0) || !vertices.valid(1) || !vertices.valid(2)) return;
@@ -218,10 +291,61 @@ static void F3DEX3_TriFan(u32 w0, u32 w1)
 	gSPTriangle(vertices.v[0], vertices.v[3], vertices.v[4]);
 
 	if (!vertices.valid(5)) return;
-	gSPTriangle(vertices.v[0], vertices.v[3], vertices.v[5]);
+	gSPTriangle(vertices.v[0], vertices.v[4], vertices.v[5]);
 
 	if (!vertices.valid(6)) return;
 	gSPTriangle(vertices.v[0], vertices.v[5], vertices.v[6]);
+}
+
+static void F3DEX3_TriSnake(u32 w0, u32 /*w1 - read explicitly from RDRAM*/)
+{
+	u8 a = w0;
+	if (!(a & 1))
+	{
+		// I am inlining the first loop to follow the GBI documentation
+		// This requires that snake A is initialized with right turn
+		return;
+	}
+
+	u8 b = w0 >> 8;
+	u8 c = w0 >> 16;
+
+	u32 cursor = RSP.PC[RSP.PCi] - 4;
+
+	while (true)
+	{
+		gSPTriangle((a >> 1) & 0x3f, b >> 1, c >> 1);
+		if (a & 0x80)
+		{
+			break;
+		}
+
+		// Snake is layed out in the memory as big endian (SS = TRISNAKE)
+		// SS i0 i1 i2 | i3 i4 i5 i6 | i7  i8 ...
+		// RDRAM is layed out as little endian so we have the XOR with 3
+		// i2 i1 i0 SS | i6 i5 i4 i3 | i10 i9 ...
+		u32 cursorLoc = (cursor++) ^ 3;
+		if (cursorLoc >= RDRAMSize)
+		{
+			break;
+		}
+
+		u8 v = RDRAM[cursorLoc];
+		bool right = v & 1;
+		if (!right)
+		{
+			b = a;
+		}
+		else
+		{
+			c = a;
+		}
+		a = v;
+	}
+
+	RSP.PC[RSP.PCi] = (cursor + 7) & (~7U);
+	RSP.nextCmd = _SHIFTR(*(u32*)&RDRAM[RSP.PC[RSP.PCi]], 24, 8);
+	gSPFlushTriangles();
 }
 
 static void F3DEX3_LightToRDP(u32 w0, u32 w1)
@@ -234,11 +358,35 @@ static void F3DEX3_RelSegment(u32 w0, u32 w1)
 	gSPRelSegment(_SHIFTR(w0, 2, 4), w1 & 0x00FFFFFF);
 }
 
+static void F3DEX3_Memset(u32 w0, u32 w1)
+{
+	u32 value = (u16)gDP.half_1;
+	u32 addr = w1 & 0x007fffff;
+	u32 length = w0 & 0x00FFFFFF;
+	gDPMemset(value, addr, length);
+}
+
+static void F3DEX3_Mtx(u32 w0, u32 w1)
+{
+	gSPMatrix(w1, _SHIFTR(w0, 0, 8) ^ G_MTX_PUSH ^ G_MTX_LOAD);
+}
+
 void F3DEX3_Init()
 {
 	gSPSetupFunctions();
 	// Set GeometryMode flags
 	GBI_InitFlags(F3DEX2);
+
+	if (GBI.f3dex3Version() > 0)
+	{
+		G_ATTROFFSET_ST_ENABLE = F3DEX3_B_G_ATTROFFSET_ST_ENABLE;
+		G_AMBOCCLUSION = F3DEX3_B_G_AMBOCCLUSION;
+	}
+	else
+	{
+		G_ATTROFFSET_ST_ENABLE = F3DEX3_A_G_ATTROFFSET_ST_ENABLE;
+		G_AMBOCCLUSION = F3DEX3_A_G_AMBOCCLUSION;
+	}
 
 	GBI.PCStackSize = 18;
 
@@ -253,12 +401,18 @@ void F3DEX3_Init()
 	GBI_SetGBI(G_LOAD_UCODE, F3DEX2_LOAD_UCODE, F3DEX_Load_uCode);
 	GBI_SetGBI(G_MOVEMEM, F3DEX2_MOVEMEM, F3DEX3_MoveMem);
 	GBI_SetGBI(G_MOVEWORD, F3DEX2_MOVEWORD, F3DEX3_MoveWord);
-	GBI_SetGBI(G_MTX, F3DEX2_MTX, F3DEX2_Mtx);
+	if (GBI.f3dex3Version() > 0)
+	{
+		GBI_SetGBI(G_MTX, F3DEX2_MTX, F3DEX3_Mtx);
+	}
+	else
+	{
+		GBI_SetGBI(G_MTX, F3DEX2_MTX, F3DEX2_Mtx);
+	}
 	GBI_SetGBI(G_GEOMETRYMODE, F3DEX2_GEOMETRYMODE, F3DEX2_GeometryMode);
 	GBI_SetGBI(G_POPMTX, F3DEX2_POPMTX, F3DEX2_PopMtx);
 	GBI_SetGBI(G_TEXTURE, F3DEX2_TEXTURE, F3DEX2_Texture);
 	GBI_SetGBI(G_DMA_IO, F3DEX2_DMA_IO, F3DEX2_DMAIO);
-	GBI_SetGBI(G_SPECIAL_1, F3DEX2_SPECIAL_1, F3DEX2_Special_1);
 	GBI_SetGBI(G_SPECIAL_2, F3DEX2_SPECIAL_2, F3DEX2_Special_2);
 	GBI_SetGBI(G_SPECIAL_3, F3DEX2_SPECIAL_3, F3DEX2_Special_3);
 
@@ -269,8 +423,17 @@ void F3DEX3_Init()
 	GBI_SetGBI(G_TRI1, F3DEX2_TRI1, F3DEX2_Tri1);
 	GBI_SetGBI(G_TRI2, F3DEX2_TRI2, F3DEX_Tri2);
 	GBI_SetGBI(G_QUAD, F3DEX2_QUAD, F3DEX2_Quad);
-	GBI_SetGBI(G_TRISTRIP, F3DEX3_TRISTRIP, F3DEX3_TriStrip);
-	GBI_SetGBI(G_TRIFAN, F3DEX3_TRIFAN, F3DEX3_TriFan);
+	if (GBI.f3dex3Version() > 0)
+	{
+		GBI_SetGBI(G_TRISTRIP, F3DEX3_B_TRISNAKE, F3DEX3_TriSnake);
+		GBI_SetGBI(G_SPNOOP, F3DEX3_B_TRI_NOOP, F3D_SPNoOp);
+	}
+	else
+	{
+		GBI_SetGBI(G_TRISTRIP, F3DEX3_TRISTRIP, F3DEX3_TriStrip);
+		GBI_SetGBI(G_TRIFAN, F3DEX3_TRIFAN, F3DEX3_TriFan);
+	}
 	GBI_SetGBI(G_LIGHTTORDP, F3DEX3_LIGHTTORDP, F3DEX3_LightToRDP);
 	GBI_SetGBI(G_RELSEGMENT, F3DEX3_RELSEGMENT, F3DEX3_RelSegment);
+	GBI_SetGBI(G_SPECIAL_1, F3DEX3_MEMSET, F3DEX3_Memset);
 }

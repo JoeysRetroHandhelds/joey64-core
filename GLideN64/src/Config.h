@@ -30,6 +30,7 @@ struct Config
 		u32 multisampling, maxMultiSampling;
 		u32 verticalSync;
 		u32 threadedVideo;
+		u32 asyncShaderCompilation;
 		wchar_t deviceName[32];
 	} video;
 
@@ -288,7 +289,7 @@ extern Config config;
 
 extern "C" void Config_LoadConfig();
 #if defined(M64P_GLIDENUI) || !defined(MUPENPLUSAPI)
-void Config_DoConfig(/*HWND hParent*/);
+void Config_DoConfig(void* parent);
 #endif
 
 bool isHWLightingAllowed();

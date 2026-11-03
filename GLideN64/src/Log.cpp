@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <fstream>
 #include <ctime>
+#include <chrono>
 
 #ifndef MUPENPLUSAPI // zilmar spec
 
@@ -169,7 +170,7 @@ void debugPrint(const char * format, ...) {
 	va_start(va, format);
 	vsprintf(text, format, va);
 	mbstowcs(wtext, text, 256);
-	OutputDebugString(wtext);
+	OutputDebugStringW(wtext);
 	va_end(va);
 }
 #endif
