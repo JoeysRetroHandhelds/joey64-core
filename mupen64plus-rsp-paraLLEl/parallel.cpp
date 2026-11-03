@@ -4,6 +4,7 @@
 #include "rsp_jit.hpp"
 #endif
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "m64p_plugin.h"
 #include "rsp_1.1.h"
@@ -25,6 +26,12 @@ int SP_STATUS_TIMEOUT;
 
 extern "C"
 {
+	// HLE audio with LLE graphics (dev env N64_HLE_AUDIO=1): audio tasks with a ucode the HLE plugin
+	// knows run there, everything else on this RSP.
+	void hleInitiateRSP(RSP_INFO Rsp_Info, unsigned int *CycleCount);
+	int hleTryAudioTask(void);
+	static bool hle_audio;
+
 	// Hack entry point to use when loading savestates when we're tracing.
 	void rsp_clear_registers()
 	{
@@ -54,6 +61,10 @@ extern "C"
 	{
 		if (*RSP::rsp.SP_STATUS_REG & (SP_STATUS_HALT | SP_STATUS_BROKE))
 			return 0;
+
+		// Only at a task's start: a task this RSP was already running continues here.
+		if (hle_audio && (*RSP::rsp.SP_PC_REG & 0xfff) == 0 && hleTryAudioTask())
+			return cycles;
 
 		// We don't know if Mupen from the outside invalidated our IMEM.
 		RSP::cpu.invalidate_imem();
@@ -130,6 +141,10 @@ extern "C"
 			return; /* DMA is not executed just because plugin initiates. */
 
 		RSP::rsp = Rsp_Info;
+		const char *env = getenv("N64_HLE_AUDIO");
+		hle_audio = env && *env == '1';
+		if (hle_audio)
+			hleInitiateRSP(Rsp_Info, nullptr);
 		*RSP::rsp.SP_PC_REG = 0x04001000 & 0x00000FFF; /* task init bug on Mupen64 */
 
 		auto **cr = RSP::cpu.get_state().cp0.cr;

@@ -142,6 +142,19 @@ void hle_execute(struct hle_t* hle)
     info->uc_pfunc(hle);
 }
 
+int hle_try_audio_task(struct hle_t* hle)
+{
+    ucode_func_t uc_pfunc;
+
+    if (!is_task(hle) || *dmem_u32(hle, TASK_TYPE) != 2)
+        return 0;
+    uc_pfunc = try_audio_task_detection(hle);
+    if (!uc_pfunc)
+        return 0;
+    uc_pfunc(hle);
+    return 1;
+}
+
 /* local functions */
 static unsigned int sum_bytes(const unsigned char *bytes, unsigned int size)
 {

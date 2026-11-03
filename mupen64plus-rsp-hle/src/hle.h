@@ -49,6 +49,8 @@ void hle_init(struct hle_t* hle,
     void* user_defined);
 
 void hle_execute(struct hle_t* hle);
+/* Runs the task in DMEM if it is an audio task with a known ucode; returns 0 (and does nothing) otherwise. */
+int hle_try_audio_task(struct hle_t* hle);
 
 #endif
 
