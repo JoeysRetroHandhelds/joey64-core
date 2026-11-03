@@ -931,8 +931,13 @@ void FrameBufferList::saveBuffer(u32 _address, u16 _format, u16 _size, u16 _widt
 void FrameBufferList::copyAux()
 {
 	for (auto iter = m_list.begin(); iter != m_list.end(); ++iter) {
-		if (iter->isAuxiliary())
-			FrameBuffer_CopyToRDRAM(iter->m_startAddress, true);
+		if (!iter->isAuxiliary())
+			continue;
+		// Don't overwrite software-rendered depth in RDRAM with the color of a buffer at its address.
+		if (config.frameBufferEmulation.copyDepthToRDRAM == Config::cdSoftwareRender &&
+			depthBufferList().findBuffer(iter->m_startAddress) != nullptr)
+			continue;
+		FrameBuffer_CopyToRDRAM(iter->m_startAddress, true);
 	}
 }
 

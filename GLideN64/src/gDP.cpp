@@ -404,6 +404,16 @@ bool CheckForFrameBufferTexture(u32 _address, u32 _width, u32 _bytes)
 			break;
 		}
 
+		// A color buffer at a depth buffer address only holds GLideN64's own color output, while
+		// software depth rendering keeps the real N64 depth values in RDRAM: load those instead.
+		// Pokemon Snap copies depth strips this way to check that photographed Pokemon are visible.
+		if (config.frameBufferEmulation.copyDepthToRDRAM == Config::cdSoftwareRender &&
+			pBuffer != fbList.getCurrent() &&
+			depthBufferList().findBuffer(pBuffer->m_startAddress) != nullptr) {
+			bRes = false;
+			break;
+		}
+
 		if ((config.generalEmulation.hacks & hack_noDepthFrameBuffers) != 0 && pBuffer->m_isDepthBuffer) {
 			fbList.removeBuffer(pBuffer->m_startAddress);
 			bRes = false;
