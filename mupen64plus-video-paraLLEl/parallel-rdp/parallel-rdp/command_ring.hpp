@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -53,13 +54,20 @@ private:
 	std::mutex lock;
 	std::condition_variable cond;
 
+	// Single producer (the emulation thread), single consumer (the worker). The counters are
+	// atomics, so neither side takes the lock unless it has to sleep: the ring empty (worker),
+	// full (writer), or not yet completed (drain). A side about to sleep raises its flag before
+	// checking again, and the other side, after publishing a counter, wakes it under the lock if
+	// the flag is up (both sequentially consistent, so one of them always sees the other).
 	std::vector<uint32_t> ring;
-	uint64_t write_count = 0;
-	uint64_t read_count = 0;
-	uint64_t completed_count = 0;
-	unsigned waiters = 0;        // threads in drain() or waiting for ring space
-	bool reader_waiting = false; // worker is (about to be) asleep waiting for commands
+	std::atomic<uint64_t> write_count{0};
+	std::atomic<uint64_t> read_count{0};
+	std::atomic<uint64_t> completed_count{0};
+	std::atomic<bool> reader_waiting{false};
+	std::atomic<bool> writer_waiting{false};
+	std::atomic<bool> drain_waiting{false};
 
+	void wake();
 	void thread_loop();
 	void teardown_thread();
 #ifdef PARALLEL_RDP_SHADER_DIR

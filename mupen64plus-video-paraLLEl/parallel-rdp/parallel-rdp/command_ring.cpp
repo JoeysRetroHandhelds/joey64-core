@@ -40,6 +40,7 @@ void CommandRing::init(
 	ring.resize(count);
 	write_count = 0;
 	read_count = 0;
+	completed_count = 0;
 #ifdef PARALLEL_RDP_SHADER_DIR
 	global_handles = std::move(global_handles_);
 #endif
@@ -60,34 +61,50 @@ CommandRing::~CommandRing()
 	teardown_thread();
 }
 
+void CommandRing::wake()
+{
+	// Under the lock: the sleeper either hasn't checked its condition yet or is already waiting.
+	std::lock_guard<std::mutex> holder{lock};
+	cond.notify_all();
+}
+
 void CommandRing::drain()
 {
+	uint64_t written = write_count.load(std::memory_order_relaxed);
+	if (completed_count.load() == written)
+		return;
 	std::unique_lock<std::mutex> holder{lock};
-	waiters++;
-	cond.wait(holder, [this]() {
-		return write_count == completed_count;
+	drain_waiting = true;
+	cond.wait(holder, [this, written]() {
+		return completed_count.load() == written;
 	});
-	waiters--;
+	drain_waiting = false;
 }
 
 void CommandRing::enqueue_command(unsigned num_words, const uint32_t *words)
 {
-	std::unique_lock<std::mutex> holder{lock};
-	waiters++;
-	cond.wait(holder, [this, num_words]() {
-		return write_count + num_words + 1 <= read_count + ring.size();
-	});
-	waiters--;
+	uint64_t write = write_count.load(std::memory_order_relaxed);
+	auto has_room = [this, write, num_words]() {
+		return write + num_words + 1 <= read_count.load() + ring.size();
+	};
+	if (!has_room())
+	{
+		std::unique_lock<std::mutex> holder{lock};
+		writer_waiting = true;
+		cond.wait(holder, has_room);
+		writer_waiting = false;
+	}
 
 	size_t mask = ring.size() - 1;
-	ring[write_count++ & mask] = num_words;
+	ring[write++ & mask] = num_words;
 	for (unsigned i = 0; i < num_words; i++)
-		ring[write_count++ & mask] = words[i];
+		ring[write++ & mask] = words[i];
+	write_count = write;
 
-	// Only wake the worker when it sleeps: a notify per command costs a futex syscall each
-	// (thousands per frame), and the worker takes everything queued per wakeup anyway.
+	// Wake the worker only when it sleeps: a lock and notify per command cost futex syscalls
+	// and contention (thousands per frame), and the worker takes everything queued per wakeup.
 	if (reader_waiting)
-		cond.notify_all();
+		wake();
 }
 
 void CommandRing::thread_loop()
@@ -108,28 +125,35 @@ void CommandRing::thread_loop()
 	for (;;)
 	{
 		bool is_idle = false;
+		uint64_t read = read_count.load(std::memory_order_relaxed);
+		auto has_work = [this, read]() { return write_count.load() > read; };
+		bool got = has_work();
+		if (!got)
 		{
 			std::unique_lock<std::mutex> holder{lock};
 			reader_waiting = true;
-			bool has_work = cond.wait_for(holder, std::chrono::microseconds(500), [this]() { return write_count > read_count; });
+			got = cond.wait_for(holder, std::chrono::microseconds(500), has_work);
 			reader_waiting = false;
-			if (has_work)
-			{
-				// Take every queued command in one go.
-				tmp_buffer.resize(write_count - read_count);
-				for (auto &word : tmp_buffer)
-					word = ring[read_count++ & mask];
-				if (waiters)
-					cond.notify_all(); // room for a writer waiting on a full ring
-			}
-			else
-			{
-				// If we don't receive commands at a steady pace,
-				// notify rendering thread that we should probably kick some work.
-				tmp_buffer.resize(1);
-				tmp_buffer[0] = uint32_t(Op::MetaIdle) << 24;
-				is_idle = true;
-			}
+		}
+
+		if (got)
+		{
+			// Take every queued command in one go.
+			uint64_t write = write_count.load(std::memory_order_acquire);
+			tmp_buffer.resize(write - read);
+			for (auto &word : tmp_buffer)
+				word = ring[read++ & mask];
+			read_count = read;
+			if (writer_waiting)
+				wake(); // room for a writer waiting on a full ring
+		}
+		else
+		{
+			// If we don't receive commands at a steady pace,
+			// notify rendering thread that we should probably kick some work.
+			tmp_buffer.resize(1);
+			tmp_buffer[0] = uint32_t(Op::MetaIdle) << 24;
+			is_idle = true;
 		}
 
 		if (is_idle)
@@ -152,12 +176,9 @@ void CommandRing::thread_loop()
 			offset += num_words;
 		}
 
-		{
-			std::lock_guard<std::mutex> holder{lock};
-			completed_count = read_count;
-			if (waiters)
-				cond.notify_all();
-		}
+		completed_count = read_count.load(std::memory_order_relaxed);
+		if (drain_waiting)
+			wake();
 
 		if (stop)
 			break;
