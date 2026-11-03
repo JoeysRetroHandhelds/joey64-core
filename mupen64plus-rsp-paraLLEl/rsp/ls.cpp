@@ -27,6 +27,23 @@ extern "C"
 			arr[n] = (arr[n] & 0xff) | ((uint16_t)b << 8);
 	}
 	
+	// DMEM keeps big-endian words in host order (see BES), so a word holds two vector elements with
+	// the first in its high half. Aligned loads and stores move whole words instead of bytes.
+	static inline void loadWords(uint16_t *elems, const uint32_t *words, unsigned count)
+	{
+		for (unsigned i = 0; i < count; i++)
+		{
+			elems[2 * i] = uint16_t(words[i] >> 16);
+			elems[2 * i + 1] = uint16_t(words[i]);
+		}
+	}
+
+	static inline void storeWords(uint32_t *words, const uint16_t *elems, unsigned count)
+	{
+		for (unsigned i = 0; i < count; i++)
+			words[i] = (uint32_t(elems[2 * i]) << 16) | elems[2 * i + 1];
+	}
+
 	// Load 8-bit
 	void RSP_LBV(RSP::CPUState *rsp, unsigned rt, unsigned e, int offset, unsigned base)
 	{
@@ -104,6 +121,12 @@ extern "C"
 	{
 		TRACE_LS(LDV);
 		unsigned addr = rsp->sr[base] + offset * 8;
+		if (!(addr & 7) && !(e & 1) && e <= 8)
+		{
+			// Aligned: two whole words, each holding two elements.
+			loadWords(rsp->cp2.regs[rt].e + (e >> 1), rsp->dmem + ((addr & 0xfff) >> 2), 2);
+			return;
+		}
 		const unsigned end = (e > 8) ? 16 : (e + 8);
 		for (unsigned i = e; i < end; i++)
 			writeByteToHalfWords(rsp->cp2.regs[rt].e, i & 0xf, READ_MEM_U8(rsp->dmem, addr++ & 0xfff));
@@ -314,6 +337,11 @@ extern "C"
 	{
 		TRACE_LS(LQV);
 		unsigned addr = rsp->sr[base] + offset * 16;
+		if (!(addr & 0xf) && !e)
+		{
+			loadWords(rsp->cp2.regs[rt].e, rsp->dmem + ((addr & 0xfff) >> 2), 4);
+			return;
+		}
 		unsigned end = 16 + e - (addr & 0xf);
 		if (end > 16) end = 16;
 
@@ -325,7 +353,12 @@ extern "C"
 	{
 		TRACE_LS(SQV);
 		unsigned addr = (rsp->sr[base] + offset * 16) & 0xfff;
-		
+		if (!(addr & 0xf) && !e)
+		{
+			storeWords(rsp->dmem + (addr >> 2), rsp->cp2.regs[rt].e, 4);
+			return;
+		}
+
 		const unsigned end = e + (16 - (addr & 15));
 		for (unsigned i = e; i < end; i++)
 			WRITE_MEM_U8(rsp->dmem, addr++, byteFromHalfWords(rsp->cp2.regs[rt].e, i & 15));
