@@ -44,6 +44,19 @@ extern "C"
 			words[i] = (uint32_t(elems[2 * i]) << 16) | elems[2 * i + 1];
 	}
 
+	// Even address and even element: whole halfwords (DMEM wraps at 4 KiB).
+	static inline void loadHalves(uint16_t *elems, const uint32_t *dmem, unsigned addr, unsigned count)
+	{
+		for (unsigned i = 0; i < count; i++)
+			elems[i] = READ_MEM_U16(dmem, (addr + 2 * i) & 0xfff);
+	}
+
+	static inline void storeHalves(uint32_t *dmem, unsigned addr, const uint16_t *elems, unsigned count)
+	{
+		for (unsigned i = 0; i < count; i++)
+			WRITE_MEM_U16(dmem, (addr + 2 * i) & 0xfff, elems[i]);
+	}
+
 	// Load 8-bit
 	void RSP_LBV(RSP::CPUState *rsp, unsigned rt, unsigned e, int offset, unsigned base)
 	{
@@ -71,6 +84,11 @@ extern "C"
 	{
 		TRACE_LS(LSV);
 		unsigned addr = rsp->sr[base] + offset * 2;
+		if (!((addr | e) & 1))
+		{
+			loadHalves(rsp->cp2.regs[rt].e + (e >> 1), rsp->dmem, addr, 1);
+			return;
+		}
 		const unsigned end = (e > 14) ? 16 : (e + 2);
 		for (unsigned i = e; i < end; i++)
 			writeByteToHalfWords(rsp->cp2.regs[rt].e, i & 0xf, READ_MEM_U8(rsp->dmem, addr++ & 0xfff));
@@ -81,6 +99,11 @@ extern "C"
 	{
 		TRACE_LS(SSV);
 		unsigned addr = (rsp->sr[base] + offset * 2) & 0xfff;
+		if (!((addr | e) & 1))
+		{
+			storeHalves(rsp->dmem, addr, rsp->cp2.regs[rt].e + (e >> 1), 1);
+			return;
+		}
 		uint8_t v0 = reinterpret_cast<uint8_t *>(rsp->cp2.regs[rt].e)[MES(e)];
 		uint8_t v1 = reinterpret_cast<uint8_t *>(rsp->cp2.regs[rt].e)[MES((e + 1) & 0xf)];
 
@@ -97,6 +120,11 @@ extern "C"
 	{
 		TRACE_LS(LLV);
 		unsigned addr = rsp->sr[base] + offset * 4;
+		if (!((addr | e) & 1) && e <= 12)
+		{
+			loadHalves(rsp->cp2.regs[rt].e + (e >> 1), rsp->dmem, addr, 2);
+			return;
+		}
 		const unsigned end = (e > 12) ? 16 : (e + 4);
 		for (unsigned i = e; i < end; i++)
 			writeByteToHalfWords(rsp->cp2.regs[rt].e, i & 0xf, READ_MEM_U8(rsp->dmem, addr++ & 0xfff));
@@ -107,6 +135,12 @@ extern "C"
 	{
 		TRACE_LS(SLV);
 		unsigned addr = (rsp->sr[base] + offset * 4) & 0xfff;
+		// The byte loop below doesn't wrap at 4 KiB, so the fast path stays off the end.
+		if (!((addr | e) & 1) && e <= 12 && addr <= 0xffc)
+		{
+			storeHalves(rsp->dmem, addr, rsp->cp2.regs[rt].e + (e >> 1), 2);
+			return;
+		}
 
 #ifdef INTENSE_DEBUG
 		fprintf(stderr, "SLV 0x%x, e = %u\n", addr, e);
@@ -121,10 +155,9 @@ extern "C"
 	{
 		TRACE_LS(LDV);
 		unsigned addr = rsp->sr[base] + offset * 8;
-		if (!(addr & 7) && !(e & 1) && e <= 8)
+		if (!((addr | e) & 1) && e <= 8)
 		{
-			// Aligned: two whole words, each holding two elements.
-			loadWords(rsp->cp2.regs[rt].e + (e >> 1), rsp->dmem + ((addr & 0xfff) >> 2), 2);
+			loadHalves(rsp->cp2.regs[rt].e + (e >> 1), rsp->dmem, addr, 4);
 			return;
 		}
 		const unsigned end = (e > 8) ? 16 : (e + 8);
@@ -170,6 +203,14 @@ extern "C"
 		addr &= ~7;
 
 		auto *reg = rsp->cp2.regs[rt].e;
+		if (!index)
+		{
+			// Each byte of two aligned words goes to the top of an element.
+			const uint32_t *words = rsp->dmem + (addr >> 2);
+			for (unsigned i = 0; i < 8; i++)
+				reg[i] = uint16_t((words[i >> 2] >> (24 - 8 * (i & 3))) << 8);
+			return;
+		}
 		for (unsigned i = 0; i < 8; i++)
 			reg[i] = READ_MEM_U8(rsp->dmem, (addr + (i + index & 0xf)) & 0xfff) << 8;
 	}
