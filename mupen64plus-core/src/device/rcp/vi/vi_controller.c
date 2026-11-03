@@ -21,6 +21,7 @@
 
 #include "vi_controller.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "api/m64p_types.h"
@@ -170,9 +171,9 @@ void write_vi_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask
     }
 }
 
-void vi_vertical_interrupt_event(void* opaque)
+/* Show the frame and end the libretro frame. */
+static void vi_scanout(struct vi_controller* vi)
 {
-    struct vi_controller* vi = (struct vi_controller*)opaque;
     if (vi->dp->do_on_unfreeze & DELAY_DP_INT)
         vi->dp->do_on_unfreeze |= DELAY_UPDATESCREEN;
     else
@@ -180,6 +181,45 @@ void vi_vertical_interrupt_event(void* opaque)
 
     /* allow main module to do things on VI event */
     new_vi();
+}
+
+/* The VI reads its origin when the active picture starts (VI_V_START), not at the vertical interrupt: games
+ * point the VI at the frame they just finished from their VI interrupt handler, so scanning out at the
+ * interrupt showed the previous frame (one frame of extra latency, as ares found). Env N64_SCANOUT_AT_VI=1
+ * restores scanout at the interrupt. */
+void vi_scanout_event(void* opaque)
+{
+    vi_scanout((struct vi_controller*)opaque);
+}
+
+static unsigned int vi_scanout_delay(const struct vi_controller* vi)
+{
+    uint32_t vstart = (vi->regs[VI_V_START_REG] >> 16) & 0x3ff;
+    uint32_t vintr = vi->regs[VI_V_INTR_REG] & 0x3ff;
+    /* half-lines; keep it well inside the field */
+    uint32_t lines = (vstart > vintr) ? vstart - vintr : 0;
+    if (lines > 64) lines = 64;
+    return lines * vi->count_per_scanline;
+}
+
+void vi_vertical_interrupt_event(void* opaque)
+{
+    struct vi_controller* vi = (struct vi_controller*)opaque;
+    static int scanout_at_vi = -1;
+    if (scanout_at_vi < 0)
+        scanout_at_vi = getenv("N64_SCANOUT_AT_VI") != NULL;
+
+    if (scanout_at_vi)
+        vi_scanout(vi);
+    else {
+        /* a scanout still pending from the last field (shouldn't happen) goes first */
+        if (get_event(&vi->mi->r4300->cp0.q, VI_SCANOUT_EVT)) {
+            remove_event(&vi->mi->r4300->cp0.q, VI_SCANOUT_EVT);
+            vi_scanout(vi);
+        }
+        cp0_update_count(vi->mi->r4300);
+        add_interrupt_event(&vi->mi->r4300->cp0, VI_SCANOUT_EVT, vi_scanout_delay(vi));
+    }
 
     /* toggle vi field if in interlaced mode */
     vi->field ^= (vi->regs[VI_STATUS_REG] >> 6) & 0x1;
