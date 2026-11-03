@@ -63,24 +63,31 @@ CommandRing::~CommandRing()
 void CommandRing::drain()
 {
 	std::unique_lock<std::mutex> holder{lock};
+	waiters++;
 	cond.wait(holder, [this]() {
 		return write_count == completed_count;
 	});
+	waiters--;
 }
 
 void CommandRing::enqueue_command(unsigned num_words, const uint32_t *words)
 {
 	std::unique_lock<std::mutex> holder{lock};
+	waiters++;
 	cond.wait(holder, [this, num_words]() {
 		return write_count + num_words + 1 <= read_count + ring.size();
 	});
+	waiters--;
 
 	size_t mask = ring.size() - 1;
 	ring[write_count++ & mask] = num_words;
 	for (unsigned i = 0; i < num_words; i++)
 		ring[write_count++ & mask] = words[i];
 
-	cond.notify_one();
+	// Only wake the worker when it sleeps: a notify per command costs a futex syscall each
+	// (thousands per frame), and the worker takes everything queued per wakeup anyway.
+	if (reader_waiting)
+		cond.notify_all();
 }
 
 void CommandRing::thread_loop()
@@ -103,12 +110,17 @@ void CommandRing::thread_loop()
 		bool is_idle = false;
 		{
 			std::unique_lock<std::mutex> holder{lock};
-			if (cond.wait_for(holder, std::chrono::microseconds(500), [this]() { return write_count > read_count; }))
+			reader_waiting = true;
+			bool has_work = cond.wait_for(holder, std::chrono::microseconds(500), [this]() { return write_count > read_count; });
+			reader_waiting = false;
+			if (has_work)
 			{
-				uint32_t num_words = ring[read_count++ & mask];
-				tmp_buffer.resize(num_words);
-				for (uint32_t i = 0; i < num_words; i++)
-					tmp_buffer[i] = ring[read_count++ & mask];
+				// Take every queued command in one go.
+				tmp_buffer.resize(write_count - read_count);
+				for (auto &word : tmp_buffer)
+					word = ring[read_count++ & mask];
+				if (waiters)
+					cond.notify_all(); // room for a writer waiting on a full ring
 			}
 			else
 			{
@@ -120,16 +132,35 @@ void CommandRing::thread_loop()
 			}
 		}
 
-		if (tmp_buffer.empty())
-			break;
+		if (is_idle)
+		{
+			processor->enqueue_command_direct(tmp_buffer.size(), tmp_buffer.data());
+			continue;
+		}
 
-		processor->enqueue_command_direct(tmp_buffer.size(), tmp_buffer.data());
-		if (!is_idle)
+		// Each command is its word count followed by its words; a count of 0 stops the thread.
+		bool stop = false;
+		for (size_t offset = 0; offset < tmp_buffer.size();)
+		{
+			uint32_t num_words = tmp_buffer[offset++];
+			if (num_words == 0)
+			{
+				stop = true;
+				break;
+			}
+			processor->enqueue_command_direct(num_words, tmp_buffer.data() + offset);
+			offset += num_words;
+		}
+
 		{
 			std::lock_guard<std::mutex> holder{lock};
 			completed_count = read_count;
-			cond.notify_one();
+			if (waiters)
+				cond.notify_all();
 		}
+
+		if (stop)
+			break;
 	}
 }
 }

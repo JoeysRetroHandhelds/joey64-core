@@ -57,6 +57,8 @@ private:
 	uint64_t write_count = 0;
 	uint64_t read_count = 0;
 	uint64_t completed_count = 0;
+	unsigned waiters = 0;        // threads in drain() or waiting for ring space
+	bool reader_waiting = false; // worker is (about to be) asleep waiting for commands
 
 	void thread_loop();
 	void teardown_thread();
