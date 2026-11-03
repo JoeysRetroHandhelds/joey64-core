@@ -404,12 +404,11 @@ bool CheckForFrameBufferTexture(u32 _address, u32 _width, u32 _bytes)
 			break;
 		}
 
-		// A color buffer at a depth buffer address only holds GLideN64's own color output, while
-		// software depth rendering keeps the real N64 depth values in RDRAM: load those instead.
+		// A buffer the game only used to clear a depth buffer holds no depth, while software depth
+		// rendering keeps the real N64 depth values in RDRAM: load those instead.
 		// Pokemon Snap copies depth strips this way to check that photographed Pokemon are visible.
 		if (config.frameBufferEmulation.copyDepthToRDRAM == Config::cdSoftwareRender &&
-			pBuffer != fbList.getCurrent() &&
-			depthBufferList().findBuffer(pBuffer->m_startAddress) != nullptr) {
+			pBuffer != fbList.getCurrent() && pBuffer->m_depthClearOnly) {
 			bRes = false;
 			break;
 		}
@@ -856,6 +855,8 @@ void gDPFillRectangle( s32 ulx, s32 uly, s32 lrx, s32 lry )
 		frameBufferList().fillRDRAM(ulx, uly, lrx, lry);
 
 	frameBufferList().setBufferChanged(f32(lry));
+	if (depthBuffer != dbNone && frameBufferList().getCurrent() != nullptr)
+		frameBufferList().getCurrent()->m_depthClearOnly = true;
 
 	DebugMsg( DEBUG_NORMAL, "gDPFillRectangle #%i- #%i ( %i, %i, %i, %i );\n", gSP.tri_num, gSP.tri_num +1, ulx, uly, lrx, lry );
 	gSP.tri_num += 2;

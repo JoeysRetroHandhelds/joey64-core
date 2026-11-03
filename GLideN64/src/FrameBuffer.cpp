@@ -668,6 +668,7 @@ void FrameBufferList::setBufferChanged(f32 _maxY)
 		m_pCurrent->m_cfb = false;
 		m_pCurrent->m_changed = true;
 		m_pCurrent->m_copiedToRdram = false;
+		m_pCurrent->m_depthClearOnly = false;
 	}
 }
 
@@ -933,9 +934,8 @@ void FrameBufferList::copyAux()
 	for (auto iter = m_list.begin(); iter != m_list.end(); ++iter) {
 		if (!iter->isAuxiliary())
 			continue;
-		// Don't overwrite software-rendered depth in RDRAM with the color of a buffer at its address.
-		if (config.frameBufferEmulation.copyDepthToRDRAM == Config::cdSoftwareRender &&
-			depthBufferList().findBuffer(iter->m_startAddress) != nullptr)
+		// Don't overwrite software-rendered depth in RDRAM with a buffer that only cleared it.
+		if (config.frameBufferEmulation.copyDepthToRDRAM == Config::cdSoftwareRender && iter->m_depthClearOnly)
 			continue;
 		FrameBuffer_CopyToRDRAM(iter->m_startAddress, true);
 	}
