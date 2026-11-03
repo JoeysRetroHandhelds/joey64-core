@@ -4,6 +4,8 @@
 #include "parallel.h"
 #include "z64.h"
 #include <assert.h>
+#include <stdio.h>
+#include <string>
 
 using namespace Vulkan;
 using namespace std;
@@ -25,6 +27,70 @@ static unique_ptr<CommandProcessor> frontend;
 static unique_ptr<Device> device;
 static unique_ptr<Context> context;
 static QueryPoolHandle begin_ts, end_ts;
+
+// Pipelines compiled by the driver, kept between runs so shaders are not recompiled (and the game
+// does not stall on them) every launch. Saved when it grows and at shutdown.
+static string pipeline_cache_path;
+static size_t pipeline_cache_saved_size;
+static unsigned frames_since_cache_check;
+
+static void load_pipeline_cache()
+{
+	const char *dir = nullptr;
+	pipeline_cache_path.clear();
+	vector<uint8_t> data;
+	if (environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &dir) && dir)
+	{
+		pipeline_cache_path = string(dir) + "/Mupen64plus/parallel-rdp-pipeline-cache.bin";
+		if (FILE *f = fopen(pipeline_cache_path.c_str(), "rb"))
+		{
+			if (fseek(f, 0, SEEK_END) == 0)
+			{
+				long size = ftell(f);
+				if (size > 0)
+				{
+					data.resize(size);
+					rewind(f);
+					if (fread(data.data(), 1, data.size(), f) != data.size())
+						data.clear();
+				}
+			}
+			fclose(f);
+		}
+	}
+	// Granite checks the GPU's cache UUID and a hash, and starts fresh when they don't match.
+	device->init_pipeline_cache(data.empty() ? nullptr : data.data(), data.size());
+	pipeline_cache_saved_size = data.size();
+	frames_since_cache_check = 0;
+	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: pipeline cache %u bytes from %s.\n",
+	       unsigned(data.size()), pipeline_cache_path.c_str());
+}
+
+static void save_pipeline_cache()
+{
+	if (pipeline_cache_path.empty() || !device)
+		return;
+	size_t size = device->get_pipeline_cache_size();
+	if (!size || size == pipeline_cache_saved_size)
+		return;
+	vector<uint8_t> data(size);
+	if (!device->get_pipeline_cache_data(data.data(), size))
+		return;
+	// Write a temporary file and rename it, so a kill mid-write can't leave a torn cache.
+	string tmp = pipeline_cache_path + ".tmp";
+	FILE *f = fopen(tmp.c_str(), "wb");
+	if (!f)
+		return;
+	bool ok = fwrite(data.data(), 1, size, f) == size;
+	ok = fclose(f) == 0 && ok;
+	if (ok && rename(tmp.c_str(), pipeline_cache_path.c_str()) == 0)
+	{
+		pipeline_cache_saved_size = size;
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: saved pipeline cache, %u bytes.\n", unsigned(size));
+	}
+	else
+		remove(tmp.c_str());
+}
 
 static vector<retro_vulkan_image> retro_images;
 static vector<ImageHandle> retro_image_handles;
@@ -185,6 +251,7 @@ bool init()
 
 	device.reset(new Device);
 	device->set_context(*context);
+	load_pipeline_cache();
 	device->init_frame_contexts(num_sync_frames);
 	log_cb(RETRO_LOG_INFO, "Using %u sync frames for parallel-RDP.\n", num_sync_frames);
 	device->set_queue_lock(
@@ -272,6 +339,7 @@ bool init()
 
 void deinit()
 {
+	save_pipeline_cache();
 	begin_ts.reset();
 	end_ts.reset();
 	retro_image_handles.clear();
@@ -345,6 +413,13 @@ void complete_frame()
 	}
 
 	timeline_value = frontend->signal_timeline();
+
+	// New pipelines show up as the game reaches new effects; check every ~10 s.
+	if (++frames_since_cache_check >= 600)
+	{
+		frames_since_cache_check = 0;
+		save_pipeline_cache();
+	}
 
 	frontend->set_vi_register(VIRegister::Control, *GET_GFX_INFO(VI_STATUS_REG));
 	frontend->set_vi_register(VIRegister::Origin, *GET_GFX_INFO(VI_ORIGIN_REG));
