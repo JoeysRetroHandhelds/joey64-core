@@ -175,6 +175,7 @@ void CommandProcessor::begin_frame_context()
 	flush();
 	drain_command_ring();
 	device.next_frame_context();
+	vi.begin_frame_context();
 }
 
 void CommandProcessor::init_renderer()

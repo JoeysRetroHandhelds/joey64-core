@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include "device.hpp"
 #include "rdp_common.hpp"
+#include "vi_image_pool.hpp"
 
 namespace RDP
 {
@@ -105,6 +106,8 @@ public:
 	Vulkan::ImageHandle scanout(VkImageLayout target_layout, const ScanoutOptions &options = {}, unsigned scale_factor = 1);
 	void scanout_memory_range(unsigned &offset, unsigned &length) const;
 	void set_shader_bank(const ShaderBank *bank);
+	// Called after each Device::next_frame_context().
+	void begin_frame_context();
 
 	enum PerScanlineRegisterBits
 	{
@@ -154,6 +157,12 @@ private:
 	void message(const std::string &tag, uint32_t code,
 	             uint32_t x, uint32_t y, uint32_t z,
 	             uint32_t num_words, const Vulkan::DebugChannelInterface::Word *words) override;
+
+	// Intermediate images, reused instead of created every frame.
+	mutable VIImagePool image_pool;
+	uint64_t frame_serial = 0;
+	const VIImagePool::Entry &acquire_image(const Vulkan::ImageCreateInfo &info, bool layer_views) const;
+	const VIImagePool::Entry &create_pooled_image(const Vulkan::ImageCreateInfo &info, bool layer_views) const;
 
 	// Frame state.
 	uint32_t frame_count = 0;
