@@ -20,6 +20,7 @@
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 #define SETTINGS_SIZE 24
+#define NETPLAY_MAX_PENDING_EVENTS 255
 
 #define M64P_CORE_PROTOTYPES 1
 #include "api/callbacks.h"
@@ -240,6 +241,24 @@ static uint8_t buffer_size(uint8_t control_id)
     return counter;
 }
 
+static int netplay_packet_has_data(const UDPpacket* packet, size_t offset, size_t size)
+{
+    return packet->len >= 0 && offset <= (size_t) packet->len
+        && size <= (size_t) packet->len - offset;
+}
+
+static uint8_t netplay_validate_plugin(uint8_t player, uint8_t plugin)
+{
+    if ((player > 0 && plugin == PLUGIN_MEMPAK)
+     || (plugin != PLUGIN_NONE && plugin != PLUGIN_MEMPAK
+      && plugin != PLUGIN_RUMBLE_PAK && plugin != PLUGIN_RAW))
+    {
+        return PLUGIN_NONE;
+    }
+
+    return plugin;
+}
+
 static void netplay_request_input(uint8_t control_id)
 {
     l_request_input_packet->data[0] = UDP_REQUEST_KEY_INFO;
@@ -293,11 +312,28 @@ static void netplay_process()
     uint8_t plugin, player, current_status;
     while (SDLNet_UDP_Recv(l_udpSocket, l_process_packet) == 1)
     {
+        if (!netplay_packet_has_data(l_process_packet, 0, 5))
+        {
+            DebugMessage(M64MSG_ERROR, "Netplay: received truncated message from server");
+            continue;
+        }
+
         switch (l_process_packet->data[0])
         {
             case UDP_RECEIVE_KEY_INFO:
             case UDP_RECEIVE_KEY_INFO_GRATUITOUS:
                 player = l_process_packet->data[1];
+                if (player >= 4)
+                {
+                    DebugMessage(M64MSG_ERROR, "Netplay: received invalid player from server");
+                    break;
+                }
+                if (l_process_packet->data[4] >
+                    ((size_t) l_process_packet->len - 5) / 9)
+                {
+                    DebugMessage(M64MSG_ERROR, "Netplay: received truncated input data from server");
+                    break;
+                }
                 //current_status is a status update from the server
                 //it will let us know if another player has disconnected, or the games have desynced
                 current_status = l_process_packet->data[2];
@@ -328,13 +364,24 @@ static void netplay_process()
                         continue;
                     }
 
+                    if (buffer_size(player) >= NETPLAY_MAX_PENDING_EVENTS)
+                    {
+                        DebugMessage(M64MSG_ERROR, "Netplay: received too many pending input events");
+                        break;
+                    }
+
                     keys = SDLNet_Read32(&l_process_packet->data[curr]);
                     curr += 4;
-                    plugin = l_process_packet->data[curr];
+                    plugin = netplay_validate_plugin(player, l_process_packet->data[curr]);
                     curr += 1;
 
                     //insert new event at beginning of linked list
                     struct netplay_event* new_event = (struct netplay_event*)malloc(sizeof(struct netplay_event));
+                    if (new_event == NULL)
+                    {
+                        DebugMessage(M64MSG_ERROR, "Netplay: could not allocate input event");
+                        break;
+                    }
                     new_event->count = count;
                     new_event->buttons = keys;
                     new_event->plugin = plugin;
@@ -653,12 +700,7 @@ void netplay_read_registration(struct controller_input_compat* cin_compats)
         else
         {
             Controls[i].Present = 1;
-            if (i > 0 && input_data[curr] == PLUGIN_MEMPAK) // only P1 can use mempak
-                Controls[i].Plugin = PLUGIN_NONE;
-            else if (input_data[curr] == PLUGIN_TRANSFER_PAK) // Transferpak not supported during netplay
-                Controls[i].Plugin = PLUGIN_NONE;
-            else
-                Controls[i].Plugin = input_data[curr];
+            Controls[i].Plugin = netplay_validate_plugin(i, input_data[curr]);
             l_plugin[i] = Controls[i].Plugin;
             ++curr;
             Controls[i].RawData = input_data[curr];
@@ -673,7 +715,10 @@ static void netplay_send_raw_input(struct pif* pif)
     {
         if (l_netplay_control[i] != -1)
         {
-            if (pif->channels[i].tx && pif->channels[i].tx_buf[0] == JCMD_CONTROLLER_READ)
+            if (pif->channels[i].tx
+             && (*pif->channels[i].tx & 0x3f) == 1
+             && (*pif->channels[i].rx & 0x3f) == 4
+             && pif->channels[i].tx_buf[0] == JCMD_CONTROLLER_READ)
                 netplay_send_input(i, *(uint32_t*)pif->channels[i].rx_buf);
         }
     }
@@ -689,11 +734,16 @@ static void netplay_get_raw_input(struct pif* pif)
             {
                 *pif->channels[i].rx &= ~0xC0; //Always show the controller as connected
 
-                if(pif->channels[i].tx_buf[0] == JCMD_CONTROLLER_READ)
+                if (pif->channels[i].tx_buf[0] == JCMD_CONTROLLER_READ
+                 && (*pif->channels[i].tx & 0x3f) == 1
+                 && (*pif->channels[i].rx & 0x3f) == 4)
                 {
                     *(uint32_t*)pif->channels[i].rx_buf = netplay_get_input(i);
                 }
-                else if ((pif->channels[i].tx_buf[0] == JCMD_STATUS || pif->channels[i].tx_buf[0] == JCMD_RESET) && Controls[i].RawData)
+                else if ((pif->channels[i].tx_buf[0] == JCMD_STATUS || pif->channels[i].tx_buf[0] == JCMD_RESET)
+                      && (*pif->channels[i].tx & 0x3f) == 1
+                      && (*pif->channels[i].rx & 0x3f) == 3
+                      && Controls[i].RawData)
                 {
                     //a bit of a hack for raw input controllers, force the status
                     uint16_t type = JDT_JOY_ABS_COUNTERS | JDT_JOY_PORT;
@@ -701,12 +751,18 @@ static void netplay_get_raw_input(struct pif* pif)
                     pif->channels[i].rx_buf[1] = (uint8_t)(type >> 8);
                     pif->channels[i].rx_buf[2] = 0;
                 }
-                else if (pif->channels[i].tx_buf[0] == JCMD_PAK_READ && Controls[i].RawData)
+                else if (pif->channels[i].tx_buf[0] == JCMD_PAK_READ
+                      && (*pif->channels[i].tx & 0x3f) == 3
+                      && (*pif->channels[i].rx & 0x3f) == 33
+                      && Controls[i].RawData)
                 {
                     //also a hack for raw input, we return "mempak not present" if the game tries to read the mempak
                     pif->channels[i].rx_buf[32] = 255;
                 }
-                else if (pif->channels[i].tx_buf[0] == JCMD_PAK_WRITE && Controls[i].RawData)
+                else if (pif->channels[i].tx_buf[0] == JCMD_PAK_WRITE
+                      && (*pif->channels[i].tx & 0x3f) == 35
+                      && (*pif->channels[i].rx & 0x3f) == 1
+                      && Controls[i].RawData)
                 {
                     //also a hack for raw input, we return "mempak not present" if the game tries to write to mempak
                     pif->channels[i].rx_buf[0] = 255;

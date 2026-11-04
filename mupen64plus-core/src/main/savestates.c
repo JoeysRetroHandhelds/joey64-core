@@ -206,6 +206,22 @@ static void savestates_clear_job(void)
 #define PUTDATA(buff, type, value) \
     do { type x = value; PUTARRAY(&x, buff, type, 1); } while(0)
 
+/* From upstream 4f71d580: a queue without its 0xFFFFFFFF end marker (corrupt or foreign state) would make
+ * load_eventqueue_infos run past the buffer. Entries are 8 bytes (type, count). */
+static int savestates_queue_has_terminator(const char* queue, size_t size)
+{
+    static const char terminator[4] = { -1, -1, -1, -1 };
+    size_t offset;
+
+    for (offset = 0; offset + sizeof(terminator) <= size; offset += 8)
+    {
+        if (memcmp(queue + offset, terminator, sizeof(terminator)) == 0)
+            return 1;
+    }
+
+    return 0;
+}
+
 #ifndef __LIBRETRO__
 int savestates_load_m64p(struct device* dev, char *filepath)
 #else
@@ -397,6 +413,13 @@ int savestates_load_m64p(struct device* dev, const void *data)
 #else
     pthread_mutex_unlock(&savestates_lock);
 #endif
+
+    if (!savestates_queue_has_terminator(queue, sizeof(queue)))
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Invalid event queue in savestate");
+        free(savestateData);
+        return 0;
+    }
 
     // Parse savestate
     dev->rdram.regs[0][RDRAM_CONFIG_REG]       = GETDATA(curr, uint32_t);
@@ -709,8 +732,9 @@ int savestates_load_m64p(struct device* dev, const void *data)
         /* extra pif channels state */
         for (i = 0; i < PIF_CHANNELS_COUNT; ++i) {
             int offset = GETDATA(curr, int8_t);
-            if (offset >= 0) {
-                setup_pif_channel(&dev->pif.channels[i], dev->pif.ram + offset);
+            if (offset >= 0 && offset < PIF_RAM_SIZE) {
+                setup_pif_channel(&dev->pif.channels[i], dev->pif.ram + offset,
+                    PIF_RAM_SIZE - offset);
             }
             else {
                 disable_pif_channel(&dev->pif.channels[i]);
@@ -854,8 +878,9 @@ int savestates_load_m64p(struct device* dev, const void *data)
         /* extra pif channels state */
         for (i = 0; i < PIF_CHANNELS_COUNT; ++i) {
             int offset = GETDATA(curr, int8_t);
-            if (offset >= 0) {
-                setup_pif_channel(&dev->pif.channels[i], dev->pif.ram + offset);
+            if (offset >= 0 && offset < PIF_RAM_SIZE) {
+                setup_pif_channel(&dev->pif.channels[i], dev->pif.ram + offset,
+                    PIF_RAM_SIZE - offset);
             }
             else {
                 disable_pif_channel(&dev->pif.channels[i]);
