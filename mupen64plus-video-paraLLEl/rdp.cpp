@@ -109,15 +109,18 @@ bool synchronous = true, divot_filter = true, gamma_dither = true;
 bool vi_aa = true, vi_scale = true, dither_filter = true;
 bool interlacing = true, super_sampled_read_back = false, super_sampled_dither = true;
 
-// Smart sync (on by default, env N64_RDP_SMART=0 turns it off and the synchronous option decides again): run
-// asynchronously, but remember which RDRAM pages the RDP drew into
+// Smart sync (replaces synchronous mode when the synchronous option is on; env N64_RDP_SMART=0 gives plain
+// synchronous mode again; with the option off parallel-RDP is plain async): run asynchronously, but remember
+// which RDRAM pages the RDP drew into
 // (color image and depth buffer rows inside the scissor). At SyncFull those pages are made inaccessible; the
 // first CPU access to one (CPU load/store, dynarec, or a DMA copy, which are all CPU memcpys here) faults,
 // waits for the GPU to reach that SyncFull, and unprotects them. Async speed, synchronous results for games
 // that read back what the RDP drew (gopher64 does the same with interpreter hooks). Needs the RDRAM imported
 // into Vulkan (VK_EXT_external_memory_host, the GPU writes the same pages) or the core's second RDRAM mapping
-// (g_rdram_alias, for paraLLEl-RDP's copy-back thread). Measured: Flip (Mali) at async speed (Snap 14.4 -> 5.0 ms,
-// GoldenEye 41 -> 52 fps vs sync); Duo (Turnip) renders RE2 and Cruis'n USA like sync, which async shows black.
+// (g_rdram_alias, for paraLLEl-RDP's copy-back thread). Measured: Duo (Turnip) renders RE2 and Cruis'n USA like
+// sync, which async shows black, at or below sync cost; Flip (Mali) Snap 14.4 -> 5.0 ms/frame vs sync. Most games
+// touch drawn pages every frame (Flip: SM64 587, OoT 599 waits per 600 SyncFulls), so it is no faster than sync
+// for them and much slower than async: it replaces sync only.
 namespace Smart
 {
 static bool enabled;
@@ -382,13 +385,13 @@ void process_commands()
 
 		if (command >= 8 && frontend)
 			frontend->enqueue_command(cmd_length * 2, &cmd_data[2 * cmd_cur]);
-		if (Smart::enabled)
+		if (Smart::enabled && synchronous)
 			Smart::track(RDP::Op(command), w1, cmd_data[2 * cmd_cur + 1]);
 
 		if (RDP::Op(command) == RDP::Op::SyncFull)
 		{
 			// For synchronous RDP (smart sync waits only when the CPU touches what was drawn):
-			if (Smart::enabled && frontend)
+			if (Smart::enabled && synchronous && frontend)
 				Smart::on_sync_full();
 			else if (synchronous && frontend)
 				frontend->wait_for_timeline(frontend->signal_timeline());
