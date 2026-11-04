@@ -27,6 +27,8 @@
 #include "rdp_common.hpp"
 #include "worker_thread.hpp"
 #include <unordered_set>
+#include <thread>
+#include <memory>
 
 namespace RDP
 {
@@ -423,6 +425,21 @@ private:
 	std::atomic_uint pipelines_done{0};
 	std::atomic_bool pipeline_worker_stop{false};
 	unsigned pipelines_ahead_target = 0;
+
+	// EXPERIMENT (N64_RDP_PREBUILD_THREADS=<n>, n >= 2): last session's pipeline list is built on n threads of
+	// its own at launch instead of on the single pipeline worker (Dolphin uses more compile threads at start).
+	// Each thread takes the next list entry; the urgent ones are first in the list, and launch waits for them.
+	struct PrebuildJob
+	{
+		std::vector<Vulkan::DeferredPipelineCompile> list;
+		std::atomic_uint next{0};
+		unsigned num_urgent = 0;
+		unsigned urgent_done = 0; // under lock
+		std::mutex lock;
+		std::condition_variable cond;
+	};
+	std::shared_ptr<PrebuildJob> prebuild_job;
+	std::vector<std::thread> prebuild_threads;
 
 	void resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd);
 	void resolve_coherency_gpu_to_host(CoherencyOperation &op, Vulkan::CommandBuffer &cmd);

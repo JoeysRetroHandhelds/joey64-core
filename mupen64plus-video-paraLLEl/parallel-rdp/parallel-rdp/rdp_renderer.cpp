@@ -49,6 +49,9 @@ Renderer::~Renderer()
 	// Drop what is still queued (pipelines built ahead), then stop the worker
 	// before the counters it uses go away.
 	pipeline_worker_stop.store(true, std::memory_order_release);
+	for (auto &t : prebuild_threads)
+		if (t.joinable())
+			t.join();
 	pipeline_worker.reset();
 }
 
@@ -3702,6 +3705,13 @@ void Renderer::build_pipelines_ahead(const Vulkan::PipelineRecord *records, size
 	if (!pipeline_worker)
 		return;
 
+	// EXPERIMENT: N64_RDP_PREBUILD_THREADS=<n> (n >= 2) builds the list on n threads of its own instead of on
+	// the worker; the worker keeps taking the draws' own requests and skips whatever is built already.
+	std::shared_ptr<PrebuildJob> job;
+	if (const char *env = getenv("N64_RDP_PREBUILD_THREADS"))
+		if (strtoul(env, nullptr, 0) >= 2)
+			job = std::make_shared<PrebuildJob>();
+
 	for (size_t i = 0; i < count; i++)
 	{
 		Vulkan::DeferredPipelineCompile compile;
@@ -3720,12 +3730,50 @@ void Renderer::build_pipelines_ahead(const Vulkan::PipelineRecord *records, size
 #endif
 		if (has_fallback)
 			background.push_back(std::move(compile));
+		else if (job)
+		{
+			job->list.push_back(std::move(compile));
+			job->num_urgent++;
+			num_urgent++;
+		}
 		else
 		{
 			pipelines_pushed.fetch_add(1, std::memory_order_relaxed);
 			pipeline_worker->push(std::move(compile));
 			num_urgent++;
 		}
+	}
+
+	if (job)
+	{
+		// Urgent entries first in the list, then the background ones; each thread takes the next entry.
+		for (auto &compile : background)
+		{
+			job->list.push_back(std::move(compile));
+			num_background++;
+		}
+		unsigned threads = unsigned(strtoul(getenv("N64_RDP_PREBUILD_THREADS"), nullptr, 0));
+		PipelineExecutor exec = { device, &pipelines_done, &pipeline_worker_stop };
+		for (unsigned t = 0; t < threads; t++)
+		{
+			prebuild_threads.emplace_back([job, exec]() {
+				for (;;)
+				{
+					unsigned i = job->next.fetch_add(1, std::memory_order_relaxed);
+					if (i >= job->list.size() || exec.stop->load(std::memory_order_acquire))
+						break;
+					exec.perform_work(job->list[i]);
+					if (i < job->num_urgent)
+					{
+						std::lock_guard<std::mutex> holder{job->lock};
+						job->urgent_done++;
+						job->cond.notify_all();
+					}
+				}
+			});
+		}
+		prebuild_job = std::move(job);
+		return;
 	}
 
 	// The worker is first in, first out: once it has done this many items,
@@ -3744,6 +3792,14 @@ void Renderer::wait_pipelines_ahead()
 {
 	if (!pipeline_worker)
 		return;
+	if (prebuild_job)
+	{
+		// Wait for the job threads to build the urgent entries (the worker may get to some first; either is fine).
+		auto job = prebuild_job;
+		std::unique_lock<std::mutex> holder{job->lock};
+		job->cond.wait(holder, [&]() { return job->urgent_done >= job->num_urgent; });
+		return;
+	}
 	unsigned target = pipelines_ahead_target;
 	pipeline_worker->wait([this, target]() {
 		return pipelines_done.load(std::memory_order_acquire) >= target;

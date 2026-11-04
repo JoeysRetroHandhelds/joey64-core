@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string>
 #include <string.h>
 #include <signal.h>
@@ -211,9 +212,14 @@ static void build_pipelines_ahead()
 	if ((env && env[0] == '0') || pipeline_list.empty() || !frontend)
 		return;
 	unsigned urgent = 0, background = 0;
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
 	frontend->build_pipelines_ahead(pipeline_list.data(), pipeline_list.size(), urgent, background);
-	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: pipeline list of %u: built %u ahead, %u more in the background.\n",
-	       unsigned(pipeline_list.size()), urgent, background);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	const char *thr = getenv("N64_RDP_PREBUILD_THREADS");
+	double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: pipeline list of %u: built %u ahead in %.1f ms, %u more in the background (threads %s).\n",
+	       unsigned(pipeline_list.size()), urgent, ms, background, thr ? thr : "1");
 }
 
 static void load_pipeline_cache()
