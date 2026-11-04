@@ -637,6 +637,23 @@ void Renderer::set_rdram(Vulkan::Buffer *buffer, uint8_t *host_rdram, size_t off
 			incoherent.staging_readback_pages = div_round_up(readback_info.size, ImplementationConstants::IncoherentPageSize);
 		}
 
+		{
+			// Reading the GPU copy back is only cheap in cached memory, and only
+			// safe to compare without extra flushes in coherent memory.
+			const VkMemoryPropertyFlags cached_coherent =
+					VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+			const auto &allocation = rdram->get_allocation();
+			incoherent.compare_before_upload = allocation.is_host_allocation() &&
+					(device->get_memory_properties().memoryTypes[allocation.get_memory_type()].propertyFlags &
+					 cached_coherent) == cached_coherent;
+			// PARALLEL_RDP_FULL_RDRAM_UPLOAD=1: upload every page whole, as before.
+			if (const char *env = getenv("PARALLEL_RDP_FULL_RDRAM_UPLOAD"))
+				if (strtol(env, nullptr, 0) > 0)
+					incoherent.compare_before_upload = false;
+			LOGI("RDRAM upload: %s.\n", incoherent.compare_before_upload ?
+			     "only pages that differ" : "every page whole");
+		}
+
 		incoherent.page_to_direct_copy.clear();
 		incoherent.page_to_masked_copy.clear();
 		incoherent.page_to_pending_readback.clear();
@@ -2706,6 +2723,54 @@ const Vulkan::Buffer *Renderer::get_upscaled_hidden_rdram_buffer() const
 	return upscaling_multisampled_hidden_rdram.get();
 }
 
+// Direct upload of count pages from index, writing only what differs: a page
+// that already matches the GPU copy is not written, and its write mask is
+// cleared only if it has a bit set. RDRAM ends up exactly as a full upload
+// would leave it, whatever wrote the guest's pages. None of these pages has
+// a GPU write pending.
+void Renderer::upload_pages_compared(unsigned index, unsigned count)
+{
+	static const uint8_t zero_page[ImplementationConstants::IncoherentPageSize] = {};
+	const size_t page_size = ImplementationConstants::IncoherentPageSize;
+	const size_t offset = page_size * index;
+	const size_t size = page_size * count;
+	const Vulkan::MemoryAccessFlags access = Vulkan::MEMORY_ACCESS_READ_BIT | Vulkan::MEMORY_ACCESS_WRITE_BIT;
+	const uint8_t *host = incoherent.host_rdram + offset;
+#ifdef PARALLEL_RDP_VERIFY_UPLOADS
+	// Snapshot the guest's pages, which the CPU may be writing meanwhile:
+	// this is what a full upload of them would leave.
+	static uint8_t seen[32 * ImplementationConstants::IncoherentPageSize];
+	memcpy(seen, host, size);
+	host = seen;
+#endif
+	uint8_t *data = static_cast<uint8_t *>(device->map_host_buffer(*rdram, access, offset, size));
+	uint8_t *mask = static_cast<uint8_t *>(device->map_host_buffer(*rdram, access, offset + rdram_size, size));
+	size_t i;
+
+	for (i = 0; i < size; i += page_size)
+	{
+		if (memcmp(data + i, host + i, page_size))
+		{
+			memcpy(data + i, host + i, page_size);
+			memset(mask + i, 0, page_size);
+		}
+		else if (memcmp(mask + i, zero_page, page_size))
+			memset(mask + i, 0, page_size);
+	}
+
+#ifdef PARALLEL_RDP_VERIFY_UPLOADS
+	for (i = 0; i < size; i += page_size)
+		if (memcmp(data + i, host + i, page_size) || memcmp(mask + i, zero_page, page_size))
+		{
+			LOGE("RDRAM page %u is not as a full upload leaves it.\n", unsigned(index + i / page_size));
+			abort();
+		}
+#endif
+
+	device->unmap_host_buffer(*rdram, access, offset + rdram_size, size);
+	device->unmap_host_buffer(*rdram, access, offset, size);
+}
+
 void Renderer::resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd)
 {
 	// Now, ensure that the GPU sees a coherent view of the CPU memory writes up until now.
@@ -2734,6 +2799,11 @@ void Renderer::resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd)
 			uint32_t base_index = 32 * (&direct - incoherent.page_to_direct_copy.data());
 			Util::for_each_bit_range(direct, [&](unsigned index, unsigned count) {
 				index += base_index;
+				if (incoherent.compare_before_upload)
+				{
+					upload_pages_compared(index, count);
+					return;
+				}
 				auto *mapped_rdram = device->map_host_buffer(*rdram, Vulkan::MEMORY_ACCESS_WRITE_BIT,
 				                                             ImplementationConstants::IncoherentPageSize * index,
 				                                             ImplementationConstants::IncoherentPageSize * count);
