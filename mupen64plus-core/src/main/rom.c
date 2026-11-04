@@ -73,6 +73,7 @@ m64p_rom_settings ROM_SETTINGS;
 static m64p_system_type rom_country_code_to_system_type(uint16_t country_code);
 
 static unsigned char rom_homebrew_savetype_to_savetype(uint8_t save_type);
+static int rom_savetype_from_game_id(void);
 
 static const uint8_t Z64_SIGNATURE[4] = { 0x80, 0x37, 0x12, 0x40 };
 static const uint8_t V64_SIGNATURE[4] = { 0x37, 0x80, 0x40, 0x12 };
@@ -229,8 +230,11 @@ m64p_error open_rom(const unsigned char* romimage, unsigned int size)
         }
         else
         {
-            /* There's no way to guess the save type, but 4K EEPROM is better than nothing */
-            ROM_SETTINGS.savetype = SAVETYPE_EEPROM_4K;
+            /* A hack or translation keeps its game's ID: use that game's save type, else 4K EEPROM */
+            int by_id = rom_savetype_from_game_id();
+            ROM_SETTINGS.savetype = by_id >= 0 ? (unsigned char)by_id : SAVETYPE_EEPROM_4K;
+            if (by_id >= 0)
+                DebugMessage(M64MSG_INFO, "Unknown ROM: save type %d from its game ID", by_id);
         }
     }
 
@@ -424,6 +428,57 @@ static m64p_system_type rom_country_code_to_system_type(uint16_t country_code)
 }
 
 // Converts the homebrew advanced rom header savetype to a m64p_rom_save_type
+/* Save type by game ID (header bytes 0x3B-0x3D, e.g. "NSM") for ROMs missing from the database: ROM hacks,
+ * randomizers and translations keep the original game's ID. Without this they all got EEPROM 4K, so hacks of
+ * 16K EEPROM games (DK64, Banjo-Tooie, Yoshi's Story...) could not save. SRAM and FlashRAM are also auto-detected
+ * by the cart on first access, but naming them avoids a wrong guess. Lists from ares
+ * (mia/medium/nintendo-64.cpp, ISC license). Returns -1 when the ID is not listed. */
+static const char* const kGameIdEeprom16K[] = {
+    "NB7", "NGT", "NFU", "NCW", "NCZ", "ND6", "NDO", "ND2", "N3D", "NMX", "NGC", "NIM", "NNB", "NMV", "NM8",
+    "NEV", "NPP", "NUB", "NPD", "NRZ", "NR7", "NEP", "NYS",
+};
+static const char* const kGameIdSram[] = {
+    "NTE", "NVB", "NB5", "CFZ", "NFZ", "NSI", "NG6", "NGP", "NYW", "NHY", "NIB", "NPS", "NPA", "NP4", "NJ5",
+    "NP6", "NPE", "NJG", "CZL", "NZL", "NKG", "NMF", "NRI", "NUT", "NUM", "NOB", "CPS", "NPM", "NRE", "NAL",
+    "NT3", "NS4", "NA2", "NVP", "NWL", "NW2", "NWX",
+};
+static const char* const kGameIdFlash[] = {
+    "NCC", "NCV", "NDA", "NAF", "NJF", "NKJ", "NZS", "NM6", "NCK", "NMQ", "NPN", "NPF", "NPO", "CP2", "NP3",
+    "NRH", "NSQ", "NT9", "NW4", "NDP",
+};
+
+static int id_in(const char* id, const char* const* list, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++)
+        if (memcmp(id, list[i], 3) == 0)
+            return 1;
+    return 0;
+}
+
+static int rom_savetype_from_game_id(void)
+{
+    const uint8_t* h = (const uint8_t*)&ROM_HEADER;
+    char id[3] = { (char)h[0x3B], (char)h[0x3C], (char)h[0x3D] };
+    char region = (char)h[0x3E];
+    uint8_t revision = h[0x3F];
+
+    /* ares' per-region exceptions */
+    if (memcmp(id, "NK4", 3) == 0) /* Kirby 64: early Japanese revisions use SRAM */
+        return (region == 'J' && revision < 2) ? SAVETYPE_SRAM : SAVETYPE_EEPROM_16KB;
+    if (memcmp(id, "ND3", 3) == 0 || memcmp(id, "ND4", 3) == 0)
+        return region == 'J' ? SAVETYPE_EEPROM_16KB : SAVETYPE_EEPROM_4K;
+    if (memcmp(id, "N3H", 3) == 0 && region == 'J')
+        return SAVETYPE_SRAM;
+    if (id_in(id, kGameIdEeprom16K, sizeof(kGameIdEeprom16K) / sizeof(kGameIdEeprom16K[0])))
+        return SAVETYPE_EEPROM_16KB;
+    if (id_in(id, kGameIdSram, sizeof(kGameIdSram) / sizeof(kGameIdSram[0])))
+        return SAVETYPE_SRAM;
+    if (id_in(id, kGameIdFlash, sizeof(kGameIdFlash) / sizeof(kGameIdFlash[0])))
+        return SAVETYPE_FLASH_RAM;
+    return -1;
+}
+
 static unsigned char rom_homebrew_savetype_to_savetype(uint8_t save_type)
 {
     unsigned char m64p_save_type;
