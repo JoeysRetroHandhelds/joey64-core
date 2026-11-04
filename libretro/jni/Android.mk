@@ -37,6 +37,8 @@ ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
   HAVE_THR_AL = 1
 else ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
   WITH_DYNAREC := aarch64
+  HAVE_NEON := 1
+  CRC_ARMV8 := 1
   LLE = 1
   HAVE_PARALLEL_RSP = 1
   HAVE_PARALLEL_RDP = 1
@@ -85,6 +87,9 @@ LOCAL_SRC_FILES        := $(SOURCES_CXX) $(SOURCES_C) $(SOURCES_ASM) $(SOURCES_N
 LOCAL_C_INCLUDES       := $(AWK_DEST_DIR)
 LOCAL_ASMFLAGS         := $(COREASMFLAGS) -I$(AWK_DEST_DIR)/
 LOCAL_CPPFLAGS         := -std=gnu++11 $(CXXFLAGS) $(COREFLAGS)
+ifeq ($(CRC_ARMV8),1)
+  LOCAL_CPPFLAGS       += -march=armv8-a+crc
+endif
 LOCAL_CFLAGS           := $(CFLAGS) $(COREFLAGS)
 LOCAL_LDFLAGS          := -Wl,-version-script=$(LIBRETRO_DIR)/link.T
 LOCAL_LDLIBS           := -llog -lEGL $(GLLIB) $(CORELDLIBS)
