@@ -171,7 +171,10 @@ extern "C" void Config_LoadConfig()
 	config.frameBufferEmulation.copyFromRDRAM = EnableCopyColorFromRDRAM;
 
 	// TODO: Make this a Core options or maybe only default to bsOnVerticalInterrupt on Android with Thr Renderer
-	config.frameBufferEmulation.bufferSwapMode = Config::bsOnVerticalInterrupt;
+	// N64_GLN_SWAP_MODE=1|2 swaps only on a VI origin change / a new frame buffer (M64Plus FZ defaults to 2), so the
+	// frontend presents only frames that changed: OoT draws ~20 a second but was presented 60 times.
+	const char *swapMode = getenv("N64_GLN_SWAP_MODE");
+	config.frameBufferEmulation.bufferSwapMode = swapMode ? atoi(swapMode) : Config::bsOnVerticalInterrupt;
 
 #ifdef HAVE_OPENGLES2
 	config.generalEmulation.enableFragmentDepthWrite = 0;

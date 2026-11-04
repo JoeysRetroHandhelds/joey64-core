@@ -28,6 +28,7 @@ extern unsigned overscan;
 extern unsigned downscaling_steps;
 extern bool synchronous, divot_filter, gamma_dither, vi_aa, vi_scale, dither_filter, interlacing;
 extern bool native_texture_lod, native_tex_rect, super_sampled_read_back, super_sampled_dither;
+extern bool frame_valid;
 
 void complete_frame();
 void deinit();

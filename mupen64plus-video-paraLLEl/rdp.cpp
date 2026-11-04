@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
+#include <string.h>
 #include <signal.h>
 #include <dlfcn.h>
 #include <ucontext.h>
@@ -114,6 +115,7 @@ bool native_tex_rect = true;
 bool synchronous = true, divot_filter = true, gamma_dither = true;
 bool vi_aa = true, vi_scale = true, dither_filter = true;
 bool interlacing = true, super_sampled_read_back = false, super_sampled_dither = true;
+bool frame_valid = true;
 
 // Smart sync (replaces synchronous mode when the synchronous option is on; env N64_RDP_SMART=0 gives plain
 // synchronous mode again; with the option off parallel-RDP is plain async): run asynchronously, but remember
@@ -365,6 +367,102 @@ static const unsigned cmd_len_lut[64] = {
 	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  1,  1,  1,  1,  1,
 };
 
+// Repeat frames (env N64_RDP_SKIP_DUP=1): most games draw 20-30 frames a second, but the VI scans one out every
+// refresh. A refresh is skipped (the frontend keeps showing the last picture) when the VI registers are the same as
+// last time, the RDP drew nothing into the scanned-out rows since, and those rows' RDRAM hashes the same (CPU
+// writes). Interlaced output always scans out. With smart sync, RDRAM is read through the never-protected alias.
+namespace Dup
+{
+static bool enabled;
+static uint32_t color_addr, color_width, color_size, scissor_yh, scissor_yl;
+static vector<std::pair<uint32_t, uint32_t>> drawn; // byte ranges the RDP drew into since the last scanout
+static uint32_t last_vi[10];
+static uint64_t last_hash;
+static bool have_last;
+static unsigned skipped, scanned;
+
+static void add_draw()
+{
+	uint32_t stride = color_size ? (color_width << (color_size - 1)) : (color_width >> 1);
+	uint32_t y0 = scissor_yh, y1 = scissor_yl + 1;
+	if (!stride || y1 <= y0)
+		return;
+	std::pair<uint32_t, uint32_t> r(color_addr + y0 * stride, color_addr + y1 * stride);
+	for (auto &d : drawn)
+		if (d == r)
+			return;
+	if (drawn.size() >= 32)
+		drawn.assign(1, std::pair<uint32_t, uint32_t>(0, 0xFFFFFFFFu)); // too many targets: everything is dirty
+	else
+		drawn.push_back(r);
+}
+
+static void track(RDP::Op op, uint32_t w1, uint32_t w2)
+{
+	switch (op)
+	{
+	case RDP::Op::SetColorImage:
+		color_addr = w2 & 0x00FFFFFF;
+		color_size = (w1 >> 19) & 3;
+		color_width = (w1 & 0x3FF) + 1;
+		break;
+	case RDP::Op::SetScissor:
+		scissor_yh = (w1 & 0xFFF) >> 2;
+		scissor_yl = (w2 & 0xFFF) >> 2;
+		break;
+	case RDP::Op::FillTriangle:
+	case RDP::Op::TextureTriangle:
+	case RDP::Op::ShadeTriangle:
+	case RDP::Op::ShadeTextureTriangle:
+	case RDP::Op::TextureRectangle:
+	case RDP::Op::TextureRectangleFlip:
+	case RDP::Op::FillRectangle:
+	case RDP::Op::FillZBufferTriangle:
+	case RDP::Op::TextureZBufferTriangle:
+	case RDP::Op::ShadeZBufferTriangle:
+	case RDP::Op::ShadeTextureZBufferTriangle:
+		add_draw();
+		break;
+	default:
+		break;
+	}
+}
+
+// True when this refresh would scan out the same picture as the last one.
+static bool same_as_last()
+{
+	const uint32_t vi[10] = { *GET_GFX_INFO(VI_STATUS_REG), *GET_GFX_INFO(VI_ORIGIN_REG), *GET_GFX_INFO(VI_WIDTH_REG),
+	                          *GET_GFX_INFO(VI_X_SCALE_REG), *GET_GFX_INFO(VI_Y_SCALE_REG), *GET_GFX_INFO(VI_H_START_REG),
+	                          *GET_GFX_INFO(VI_V_START_REG), *GET_GFX_INFO(VI_V_SYNC_REG), *GET_GFX_INFO(VI_H_SYNC_REG),
+	                          upscaling };
+	// Rows the VI reads: origin, width and bytes per pixel, active lines scaled by Y scale, plus margin for filtering.
+	uint32_t type = vi[0] & 3, bpp = type == 3 ? 4 : 2, stride = (vi[2] & 0xFFF) * bpp;
+	uint32_t v0 = (vi[6] >> 16) & 0x3FF, v1 = vi[6] & 0x3FF;
+	uint32_t rows = (v1 > v0 ? (v1 - v0) / 2 : 0) * (vi[4] & 0xFFF) / 1024 + 4;
+	uint32_t origin = vi[1] & 0x00FFFFFF;
+	uint32_t s = origin > 2 * stride ? origin - 2 * stride : 0;
+	uint32_t e = std::min<uint64_t>(uint64_t(origin) + uint64_t(rows) * stride, frontend_rdram_size);
+	bool drew = false;
+	for (auto &d : drawn)
+		drew |= d.first < e && s < d.second;
+	drawn.clear();
+	uint64_t hash = 1469598103934665603ull;
+	if (type >= 2 && s < e)
+	{
+		const uint8_t *mem = g_rdram_alias ? static_cast<const uint8_t *>(g_rdram_alias) : DRAM;
+		const uint64_t *w = reinterpret_cast<const uint64_t *>(mem + (s & ~7u));
+		for (size_t i = 0, n = (e - (s & ~7u)) / 8; i < n; i++)
+			hash = (hash ^ w[i]) * 1099511628211ull;
+	}
+	bool same = have_last && !drew && hash == last_hash && memcmp(vi, last_vi, sizeof(vi)) == 0 &&
+	            !(vi[0] & 0x40); // serrate: interlaced fields alternate
+	memcpy(last_vi, vi, sizeof(vi));
+	last_hash = hash;
+	have_last = true;
+	return same;
+}
+}
+
 void process_commands()
 {
 	const uint32_t DP_CURRENT = *GET_GFX_INFO(DPC_CURRENT_REG) & 0x00FFFFF8;
@@ -428,6 +526,8 @@ void process_commands()
 			frontend->enqueue_command(cmd_length * 2, &cmd_data[2 * cmd_cur]);
 		if (Smart::enabled && synchronous)
 			Smart::track(RDP::Op(command), w1, cmd_data[2 * cmd_cur + 1]);
+		if (Dup::enabled)
+			Dup::track(RDP::Op(command), w1, cmd_data[2 * cmd_cur + 1]);
 
 		if (RDP::Op(command) == RDP::Op::SyncFull)
 		{
@@ -560,6 +660,9 @@ bool init()
 	width = 0;
 	height = 0;
 	Smart::init(gfx_info.RDRAM, rdram_size, device->get_device_features().supports_external_memory_host);
+	// Repeat-frame skipping hashes RDRAM, which smart sync may have protected: only with its alias, or without it.
+	const char *dup = getenv("N64_RDP_SKIP_DUP");
+	Dup::enabled = dup && *dup == '1' && (!Smart::enabled || g_rdram_alias);
 	return true;
 }
 
@@ -733,6 +836,22 @@ void complete_frame()
 		device->timestamp_log_reset();
 		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: bench per frame:%s\n", line.c_str());
 	}
+
+	if (Dup::enabled)
+	{
+		bool same = Dup::same_as_last();
+		if (++(same ? Dup::skipped : Dup::scanned), Dup::skipped + Dup::scanned >= 600)
+		{
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: %u of the last 600 refreshes were repeats (not scanned out)\n", Dup::skipped);
+			Dup::skipped = Dup::scanned = 0;
+		}
+		if (same)
+		{
+			frame_valid = false;
+			return;
+		}
+	}
+	frame_valid = true;
 
 	frontend->set_vi_register(VIRegister::Control, *GET_GFX_INFO(VI_STATUS_REG));
 	frontend->set_vi_register(VIRegister::Origin, *GET_GFX_INFO(VI_ORIGIN_REG));
