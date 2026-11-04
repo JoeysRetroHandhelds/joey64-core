@@ -644,6 +644,23 @@ void complete_frame()
 		save_pipeline_cache();
 	}
 
+	// PARALLEL_RDP_BENCH=1|2: GPU/CPU time per frame for each timestamp tag, every 300 frames
+	static const bool bench = getenv("PARALLEL_RDP_BENCH") != nullptr;
+	static unsigned bench_frames;
+	if (bench && ++bench_frames >= 300)
+	{
+		bench_frames = 0;
+		std::string line;
+		device->timestamp_log([&](const std::string &tag, const Vulkan::TimestampIntervalReport &r) {
+			char buf[96];
+			snprintf(buf, sizeof(buf), " %s %.3f ms (x%.1f)", tag.c_str(),
+			         1000.0 * r.time_per_frame_context, r.accumulations_per_frame_context);
+			line += buf;
+		});
+		device->timestamp_log_reset();
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: bench per frame:%s\n", line.c_str());
+	}
+
 	frontend->set_vi_register(VIRegister::Control, *GET_GFX_INFO(VI_STATUS_REG));
 	frontend->set_vi_register(VIRegister::Origin, *GET_GFX_INFO(VI_ORIGIN_REG));
 	frontend->set_vi_register(VIRegister::Width, *GET_GFX_INFO(VI_WIDTH_REG));
