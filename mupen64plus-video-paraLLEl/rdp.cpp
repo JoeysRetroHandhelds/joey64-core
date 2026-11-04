@@ -379,7 +379,16 @@ static vector<std::pair<uint32_t, uint32_t>> drawn; // byte ranges the RDP drew 
 static uint32_t last_vi[10];
 static uint64_t last_hash;
 static bool have_last;
+// The RDP's results reach RDRAM (where the hash looks for CPU drawing) only when its GPU work for the frame
+// finishes: right after a draw into the scanned-out range the hash still sees the old picture. Until then
+// (settle_until on the timeline) the hash is not compared, and once there it is re-baselined, so a frame the
+// GPU finished late is not counted as CPU drawing (GoldenEye and Paper Mario: no repeats were found at all).
+static uint64_t settle_until;
+static bool settling;
 static unsigned skipped, scanned;
+// Why refreshes were new, over the same 600 (one refresh can count for several): VI registers changed, the RDP
+// drew into the scanned-out range (overflow: more than 32 targets, so everything counted), the RDRAM hash changed.
+static unsigned why_vi, why_drew, why_overflow, why_hash;
 
 static void add_draw()
 {
@@ -392,7 +401,10 @@ static void add_draw()
 		if (d == r)
 			return;
 	if (drawn.size() >= 32)
+	{
 		drawn.assign(1, std::pair<uint32_t, uint32_t>(0, 0xFFFFFFFFu)); // too many targets: everything is dirty
+		why_overflow++;
+	}
 	else
 		drawn.push_back(r);
 }
@@ -435,12 +447,17 @@ static bool same_as_last()
 	                          *GET_GFX_INFO(VI_X_SCALE_REG), *GET_GFX_INFO(VI_Y_SCALE_REG), *GET_GFX_INFO(VI_H_START_REG),
 	                          *GET_GFX_INFO(VI_V_START_REG), *GET_GFX_INFO(VI_V_SYNC_REG), *GET_GFX_INFO(VI_H_SYNC_REG),
 	                          upscaling };
-	// Rows the VI reads: origin, width and bytes per pixel, active lines scaled by Y scale, plus margin for filtering.
+	// Rows the VI reads: from the origin, the active lines stepped by the Y scale (2.10 fixed point, plus its
+	// subpixel start offset), and the next row when it interpolates between two. Exact, because games keep their
+	// frame buffers back to back (SM64): a margin made drawing the next frame look like drawing into this one.
 	uint32_t type = vi[0] & 3, bpp = type == 3 ? 4 : 2, stride = (vi[2] & 0xFFF) * bpp;
 	uint32_t v0 = (vi[6] >> 16) & 0x3FF, v1 = vi[6] & 0x3FF;
-	uint32_t rows = (v1 > v0 ? (v1 - v0) / 2 : 0) * (vi[4] & 0xFFF) / 1024 + 4;
+	uint32_t lines = v1 > v0 ? (v1 - v0) / 2 : 0;
+	uint32_t yscale = vi[4] & 0xFFF, yoff = (vi[4] >> 16) & 0xFFF;
+	uint32_t last = lines ? (lines - 1) * yscale + yoff : 0;
+	uint32_t rows = lines ? last / 1024 + 1 + ((last & 1023) ? 1 : 0) : 0;
 	uint32_t origin = vi[1] & 0x00FFFFFF;
-	uint32_t s = origin > 2 * stride ? origin - 2 * stride : 0;
+	uint32_t s = origin;
 	uint32_t e = std::min<uint64_t>(uint64_t(origin) + uint64_t(rows) * stride, frontend_rdram_size);
 	bool drew = false;
 	for (auto &d : drawn)
@@ -454,8 +471,22 @@ static bool same_as_last()
 		for (size_t i = 0, n = (e - (s & ~7u)) / 8; i < n; i++)
 			hash = (hash ^ w[i]) * 1099511628211ull;
 	}
-	bool same = have_last && !drew && hash == last_hash && memcmp(vi, last_vi, sizeof(vi)) == 0 &&
+	bool vi_same = memcmp(vi, last_vi, sizeof(vi)) == 0;
+	bool hash_same = hash == last_hash;
+	if (drew || !vi_same || !have_last) // a draw into the shown range, or a flip to a buffer drawn earlier
+	{
+		settle_until = timeline_value; // signalled for this frame in complete_frame
+		settling = true;
+	}
+	else if (settling)
+	{
+		if (frontend->timeline_reached(settle_until))
+			settling = false; // results in RDRAM now: this hash is the new baseline
+		hash_same = true;
+	}
+	bool same = have_last && !drew && hash_same && vi_same &&
 	            !(vi[0] & 0x40); // serrate: interlaced fields alternate
+	why_vi += !vi_same; why_drew += drew; why_hash += !hash_same;
 	memcpy(last_vi, vi, sizeof(vi));
 	last_hash = hash;
 	have_last = true;
@@ -842,8 +873,9 @@ void complete_frame()
 		bool same = Dup::same_as_last();
 		if (++(same ? Dup::skipped : Dup::scanned), Dup::skipped + Dup::scanned >= 600)
 		{
-			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: %u of the last 600 refreshes were repeats (not scanned out)\n", Dup::skipped);
-			Dup::skipped = Dup::scanned = 0;
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: %u of the last 600 refreshes were repeats (not scanned out); new because: VI %u, drew %u (overflow %u), hash %u\n",
+			       Dup::skipped, Dup::why_vi, Dup::why_drew, Dup::why_overflow, Dup::why_hash);
+			Dup::skipped = Dup::scanned = Dup::why_vi = Dup::why_drew = Dup::why_overflow = Dup::why_hash = 0;
 		}
 		if (same)
 		{
