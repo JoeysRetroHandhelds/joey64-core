@@ -26,7 +26,7 @@ int SP_STATUS_TIMEOUT;
 
 extern "C"
 {
-	// HLE audio with LLE graphics (dev env N64_HLE_AUDIO=1): audio tasks with a ucode the HLE plugin
+	// HLE audio with LLE graphics (on by default; dev env N64_HLE_AUDIO=0 turns it off): audio tasks with a ucode the HLE plugin
 	// knows run there, everything else on this RSP.
 	void hleInitiateRSP(RSP_INFO Rsp_Info, unsigned int *CycleCount);
 	int hleTryAudioTask(void);
@@ -142,7 +142,7 @@ extern "C"
 
 		RSP::rsp = Rsp_Info;
 		const char *env = getenv("N64_HLE_AUDIO");
-		hle_audio = env && *env == '1';
+		hle_audio = !(env && *env == '0');
 		if (hle_audio)
 			hleInitiateRSP(Rsp_Info, nullptr);
 		*RSP::rsp.SP_PC_REG = 0x04001000 & 0x00000FFF; /* task init bug on Mupen64 */
