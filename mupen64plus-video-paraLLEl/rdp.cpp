@@ -115,6 +115,9 @@ bool native_tex_rect = true;
 bool synchronous = true, divot_filter = true, gamma_dither = true;
 bool vi_aa = true, vi_scale = true, dither_filter = true;
 bool interlacing = true, super_sampled_read_back = false, super_sampled_dither = true;
+// Whether a new picture was scanned out since the frontend last asked (take_frame_valid). Sticky: with repeat
+// skipping, one retro_run can end two refreshes, a new one and then a repeat, and the repeat must not hide the new
+// image (Banjo-Kazooie/Tooie on the Duo kept showing stale and black frames with the app skipping repeats).
 bool frame_valid = true;
 
 // Smart sync (replaces synchronous mode when the synchronous option is on; env N64_RDP_SMART=0 gives plain
@@ -536,6 +539,18 @@ static bool same_as_last()
 	bool drew = false;
 	for (auto &d : drawn)
 		drew |= d.first < e && s < d.second;
+	// N64_RDP_SKIP_DUP_DEBUG=1: the VI registers, the scanned-out range and what the RDP drew, every 60 refreshes
+	static const bool dbg = getenv("N64_RDP_SKIP_DUP_DEBUG") && getenv("N64_RDP_SKIP_DUP_DEBUG")[0] == '1';
+	static unsigned dbg_n;
+	if (dbg && ++dbg_n % 60 == 0)
+	{
+		char buf[512];
+		int n = snprintf(buf, sizeof(buf), "status %x origin %x width %u xs %x ys %x hstart %x vstart %x -> rows %u stride %u [%x,%x) drew %d; draws",
+		                 vi[0], vi[1], vi[2], vi[3], vi[4], vi[5], vi[6], rows, stride, s, e, drew);
+		for (size_t i = 0; i < drawn.size() && i < 8 && n < int(sizeof(buf)) - 24; i++)
+			n += snprintf(buf + n, sizeof(buf) - n, " [%x,%x)", drawn[i].first, drawn[i].second);
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: dup debug: %s\n", buf);
+	}
 	drawn.clear();
 	uint64_t hash = 1469598103934665603ull;
 	if (type >= 2 && s < e)
@@ -907,6 +922,14 @@ static void complete_frame_error()
 	device->flush_frame();
 }
 
+bool take_frame_valid()
+{
+	bool v = frame_valid;
+	if (Dup::enabled)
+		frame_valid = false;
+	return v;
+}
+
 void complete_frame()
 {
 	if (!frontend)
@@ -952,10 +975,7 @@ void complete_frame()
 			Dup::skipped = Dup::scanned = Dup::why_vi = Dup::why_drew = Dup::why_overflow = Dup::why_hash = 0;
 		}
 		if (same)
-		{
-			frame_valid = false;
 			return;
-		}
 	}
 	frame_valid = true;
 

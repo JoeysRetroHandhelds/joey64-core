@@ -143,7 +143,7 @@ unsigned parallel_frame_height()
 
 bool parallel_frame_is_valid()
 {
-	return RDP::frame_valid;
+	return RDP::take_frame_valid();
 }
 
 void parallel_begin_frame()
