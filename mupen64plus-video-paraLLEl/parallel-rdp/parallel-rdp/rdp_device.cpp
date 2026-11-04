@@ -178,6 +178,17 @@ void CommandProcessor::begin_frame_context()
 	vi.begin_frame_context();
 }
 
+void CommandProcessor::build_pipelines_ahead(const Vulkan::PipelineRecord *records, size_t count,
+                                             unsigned &num_urgent, unsigned &num_background)
+{
+	num_urgent = 0;
+	num_background = 0;
+	if (!is_supported)
+		return;
+	renderer.build_pipelines_ahead(records, count, num_urgent, num_background);
+	renderer.wait_pipelines_ahead();
+}
+
 void CommandProcessor::init_renderer()
 {
 	if (!rdram)

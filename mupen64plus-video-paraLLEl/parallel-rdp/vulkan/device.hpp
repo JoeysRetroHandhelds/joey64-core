@@ -151,6 +151,20 @@ private:
 };
 }
 
+// A compute pipeline as it was built, without the driver: enough to build it
+// again in a later run, before its first use. Plain fields only, so a list of
+// them can be written to a file as is.
+struct PipelineRecord
+{
+	uint64_t pipeline_hash;
+	uint64_t program_hash;
+	uint32_t static_words[4];
+	uint32_t spec_constants[VULKAN_NUM_TOTAL_SPEC_CONSTANTS];
+	uint32_t spec_masks; // user mask | internal mask << 8
+	uint32_t subgroup_size_tag;
+};
+static_assert(sizeof(PipelineRecord) == 88, "PipelineRecord is written to files as is.");
+
 class Device
 	: public Util::IntrusivePtrEnabled<Device, std::default_delete<Device>, HandleCounter>
 #ifdef GRANITE_VULKAN_FOSSILIZE
@@ -242,6 +256,14 @@ public:
 	size_t get_pipeline_cache_size();
 	bool get_pipeline_cache_data(uint8_t *data, size_t size);
 	bool init_pipeline_cache(const uint8_t *data, size_t size);
+
+	// The compute pipelines built in this run (up to a cap), as records, and a
+	// record from an earlier run turned back into a compile request. Resolving
+	// fails when the program is not made yet in this run or the pipeline would
+	// no longer hash the same.
+	void record_pipeline(const DeferredPipelineCompile &compile);
+	std::vector<PipelineRecord> get_pipeline_records();
+	bool resolve_pipeline_record(const PipelineRecord &record, DeferredPipelineCompile &compile);
 
 	// Frame-pushing interface.
 	void next_frame_context();
@@ -738,6 +760,8 @@ private:
 	FramebufferAllocator framebuffer_allocator;
 	TransientAttachmentAllocator transient_allocator;
 	VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+	std::mutex pipeline_records_lock;
+	std::vector<PipelineRecord> pipeline_records;
 
 	void init_pipeline_cache();
 	void flush_pipeline_cache();

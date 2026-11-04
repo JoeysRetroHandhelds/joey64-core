@@ -817,6 +817,56 @@ bool Device::get_pipeline_cache_data(uint8_t *data, size_t size)
 	return true;
 }
 
+void Device::record_pipeline(const DeferredPipelineCompile &compile)
+{
+	PipelineRecord r = {};
+	r.pipeline_hash = compile.hash;
+	r.program_hash = compile.program->get_hash();
+	for (unsigned i = 0; i < 4; i++)
+		r.static_words[i] = compile.static_state.words[i];
+	for (unsigned i = 0; i < VULKAN_NUM_TOTAL_SPEC_CONSTANTS; i++)
+		r.spec_constants[i] = compile.potential_static_state.spec_constants[i];
+	r.spec_masks = compile.potential_static_state.spec_constant_mask |
+	               (uint32_t(compile.potential_static_state.internal_spec_constant_mask) << 8);
+	r.subgroup_size_tag = compile.subgroup_size_tag;
+
+	std::lock_guard<std::mutex> holder{pipeline_records_lock};
+	if (pipeline_records.size() < 4096)
+		pipeline_records.push_back(r);
+}
+
+std::vector<PipelineRecord> Device::get_pipeline_records()
+{
+	std::lock_guard<std::mutex> holder{pipeline_records_lock};
+	return pipeline_records;
+}
+
+bool Device::resolve_pipeline_record(const PipelineRecord &record, DeferredPipelineCompile &compile)
+{
+	Program *program;
+	{
+		LOCK_CACHE();
+		program = programs.find(record.program_hash);
+	}
+	// Only programs this run has made already (parallel-RDP makes all of its own at start).
+	if (!program || !program->get_shader(ShaderStage::Compute) || !program->get_pipeline_layout())
+		return false;
+
+	compile = DeferredPipelineCompile{};
+	compile.program = program;
+	compile.layout = program->get_pipeline_layout();
+	for (unsigned i = 0; i < 4; i++)
+		compile.static_state.words[i] = record.static_words[i];
+	for (unsigned i = 0; i < VULKAN_NUM_TOTAL_SPEC_CONSTANTS; i++)
+		compile.potential_static_state.spec_constants[i] = record.spec_constants[i];
+	compile.potential_static_state.spec_constant_mask = uint8_t(record.spec_masks & 0xff);
+	compile.potential_static_state.internal_spec_constant_mask = uint8_t((record.spec_masks >> 8) & 0xff);
+	compile.subgroup_size_tag = record.subgroup_size_tag;
+	compile.cache = pipeline_cache;
+	CommandBuffer::update_hash_compute_pipeline(compile);
+	return compile.hash == record.pipeline_hash;
+}
+
 void Device::flush_pipeline_cache()
 {
 #ifdef GRANITE_VULKAN_SYSTEM_HANDLES

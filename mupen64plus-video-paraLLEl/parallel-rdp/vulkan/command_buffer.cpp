@@ -1184,6 +1184,8 @@ Pipeline CommandBuffer::build_compute_pipeline(Device *device, const DeferredPip
 	auto returned_pipeline = compile.program->add_pipeline(compile.hash, { compute_pipeline, 0 });
 	if (returned_pipeline.pipeline != compute_pipeline)
 		table.vkDestroyPipeline(device->get_device(), compute_pipeline, nullptr);
+	else
+		device->record_pipeline(compile);
 	return returned_pipeline;
 }
 

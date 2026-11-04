@@ -133,6 +133,12 @@ public:
 	void idle();
 	void begin_frame_context();
 
+	// Builds the compute pipelines an earlier run listed, ahead of their first
+	// use, and returns once those a draw cannot do without are built (the rest
+	// keep building in the background). Call before the first command is queued.
+	void build_pipelines_ahead(const Vulkan::PipelineRecord *records, size_t count,
+	                           unsigned &num_urgent, unsigned &num_background);
+
 	// Queues up state and drawing commands.
 	void enqueue_command(unsigned num_words, const uint32_t *words);
 	void enqueue_command_direct(unsigned num_words, const uint32_t *words);

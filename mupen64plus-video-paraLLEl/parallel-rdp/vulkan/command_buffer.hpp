@@ -820,6 +820,7 @@ public:
 
 private:
 	friend class Util::ObjectPool<CommandBuffer>;
+	friend class Device; // for update_hash_compute_pipeline when resolving pipeline records
 	CommandBuffer(Device *device, VkCommandBuffer cmd, VkPipelineCache cache, Type type);
 
 	Device *device;

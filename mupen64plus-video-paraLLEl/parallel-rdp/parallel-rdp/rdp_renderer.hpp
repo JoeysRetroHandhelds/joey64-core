@@ -112,6 +112,15 @@ public:
 
 	bool init_renderer(const RendererOptions &options);
 
+	// Hands the compute pipelines an earlier run listed to the pipeline worker:
+	// first those a draw cannot do without, then the rasterizer variants a draw
+	// can replace with the ubershader meanwhile. Counts both kinds. Call after
+	// init_renderer, before any command is processed.
+	void build_pipelines_ahead(const Vulkan::PipelineRecord *records, size_t count,
+	                           unsigned &num_urgent, unsigned &num_background);
+	// Returns once the worker has built the first kind.
+	void wait_pipelines_ahead();
+
 	// setup may be mutated to apply various fixups to triangle setup.
 	void draw_flat_primitive(TriangleSetup &setup);
 	void draw_shaded_primitive(TriangleSetup &setup, const AttributeSetup &attr);
@@ -402,12 +411,18 @@ private:
 	struct PipelineExecutor
 	{
 		Vulkan::Device *device;
+		std::atomic_uint *done; // work items finished, counted after each one
+		const std::atomic_bool *stop; // set at teardown: queued work is dropped
 		bool is_sentinel(const Vulkan::DeferredPipelineCompile &compile) const;
 		void perform_work(const Vulkan::DeferredPipelineCompile &compile) const;
 		void notify_work_locked(const Vulkan::DeferredPipelineCompile &compile) const;
 	};
 
 	std::unique_ptr<WorkerThread<Vulkan::DeferredPipelineCompile, PipelineExecutor>> pipeline_worker;
+	std::atomic_uint pipelines_pushed{0};
+	std::atomic_uint pipelines_done{0};
+	std::atomic_bool pipeline_worker_stop{false};
+	unsigned pipelines_ahead_target = 0;
 
 	void resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd);
 	void resolve_coherency_gpu_to_host(CoherencyOperation &op, Vulkan::CommandBuffer &cmd);

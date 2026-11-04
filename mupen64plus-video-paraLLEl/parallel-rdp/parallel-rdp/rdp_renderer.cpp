@@ -46,6 +46,10 @@ Renderer::Renderer(CommandProcessor &processor_)
 
 Renderer::~Renderer()
 {
+	// Drop what is still queued (pipelines built ahead), then stop the worker
+	// before the counters it uses go away.
+	pipeline_worker_stop.store(true, std::memory_order_release);
+	pipeline_worker.reset();
 }
 
 void Renderer::set_shader_bank(const ShaderBank *bank)
@@ -68,9 +72,10 @@ bool Renderer::init_renderer(const RendererOptions &options)
 
 #ifdef PARALLEL_RDP_SHADER_DIR
 	pipeline_worker.reset(new WorkerThread<Vulkan::DeferredPipelineCompile, PipelineExecutor>(
-			Granite::Global::create_thread_context(), { device }));
+			Granite::Global::create_thread_context(), { device, &pipelines_done, &pipeline_worker_stop }));
 #else
-	pipeline_worker.reset(new WorkerThread<Vulkan::DeferredPipelineCompile, PipelineExecutor>({ device }));
+	pipeline_worker.reset(new WorkerThread<Vulkan::DeferredPipelineCompile, PipelineExecutor>(
+			{ device, &pipelines_done, &pipeline_worker_stop }));
 #endif
 
 #ifdef PARALLEL_RDP_SHADER_DIR
@@ -1833,6 +1838,7 @@ void Renderer::submit_rasterization(Vulkan::CommandBuffer &cmd, Vulkan::Buffer &
 			if (pending_async_pipelines.count(compile.hash) == 0)
 			{
 				pending_async_pipelines.insert(compile.hash);
+				pipelines_pushed.fetch_add(1, std::memory_order_relaxed);
 				pipeline_worker->push(std::move(compile));
 			}
 			cmd.set_specialization_constant_mask(7);
@@ -3666,6 +3672,10 @@ bool Renderer::supports_subgroup_size_control(uint32_t minimum_size, uint32_t ma
 
 void Renderer::PipelineExecutor::perform_work(const Vulkan::DeferredPipelineCompile &compile) const
 {
+	// Skip at teardown, and skip a pipeline that is already built (ahead, or for a draw).
+	if (stop->load(std::memory_order_acquire) ||
+	    compile.program->get_pipeline(compile.hash).pipeline != VK_NULL_HANDLE)
+		return;
 	auto start_ts = device->write_calibrated_timestamp();
 	Vulkan::CommandBuffer::build_compute_pipeline(device, compile, Vulkan::CommandBuffer::CompileMode::AsyncThread);
 	auto end_ts = device->write_calibrated_timestamp();
@@ -3680,5 +3690,63 @@ bool Renderer::PipelineExecutor::is_sentinel(const Vulkan::DeferredPipelineCompi
 
 void Renderer::PipelineExecutor::notify_work_locked(const Vulkan::DeferredPipelineCompile &) const
 {
+	done->fetch_add(1, std::memory_order_release);
+}
+
+void Renderer::build_pipelines_ahead(const Vulkan::PipelineRecord *records, size_t count,
+                                     unsigned &num_urgent, unsigned &num_background)
+{
+	std::vector<Vulkan::DeferredPipelineCompile> background;
+	num_urgent = 0;
+	num_background = 0;
+	if (!pipeline_worker)
+		return;
+
+	for (size_t i = 0; i < count; i++)
+	{
+		Vulkan::DeferredPipelineCompile compile;
+		// Skip what this run no longer has, or has built already.
+		if (!device->resolve_pipeline_record(records[i], compile) ||
+		    compile.program->get_pipeline(compile.hash).pipeline != VK_NULL_HANDLE)
+			continue;
+
+		// The rasterizer's specialised variants: a draw that misses one runs on the
+		// ubershader meanwhile and asks the worker for it, which finds it built by
+		// then (the worker takes its work in order).
+		bool has_fallback = false;
+#ifndef PARALLEL_RDP_SHADER_DIR
+		has_fallback = !caps.force_sync && compile.program == shader_bank->rasterizer &&
+		               compile.potential_static_state.spec_constant_mask == 0xff;
+#endif
+		if (has_fallback)
+			background.push_back(std::move(compile));
+		else
+		{
+			pipelines_pushed.fetch_add(1, std::memory_order_relaxed);
+			pipeline_worker->push(std::move(compile));
+			num_urgent++;
+		}
+	}
+
+	// The worker is first in, first out: once it has done this many items,
+	// the urgent ones are built.
+	pipelines_ahead_target = pipelines_pushed.load(std::memory_order_relaxed);
+
+	for (auto &compile : background)
+	{
+		pipelines_pushed.fetch_add(1, std::memory_order_relaxed);
+		pipeline_worker->push(std::move(compile));
+		num_background++;
+	}
+}
+
+void Renderer::wait_pipelines_ahead()
+{
+	if (!pipeline_worker)
+		return;
+	unsigned target = pipelines_ahead_target;
+	pipeline_worker->wait([this, target]() {
+		return pipelines_done.load(std::memory_order_acquire) >= target;
+	});
 }
 }

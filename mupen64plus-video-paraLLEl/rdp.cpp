@@ -18,6 +18,7 @@
 #include <semaphore.h>
 #include <pthread.h>
 #include <atomic>
+#include <unordered_set>
 
 using namespace Vulkan;
 using namespace std;
@@ -96,14 +97,135 @@ static void joey_gpu_spin()
 	device->submit(cmd);
 }
 
+// The compute pipelines built in earlier runs (Granite's PipelineRecord), kept next to the pipeline cache in
+// parallel-rdp-pipelines.bin. At start they are built ahead on parallel-RDP's pipeline thread (from the driver
+// cache, so quickly), so a game does not stall on one, or run on the slower ubershader, the first time it needs
+// it. From parallel-n64 (d8fd0cb). N64_RDP_PREBUILD=0 turns the building off; the list is still kept.
+struct PipelineListHeader
+{
+	char magic[8];
+	uint32_t version;
+	uint32_t record_size;
+	uint32_t count;
+	uint32_t reserved;
+	uint64_t checksum;
+};
+static const char pipeline_list_magic[8] = { 'P', 'R', 'D', 'P', 'P', 'I', 'P', 'E' };
+static const uint32_t pipeline_list_version = 1;
+static const size_t pipeline_list_max = 8192;
+static string pipeline_list_path;
+static vector<PipelineRecord> pipeline_list; // as loaded, or as last saved
+static size_t pipeline_records_seen;
+
+static uint64_t pipeline_list_checksum(const vector<PipelineRecord> &list)
+{
+	Util::Hasher h;
+	h.data(reinterpret_cast<const uint32_t *>(list.data()), list.size() * sizeof(PipelineRecord));
+	return h.get();
+}
+
+static void load_pipeline_list()
+{
+	pipeline_list.clear();
+	pipeline_records_seen = 0;
+	if (pipeline_list_path.empty())
+		return;
+	FILE *f = fopen(pipeline_list_path.c_str(), "rb");
+	if (!f)
+		return;
+	PipelineListHeader header = {};
+	bool ok = fread(&header, sizeof(header), 1, f) == 1 &&
+	          memcmp(header.magic, pipeline_list_magic, sizeof(header.magic)) == 0 &&
+	          header.version == pipeline_list_version &&
+	          header.record_size == sizeof(PipelineRecord) &&
+	          header.count <= pipeline_list_max;
+	if (ok)
+	{
+		pipeline_list.resize(header.count);
+		ok = header.count == 0 ||
+		     fread(pipeline_list.data(), sizeof(PipelineRecord), header.count, f) == header.count;
+	}
+	fclose(f);
+	if (ok)
+		ok = pipeline_list_checksum(pipeline_list) == header.checksum;
+	if (!ok)
+	{
+		// A damaged or old list is ignored, and written again at the next save.
+		pipeline_list.clear();
+		log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: ignoring a damaged pipeline list at %s.\n", pipeline_list_path.c_str());
+	}
+}
+
+// Adds this run's new pipelines to the list and writes it, when there are any.
+static void save_pipeline_list()
+{
+	if (pipeline_list_path.empty() || !device)
+		return;
+	vector<PipelineRecord> built = device->get_pipeline_records();
+	if (built.size() == pipeline_records_seen)
+		return;
+	pipeline_records_seen = built.size();
+
+	// The earlier ones first, then this run's that are new; past the cap the oldest go.
+	unordered_set<uint64_t> known;
+	for (auto &r : pipeline_list)
+		known.insert(r.pipeline_hash);
+	vector<PipelineRecord> merged = pipeline_list;
+	for (auto &r : built)
+		if (known.insert(r.pipeline_hash).second)
+			merged.push_back(r);
+	if (merged.size() == pipeline_list.size())
+		return;
+	if (merged.size() > pipeline_list_max)
+		merged.erase(merged.begin(), merged.begin() + (merged.size() - pipeline_list_max));
+
+	PipelineListHeader header = {};
+	memcpy(header.magic, pipeline_list_magic, sizeof(header.magic));
+	header.version = pipeline_list_version;
+	header.record_size = sizeof(PipelineRecord);
+	header.count = uint32_t(merged.size());
+	header.checksum = pipeline_list_checksum(merged);
+
+	// Write a temporary file and rename it, so a kill mid-write can't leave a torn list.
+	string tmp = pipeline_list_path + ".tmp";
+	FILE *f = fopen(tmp.c_str(), "wb");
+	if (!f)
+		return;
+	bool ok = fwrite(&header, sizeof(header), 1, f) == 1 &&
+	          fwrite(merged.data(), sizeof(PipelineRecord), merged.size(), f) == merged.size();
+	ok = fclose(f) == 0 && ok;
+	if (ok && rename(tmp.c_str(), pipeline_list_path.c_str()) == 0)
+	{
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: saved pipeline list, %u pipelines (%u new).\n",
+		       unsigned(merged.size()), unsigned(merged.size() - pipeline_list.size()));
+		pipeline_list = std::move(merged);
+	}
+	else
+		remove(tmp.c_str());
+}
+
+// Right after the CommandProcessor is made, before any command.
+static void build_pipelines_ahead()
+{
+	const char *env = getenv("N64_RDP_PREBUILD");
+	if ((env && env[0] == '0') || pipeline_list.empty() || !frontend)
+		return;
+	unsigned urgent = 0, background = 0;
+	frontend->build_pipelines_ahead(pipeline_list.data(), pipeline_list.size(), urgent, background);
+	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: pipeline list of %u: built %u ahead, %u more in the background.\n",
+	       unsigned(pipeline_list.size()), urgent, background);
+}
+
 static void load_pipeline_cache()
 {
 	const char *dir = nullptr;
 	pipeline_cache_path.clear();
+	pipeline_list_path.clear();
 	vector<uint8_t> data;
 	if (environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &dir) && dir)
 	{
 		pipeline_cache_path = string(dir) + "/Mupen64plus/parallel-rdp-pipeline-cache.bin";
+		pipeline_list_path = string(dir) + "/Mupen64plus/parallel-rdp-pipelines.bin";
 		if (FILE *f = fopen(pipeline_cache_path.c_str(), "rb"))
 		{
 			if (fseek(f, 0, SEEK_END) == 0)
@@ -126,11 +248,12 @@ static void load_pipeline_cache()
 	frames_since_cache_check = 0;
 	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: pipeline cache %u bytes from %s.\n",
 	       unsigned(data.size()), pipeline_cache_path.c_str());
-
+	load_pipeline_list();
 }
 
 static void save_pipeline_cache()
 {
+	save_pipeline_list();
 	if (pipeline_cache_path.empty() || !device)
 		return;
 	size_t size = device->get_pipeline_cache_size();
@@ -907,6 +1030,7 @@ bool init()
 	frontend_rdram_size = rdram_size;
 	if (!create_frontend())
 		return false;
+	build_pipelines_ahead();
 
 	timeline_value = 0;
 	pending_timeline_value = 0;
