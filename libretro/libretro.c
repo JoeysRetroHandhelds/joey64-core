@@ -19,6 +19,7 @@
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <compat/strl.h>
@@ -2042,10 +2043,34 @@ void retro_unload_game(void)
     retro_savestate_complete = false;
 }
 
+/* PGO profile collection: an instrumented build (-fprofile-generate) only writes its profile at exit, which a
+ * force-stopped Android app never reaches; with env N64_PGO_FILE=<path prefix> the profile is written every ~10 s
+ * to <prefix>-<pid>.tmp and renamed to <prefix>-<pid>.profraw, so a kill mid-write never leaves a corrupt file. */
+int __llvm_profile_write_file(void) __attribute__((weak));
+void __llvm_profile_set_filename(const char *) __attribute__((weak));
+static void pgo_flush(void)
+{
+    static int frames = -1;
+    static char tmp[512], final_path[512];
+    if (frames < 0) {
+        const char *path = getenv("N64_PGO_FILE");
+        frames = 0;
+        if (path && __llvm_profile_set_filename) {
+            snprintf(tmp, sizeof(tmp), "%s-%d.tmp", path, (int)getpid());
+            snprintf(final_path, sizeof(final_path), "%s-%d.profraw", path, (int)getpid());
+            __llvm_profile_set_filename(tmp);
+        }
+    }
+    if (tmp[0] && __llvm_profile_write_file && ++frames % 600 == 0 && __llvm_profile_write_file() == 0)
+        rename(tmp, final_path);
+}
+
 void retro_run (void)
 {
     libretro_swap_buffer = false;
     static bool updated = false;
+
+    pgo_flush();
 
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
        update_variables(false);
