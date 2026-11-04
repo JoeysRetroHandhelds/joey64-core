@@ -1296,7 +1296,12 @@ bool Context::create_device(VkPhysicalDevice gpu_, VkSurfaceKHR surface,
 	else
 	{
 		if (has_extension(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME))
+		{
+			// Joey64: the extension must be enabled too, or vkResetQueryPoolEXT stays null on a Vulkan 1.1
+			// instance and QueryPool::add_pool jumps to address 0 (Retroid Pocket Duo, 2026-11-04).
+			enabled_extensions.push_back(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
 			ADD_CHAIN(ext.host_query_reset_features, HOST_QUERY_RESET_FEATURES);
+		}
 
 		if (has_extension(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME))
 		{

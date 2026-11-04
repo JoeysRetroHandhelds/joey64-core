@@ -322,7 +322,8 @@ QueryPool::QueryPool(Device *device_)
 	, table(device_->get_device_table())
 {
 	supports_timestamp = device->get_gpu_properties().limits.timestampComputeAndGraphics &&
-	                     device->get_device_features().vk12_features.hostQueryReset;
+	                     device->get_device_features().vk12_features.hostQueryReset &&
+	                     table.vkResetQueryPool; // Joey64: never call a null entry point
 
 	// Ignore timestampValidBits and friends for now.
 	if (supports_timestamp)
