@@ -320,6 +320,13 @@ template <typename T, unsigned N>
 class StreamCache
 {
 public:
+	// The stream is written straight into its upload buffer: storage is that
+	// mapped buffer, room for N elements.
+	void bind(void *storage)
+	{
+		elements = static_cast<T *>(storage);
+	}
+
 	void add(const T &t)
 	{
 		assert(count < N);
@@ -358,7 +365,7 @@ public:
 
 private:
 	unsigned count = 0;
-	T elements[N];
+	T *elements = nullptr;
 };
 
 namespace Limits
