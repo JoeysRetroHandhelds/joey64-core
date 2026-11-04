@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string>
 #include <signal.h>
+#include <dlfcn.h>
+#include <ucontext.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -29,6 +31,10 @@ static uint64_t pending_timeline_value, timeline_value;
 
 static unique_ptr<Util::TimelineTraceFile> timeline_trace_file;
 static unique_ptr<CommandProcessor> frontend;
+static uintptr_t frontend_rdram;
+static size_t frontend_offset;
+static unsigned frontend_rdram_size, active_upscaling;
+static bool create_frontend();
 static unique_ptr<Device> device;
 static unique_ptr<Context> context;
 static QueryPoolHandle begin_ts, end_ts;
@@ -132,20 +138,25 @@ static volatile uint64_t sync_signal;
 static struct sigaction old_action;
 static bool handler_installed;
 static unsigned faults, sync_count;
+// N64_RDP_SMART_DEBUG=1: what the waits hit (page kind 1 = color, 2 = depth, 3 = both) and who touched it
+static bool debug;
+static unsigned faults_kind[4];
+static uint32_t last_fault_offset;
+static uintptr_t last_fault_pc;
 
 // RDP state that decides where draws land
 static uint32_t color_addr, color_width, color_size, depth_addr;
 static uint32_t scissor_yh, scissor_yl;
 static bool depth_write;
 
-static void set_pages(uint32_t start, uint32_t end)
+static void set_pages(uint32_t start, uint32_t end, uint8_t kind)
 {
 	if (start >= rdram_size)
 		return;
 	if (end > rdram_size)
 		end = rdram_size;
 	for (size_t p = start >> page_shift; p <= ((end - 1) >> page_shift); p++)
-		dirty[p] = 1;
+		dirty[p] |= kind;
 }
 
 static void mark_draw(bool zbuffered)
@@ -154,9 +165,9 @@ static void mark_draw(bool zbuffered)
 	uint32_t y0 = scissor_yh, y1 = scissor_yl + 1;
 	if (!stride || y1 <= y0)
 		return;
-	set_pages(color_addr + y0 * stride, color_addr + y1 * stride);
+	set_pages(color_addr + y0 * stride, color_addr + y1 * stride, 1);
 	if (zbuffered && depth_write)
-		set_pages(depth_addr + y0 * color_width * 2, depth_addr + y1 * color_width * 2);
+		set_pages(depth_addr + y0 * color_width * 2, depth_addr + y1 * color_width * 2, 2);
 }
 
 // Coalesced mprotect over runs of pages where pick(p) is set.
@@ -191,12 +202,21 @@ static void on_sync_full()
 	{
 		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync: %u CPU waits in the last 600 SyncFulls.\n", faults);
 		faults = 0;
+		if (debug)
+		{
+			Dl_info info = {};
+			const char *who = (last_fault_pc && dladdr(reinterpret_cast<void *>(last_fault_pc), &info) && info.dli_sname)
+			                      ? info.dli_sname : "JIT or unknown";
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart debug: color %u, depth %u, both %u; last at 0x%06x (color 0x%06x w %u, depth 0x%06x) by %s\n",
+			       faults_kind[1], faults_kind[2], faults_kind[3], last_fault_offset, color_addr, color_width, depth_addr, who);
+			faults_kind[1] = faults_kind[2] = faults_kind[3] = 0;
+		}
 	}
 	protect_runs([](size_t p) { return dirty[p] && !locked[p]; }, PROT_NONE);
 	for (size_t p = 0; p < dirty.size(); p++)
 		if (dirty[p])
 		{
-			locked[p] = 1;
+			locked[p] |= dirty[p];
 			dirty[p] = 0;
 			any_locked = true;
 		}
@@ -207,6 +227,14 @@ static void handler(int sig, siginfo_t *info, void *uc)
 	uint8_t *addr = static_cast<uint8_t *>(info->si_addr);
 	if (any_locked && addr >= rdram && addr < rdram + rdram_size && locked[size_t(addr - rdram) >> page_shift])
 	{
+		if (debug)
+		{
+			faults_kind[locked[size_t(addr - rdram) >> page_shift] & 3]++;
+			last_fault_offset = uint32_t(addr - rdram);
+#if defined(__aarch64__)
+			last_fault_pc = static_cast<ucontext_t *>(uc)->uc_mcontext.pc;
+#endif
+		}
 		frontend->wait_for_timeline(sync_signal);
 		unlock_all();
 		faults++;
@@ -227,6 +255,17 @@ static void handler(int sig, siginfo_t *info, void *uc)
 		old_action.sa_handler(sig);
 }
 
+// After a full GPU drain before the CommandProcessor is rebuilt: nothing is pending, and the old timeline values
+// mean nothing to the new one.
+static void reset_after_drain()
+{
+	if (!enabled)
+		return;
+	unlock_all();
+	fill(dirty.begin(), dirty.end(), 0);
+	sync_signal = 0;
+}
+
 static bool requested()
 {
 	const char *env = getenv("N64_RDP_SMART");
@@ -245,6 +284,8 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 		log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: smart sync needs shared RDRAM or VK_EXT_external_memory_host, staying as configured.\n");
 		return;
 	}
+	const char *dbg = getenv("N64_RDP_SMART_DEBUG");
+	debug = dbg && dbg[0] == '1';
 	long ps = sysconf(_SC_PAGESIZE);
 	page_shift = 0;
 	while ((size_t(1) << page_shift) < size_t(ps))
@@ -508,6 +549,22 @@ bool init()
 		return false;
 	}
 
+	frontend_rdram = aligned_rdram;
+	frontend_offset = offset;
+	frontend_rdram_size = rdram_size;
+	if (!create_frontend())
+		return false;
+
+	timeline_value = 0;
+	pending_timeline_value = 0;
+	width = 0;
+	height = 0;
+	Smart::init(gfx_info.RDRAM, rdram_size, device->get_device_features().supports_external_memory_host);
+	return true;
+}
+
+static bool create_frontend()
+{
 	CommandProcessorFlags flags = 0;
 	switch (upscaling)
 	{
@@ -535,9 +592,10 @@ bool init()
 	if (super_sampled_dither)
 		flags |= COMMAND_PROCESSOR_FLAG_SUPER_SAMPLED_DITHER_BIT;
 
-	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: Using RDRAM size of %u bytes.\n", rdram_size);
-	frontend.reset(new CommandProcessor(*device, reinterpret_cast<void *>(aligned_rdram),
-				offset, rdram_size, rdram_size / 2, flags));
+	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: Using RDRAM size of %u bytes.\n", frontend_rdram_size);
+	frontend.reset(new CommandProcessor(*device, reinterpret_cast<void *>(frontend_rdram),
+				frontend_offset, frontend_rdram_size, frontend_rdram_size / 2, flags));
+	active_upscaling = upscaling;
 
 	if (!frontend->device_is_supported())
 	{
@@ -550,13 +608,28 @@ bool init()
 	quirks.set_native_texture_lod(native_texture_lod);
 	quirks.set_native_resolution_tex_rect(native_tex_rect);
 	frontend->set_quirks(quirks);
+	return true;
+}
 
+// The upscaling option changed while running (fast-forward drops to 1x): finish all GPU work so RDRAM holds the
+// latest results, then rebuild the CommandProcessor between frames. The first upscaled frames after a rebuild
+// may show the previous picture until the game draws again.
+static void apply_upscaling_change()
+{
+	if (!frontend || upscaling == active_upscaling)
+		return;
+	frontend->wait_for_timeline(frontend->signal_timeline());
+	Smart::reset_after_drain();
+	unsigned from = active_upscaling;
+	frontend.reset();
+	if (!create_frontend())
+	{
+		log_cb(RETRO_LOG_ERROR, "paraLLEl-RDP: switching upscaling %ux -> %ux failed.\n", from, upscaling);
+		return;
+	}
 	timeline_value = 0;
 	pending_timeline_value = 0;
-	width = 0;
-	height = 0;
-	Smart::init(gfx_info.RDRAM, rdram_size, device->get_device_features().supports_external_memory_host);
-	return true;
+	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: upscaling %ux -> %ux while running.\n", from, upscaling);
 }
 
 void deinit()
@@ -746,7 +819,9 @@ void complete_frame()
 	quirks.set_native_resolution_tex_rect(native_tex_rect);
 	frontend->set_quirks(quirks);
 
-	frontend->begin_frame_context();
+	apply_upscaling_change();
+	if (frontend)
+		frontend->begin_frame_context();
 }
 }
 
