@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "api/callbacks.h"
 #include "api/m64p_types.h"
 #include "device/memory/memory.h"
 #include "device/r4300/r4300_core.h"
@@ -174,6 +175,15 @@ void write_vi_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask
 /* Show the frame and end the libretro frame. */
 static void vi_scanout(struct vi_controller* vi)
 {
+    /* the game's own frame rate: new VI origins per 300 scanouts (~5 s at 60 Hz) */
+    static uint32_t last_origin, scanouts, new_frames;
+    uint32_t origin = vi->regs[VI_ORIGIN_REG];
+    if (origin != last_origin) { new_frames++; last_origin = origin; }
+    if (++scanouts == 300) {
+        DebugMessage(M64MSG_INFO, "VI: %u new frames in 300 scanouts", new_frames);
+        scanouts = new_frames = 0;
+    }
+
     if (vi->dp->do_on_unfreeze & DELAY_DP_INT)
         vi->dp->do_on_unfreeze |= DELAY_UPDATESCREEN;
     else
