@@ -8853,7 +8853,48 @@ void new_dynarec_cleanup(void)
 #endif
 }
 
+static int new_recompile_block_impl(int addr);
+
+#ifndef _WIN32
+#include <time.h>
+// N64_DRC_STATS=1: log compile time about every 5 s (blocks, total ms, worst block)
+static double drc_now_ms(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+#endif
+
 int new_recompile_block(int addr)
+{
+#ifndef _WIN32
+  static int enabled = -1;
+  static double window_start, total_ms, worst_ms;
+  static unsigned blocks;
+  if (enabled < 0) {
+    const char* e = getenv("N64_DRC_STATS");
+    enabled = e && *e == '1';
+  }
+  if (enabled) {
+    double t0 = drc_now_ms();
+    int r = new_recompile_block_impl(addr);
+    double t1 = drc_now_ms(), d = t1 - t0;
+    total_ms += d; blocks++;
+    if (d > worst_ms) worst_ms = d;
+    if (window_start == 0) window_start = t0;
+    if (t1 - window_start >= 5000) {
+      DebugMessage(M64MSG_INFO, "dynarec: %u blocks compiled in the last %.0f ms, %.2f ms total, worst %.2f ms",
+                   blocks, t1 - window_start, total_ms, worst_ms);
+      window_start = t1; total_ms = worst_ms = 0; blocks = 0;
+    }
+    return r;
+  }
+#endif
+  return new_recompile_block_impl(addr);
+}
+
+static int new_recompile_block_impl(int addr)
 {
 #if defined(RECOMPILER_DEBUG) && !defined(RECOMP_DBG)
   recomp_dbg_block(addr);
