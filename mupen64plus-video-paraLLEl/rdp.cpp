@@ -13,6 +13,9 @@
 #include <ucontext.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <semaphore.h>
+#include <pthread.h>
+#include <atomic>
 
 using namespace Vulkan;
 using namespace std;
@@ -20,6 +23,8 @@ using namespace std;
 extern retro_log_printf_t log_cb;
 extern retro_environment_t environ_cb;
 extern "C" void *g_rdram_alias;
+// new_dynarec's code cache (weak: absent without the dynarec); its size is NEW_DYNAREC_CACHE_SIZE
+extern "C" __attribute__((weak)) void *base_addr_rx;
 
 namespace RDP
 {
@@ -149,10 +154,27 @@ static unsigned faults_kind[4];
 static uint32_t last_fault_offset;
 static uintptr_t last_fault_pc;
 // Byte ranges drawn since the last SyncFull (drawn) and still locked (locked_ranges): a fault outside them only
-// shares a page with what the RDP drew. N64_RDP_SMART_PRECISE=1: such a fault unlocks that page without waiting.
+// shares a page with what the RDP drew. N64_RDP_SMART_PRECISE=1: such a fault unlocks that page without waiting,
+// if it came from dynarec code (one load or store, at most 8 bytes). Anything else (a DMA or RSP memcpy, C code)
+// may run on into the drawn bytes of the same page after its first fault, so it always waits: letting those
+// through left Cruis'n USA's RSP looping forever on its boot screen.
 static bool precise;
 static vector<pair<uint32_t, uint32_t>> drawn, locked_ranges;
-static unsigned faults_inside, faults_outside;
+static unsigned faults_inside, faults_outside, faults_copy;
+// A page opened that way is locked again ~0.5 ms later by a helper thread (relock_main), so a later read of its
+// drawn part faults and waits again instead of seeing stale RDRAM until the next SyncFull (on Turnip/Adreno
+// without host-imported RDRAM the CPU only sees RDP results after a wait). A read inside those 0.5 ms can still
+// see old pixels. guard serialises page state between the emulation thread, the handler and the helper.
+static vector<uint8_t> opened;
+static bool any_opened;
+static std::atomic_flag guard = ATOMIC_FLAG_INIT;
+static sem_t relock_sem;
+static bool relock_started;
+struct Guard
+{
+	Guard() { while (guard.test_and_set(std::memory_order_acquire)) {} }
+	~Guard() { guard.clear(std::memory_order_release); }
+};
 static uint32_t outside_page[8];
 static unsigned outside_count[8];
 
@@ -173,12 +195,24 @@ static void add_range(vector<pair<uint32_t, uint32_t>> &ranges, uint32_t start, 
 	ranges.push_back({ start, end });
 }
 
-static bool in_locked_range(uint32_t offset)
+static bool touches_locked_range(uint32_t start, uint32_t end)
 {
 	for (auto &r : locked_ranges)
-		if (offset >= r.first && offset < r.second)
+		if (start < r.second && end > r.first)
 			return true;
 	return false;
+}
+
+static bool from_dynarec(void *uc)
+{
+#if defined(__aarch64__)
+	uintptr_t pc = static_cast<ucontext_t *>(uc)->uc_mcontext.pc;
+	uintptr_t base = &base_addr_rx ? reinterpret_cast<uintptr_t>(base_addr_rx) : 0;
+	return base && pc >= base && pc - base < (uintptr_t(1) << 25);
+#else
+	(void)uc;
+	return false;
+#endif
 }
 
 static void set_pages(uint32_t start, uint32_t end, uint8_t kind)
@@ -222,12 +256,40 @@ static void protect_runs(F pick, int prot)
 
 static void unlock_all()
 {
+	Guard g;
+	if (any_opened)
+	{
+		fill(opened.begin(), opened.end(), 0);
+		any_opened = false;
+	}
 	if (!any_locked)
 		return;
 	protect_runs([](size_t p) { return locked[p] != 0; }, PROT_READ | PROT_WRITE);
 	fill(locked.begin(), locked.end(), 0);
 	any_locked = false;
 	locked_ranges.clear();
+}
+
+static void *relock_main(void *)
+{
+	for (;;)
+	{
+		while (sem_wait(&relock_sem) != 0) {}
+		usleep(500);
+		Guard g;
+		if (!any_opened)
+			continue;
+		for (size_t p = 0; p < opened.size(); p++)
+			if (opened[p])
+			{
+				mprotect(rdram + (p << page_shift), size_t(1) << page_shift, PROT_NONE);
+				locked[p] = 1;
+				opened[p] = 0;
+			}
+		any_opened = false;
+		any_locked = true;
+	}
+	return nullptr;
 }
 
 static void on_sync_full()
@@ -250,12 +312,13 @@ static void on_sync_full()
 			for (int i = 0; i < 8 && outside_count[i] && n < int(sizeof(pages)) - 24; i++)
 				n += snprintf(pages + n, sizeof(pages) - n, " 0x%06x:%u", outside_page[i], outside_count[i]);
 			pages[n] = 0;
-			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart debug: %u faults inside drawn bytes, %u only on a shared page;%s\n",
-			       faults_inside, faults_outside, pages);
-			faults_inside = faults_outside = 0;
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart debug: %u faults inside drawn bytes, %u copies starting outside them, %u dynarec accesses only on a shared page;%s\n",
+			       faults_inside, faults_copy, faults_outside, pages);
+			faults_inside = faults_outside = faults_copy = 0;
 			memset(outside_count, 0, sizeof(outside_count));
 		}
 	}
+	Guard g;
 	for (auto &r : drawn)
 		add_range(locked_ranges, r.first, r.second);
 	drawn.clear();
@@ -283,11 +346,14 @@ static void handler(int sig, siginfo_t *info, void *uc)
 #endif
 		}
 		uint32_t offset = uint32_t(addr - rdram);
-		bool inside = !(precise || debug) || in_locked_range(offset);
+		bool inside = !(precise || debug) || touches_locked_range(offset, offset + 8);
+		bool single = (precise || debug) && from_dynarec(uc);
 		if (debug)
 		{
 			if (inside)
 				faults_inside++;
+			else if (!single)
+				faults_copy++;
 			else
 			{
 				faults_outside++;
@@ -301,12 +367,18 @@ static void handler(int sig, siginfo_t *info, void *uc)
 					}
 			}
 		}
-		if (precise && !inside)
+		if (precise && !inside && single)
 		{
 			// Only shares a page with the drawing: let this access through without waiting for the GPU.
 			size_t p = offset >> page_shift;
-			mprotect(rdram + (p << page_shift), size_t(1) << page_shift, PROT_READ | PROT_WRITE);
-			locked[p] = 0;
+			{
+				Guard g;
+				mprotect(rdram + (p << page_shift), size_t(1) << page_shift, PROT_READ | PROT_WRITE);
+				locked[p] = 0;
+				opened[p] = 1;
+				any_opened = true;
+			}
+			sem_post(&relock_sem); // async-signal-safe
 			return;
 		}
 		frontend->wait_for_timeline(sync_signal);
@@ -373,6 +445,18 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	rdram_size = size;
 	dirty.assign(size >> page_shift, 0);
 	locked.assign(size >> page_shift, 0);
+	opened.assign(size >> page_shift, 0);
+	any_opened = false;
+	if (precise && !relock_started)
+	{
+		pthread_t t;
+		sem_init(&relock_sem, 0, 0);
+		relock_started = pthread_create(&t, nullptr, relock_main, nullptr) == 0;
+		if (relock_started)
+			pthread_detach(t);
+		else
+			precise = false;
+	}
 	any_locked = false;
 	faults = 0;
 	if (!handler_installed)
