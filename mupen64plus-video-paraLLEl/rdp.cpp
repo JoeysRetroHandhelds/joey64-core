@@ -154,7 +154,7 @@ static unsigned faults_kind[4];
 static uint32_t last_fault_offset;
 static uintptr_t last_fault_pc;
 // Byte ranges drawn since the last SyncFull (drawn) and still locked (locked_ranges): a fault outside them only
-// shares a page with what the RDP drew. N64_RDP_SMART_PRECISE=1: such a fault unlocks that page without waiting,
+// shares a page with what the RDP drew. Precise mode (default; N64_RDP_SMART_PRECISE=0 turns it off): such a fault unlocks that page without waiting,
 // if it came from dynarec code (one load or store, at most 8 bytes). Anything else (a DMA or RSP memcpy, C code)
 // may run on into the drawn bytes of the same page after its first fault, so it always waits: letting those
 // through left Cruis'n USA's RSP looping forever on its boot screen.
@@ -437,7 +437,7 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	const char *dbg = getenv("N64_RDP_SMART_DEBUG");
 	debug = dbg && dbg[0] == '1';
 	const char *pre = getenv("N64_RDP_SMART_PRECISE");
-	precise = pre && pre[0] == '1';
+	precise = !(pre && pre[0] == '0');
 	drawn.clear();
 	locked_ranges.clear();
 	long ps = sysconf(_SC_PAGESIZE);
@@ -531,7 +531,7 @@ static const unsigned cmd_len_lut[64] = {
 	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  1,  1,  1,  1,  1,
 };
 
-// Repeat frames (env N64_RDP_SKIP_DUP=1): most games draw 20-30 frames a second, but the VI scans one out every
+// Repeat frames (default; env N64_RDP_SKIP_DUP=0 turns it off): most games draw 20-30 frames a second, but the VI scans one out every
 // refresh. A refresh is skipped (the frontend keeps showing the last picture) when the VI registers are the same as
 // last time, the RDP drew nothing into the scanned-out rows since, and those rows' RDRAM hashes the same (CPU
 // writes). Interlaced output always scans out. With smart sync, RDRAM is read through the never-protected alias.
@@ -869,7 +869,7 @@ bool init()
 	Smart::init(gfx_info.RDRAM, rdram_size, device->get_device_features().supports_external_memory_host);
 	// Repeat-frame skipping hashes RDRAM, which smart sync may have protected: only with its alias, or without it.
 	const char *dup = getenv("N64_RDP_SKIP_DUP");
-	Dup::enabled = dup && *dup == '1' && (!Smart::enabled || g_rdram_alias);
+	Dup::enabled = !(dup && *dup == '0') && (!Smart::enabled || g_rdram_alias);
 	return true;
 }
 
