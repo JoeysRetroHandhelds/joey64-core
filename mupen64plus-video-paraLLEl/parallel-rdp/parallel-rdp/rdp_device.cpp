@@ -26,6 +26,8 @@
 
 #ifdef __SSE2__
 #include <emmintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
 #endif
 
 #ifndef PARALLEL_RDP_SHADER_DIR
@@ -1203,6 +1205,20 @@ static void masked_memcpy(uint8_t * __restrict dst,
 		__m128i data = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data_src + i));
 		__m128i mask = _mm_loadu_si128(reinterpret_cast<const __m128i *>(masked_src + i));
 		_mm_maskmoveu_si128(data, mask, reinterpret_cast<char *>(dst + i));
+	}
+#elif defined(__aarch64__)
+	// Copies are whole pages (multiples of 16 bytes). Fully masked or empty 16-byte blocks are the common case.
+	for (size_t i = 0; i < size; i += 16)
+	{
+		uint8x16_t mask = vld1q_u8(masked_src + i);
+		if (vminvq_u8(mask))
+			vst1q_u8(dst + i, vld1q_u8(data_src + i));
+		else if (vmaxvq_u8(mask))
+		{
+			for (unsigned j = 0; j < 16; j++)
+				if (masked_src[i + j])
+					dst[i + j] = data_src[i + j];
+		}
 	}
 #else
 	auto * __restrict data32 = reinterpret_cast<const uint32_t *>(data_src);
