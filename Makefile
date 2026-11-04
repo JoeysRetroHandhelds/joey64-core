@@ -75,7 +75,7 @@ else ifeq ($(ARCH), $(filter $(ARCH), arm))
    WITH_DYNAREC = arm
 endif
 
-TARGET_NAME := mupen64plus_next
+TARGET_NAME := joey64
 CC_AS ?= $(CC)
 NASM  ?= nasm
 

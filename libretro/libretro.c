@@ -654,7 +654,7 @@ void retro_set_environment(retro_environment_t cb)
 
 void retro_get_system_info(struct retro_system_info *info)
 {
-    info->library_name = "Mupen64Plus-Next";
+    info->library_name = "Joey64"; /* our fork of Mupen64Plus-Next (libretro/mupen64plus-libretro-nx) */
     info->library_version = "3.0" FLAVOUR_VERSION GIT_VERSION;
     info->valid_extensions = "n64|v64|z64|bin|u1";
     info->need_fullpath = false;
