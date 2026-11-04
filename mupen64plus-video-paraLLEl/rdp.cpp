@@ -279,15 +279,18 @@ static void *relock_main(void *)
 		Guard g;
 		if (!any_opened)
 			continue;
+		// Mark first, then protect: the emulation thread may fault on the page the moment it is protected, and the
+		// handler passes faults on unmarked pages on as crashes (OoT and Banjo-Tooie died that way on the Duo).
+		any_locked = true;
 		for (size_t p = 0; p < opened.size(); p++)
 			if (opened[p])
 			{
-				mprotect(rdram + (p << page_shift), size_t(1) << page_shift, PROT_NONE);
 				locked[p] = 1;
 				opened[p] = 0;
+				std::atomic_thread_fence(std::memory_order_seq_cst);
+				mprotect(rdram + (p << page_shift), size_t(1) << page_shift, PROT_NONE);
 			}
 		any_opened = false;
-		any_locked = true;
 	}
 	return nullptr;
 }
