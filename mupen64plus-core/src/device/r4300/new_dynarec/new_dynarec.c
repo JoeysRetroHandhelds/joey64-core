@@ -11847,23 +11847,27 @@ static int new_recompile_block_impl(int addr)
     literal_pool(64);
     if(!link_addr[i][2])
     {
+      intptr_t branch=link_addr[i][0];
+#if NEW_DYNAREC==NEW_DYNAREC_ARM64
+      // Conditional branches only reach +/-1MB, so they can't be patched to another block.
+      // Send them through a plain b in this block instead; that one can be linked like any other exit.
+      if(((u_char *)branch)[3]==0x54) {
+        set_jump_target(branch,(intptr_t)out);
+        branch=(intptr_t)out;
+        emit_jmp(0);
+      }
+#endif
       void *stub=out;
       void *addr=check_addr(link_addr[i][1]);
-      emit_extjump(link_addr[i][0],link_addr[i][1]);
+      emit_extjump(branch,link_addr[i][1]);
 #ifndef DISABLE_BLOCK_LINKING
-#if NEW_DYNAREC==NEW_DYNAREC_ARM64
-      //TODO: Avoid disabling link between blocks for conditional branches
-      u_char *ptr=(u_char *)link_addr[i][0];
-      if(addr&&((ptr[3]&0xfc)==0x14)) {
-#else
       if(addr) {
-#endif
-        set_jump_target(link_addr[i][0],(intptr_t)addr);
+        set_jump_target(branch,(intptr_t)addr);
         add_link(link_addr[i][1],stub);
       }
       else
 #endif
-        set_jump_target(link_addr[i][0],(intptr_t)stub);
+        set_jump_target(branch,(intptr_t)stub);
     }
     else
     {
