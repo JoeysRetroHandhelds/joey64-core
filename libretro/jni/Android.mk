@@ -92,6 +92,11 @@ ifeq ($(CRC_ARMV8),1)
 endif
 LOCAL_CFLAGS           := $(CFLAGS) $(COREFLAGS)
 LOCAL_LDFLAGS          := -Wl,-version-script=$(LIBRETRO_DIR)/link.T
+# Experiments: extra compile/link flags from the command line, e.g. N64_XFLAGS="-flto=thin"
+# N64_XLDFLAGS="-flto=thin" (appended to C++ flags too, so a -march here wins over CRC_ARMV8's)
+LOCAL_CFLAGS           += $(N64_XFLAGS)
+LOCAL_CPPFLAGS         += $(N64_XFLAGS)
+LOCAL_LDFLAGS          += $(N64_XLDFLAGS)
 LOCAL_LDLIBS           := -llog -lEGL $(GLLIB) $(CORELDLIBS)
 LOCAL_STATIC_LIBRARIES := 
 LOCAL_CPP_FEATURES     := exceptions
