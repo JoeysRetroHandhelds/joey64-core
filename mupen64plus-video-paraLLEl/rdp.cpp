@@ -5,13 +5,18 @@
 #include "z64.h"
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string>
+#include <signal.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 using namespace Vulkan;
 using namespace std;
 
 extern retro_log_printf_t log_cb;
 extern retro_environment_t environ_cb;
+extern "C" void *g_rdram_alias;
 
 namespace RDP
 {
@@ -104,6 +109,211 @@ bool synchronous = true, divot_filter = true, gamma_dither = true;
 bool vi_aa = true, vi_scale = true, dither_filter = true;
 bool interlacing = true, super_sampled_read_back = false, super_sampled_dither = true;
 
+// Smart sync (on by default, env N64_RDP_SMART=0 turns it off and the synchronous option decides again): run
+// asynchronously, but remember which RDRAM pages the RDP drew into
+// (color image and depth buffer rows inside the scissor). At SyncFull those pages are made inaccessible; the
+// first CPU access to one (CPU load/store, dynarec, or a DMA copy, which are all CPU memcpys here) faults,
+// waits for the GPU to reach that SyncFull, and unprotects them. Async speed, synchronous results for games
+// that read back what the RDP drew (gopher64 does the same with interpreter hooks). Needs the RDRAM imported
+// into Vulkan (VK_EXT_external_memory_host, the GPU writes the same pages) or the core's second RDRAM mapping
+// (g_rdram_alias, for paraLLEl-RDP's copy-back thread). Measured: Flip (Mali) at async speed (Snap 14.4 -> 5.0 ms,
+// GoldenEye 41 -> 52 fps vs sync); Duo (Turnip) renders RE2 and Cruis'n USA like sync, which async shows black.
+namespace Smart
+{
+static bool enabled;
+static uint8_t *rdram;
+static size_t rdram_size, page_shift;
+static vector<uint8_t> dirty, locked;
+static bool any_locked;
+static volatile uint64_t sync_signal;
+static struct sigaction old_action;
+static bool handler_installed;
+static unsigned faults, sync_count;
+
+// RDP state that decides where draws land
+static uint32_t color_addr, color_width, color_size, depth_addr;
+static uint32_t scissor_yh, scissor_yl;
+static bool depth_write;
+
+static void set_pages(uint32_t start, uint32_t end)
+{
+	if (start >= rdram_size)
+		return;
+	if (end > rdram_size)
+		end = rdram_size;
+	for (size_t p = start >> page_shift; p <= ((end - 1) >> page_shift); p++)
+		dirty[p] = 1;
+}
+
+static void mark_draw(bool zbuffered)
+{
+	uint32_t stride = color_size ? (color_width << (color_size - 1)) : (color_width >> 1);
+	uint32_t y0 = scissor_yh, y1 = scissor_yl + 1;
+	if (!stride || y1 <= y0)
+		return;
+	set_pages(color_addr + y0 * stride, color_addr + y1 * stride);
+	if (zbuffered && depth_write)
+		set_pages(depth_addr + y0 * color_width * 2, depth_addr + y1 * color_width * 2);
+}
+
+// Coalesced mprotect over runs of pages where pick(p) is set.
+template <typename F>
+static void protect_runs(F pick, int prot)
+{
+	size_t n = dirty.size();
+	for (size_t p = 0; p < n;)
+	{
+		if (!pick(p)) { p++; continue; }
+		size_t q = p;
+		while (q < n && pick(q))
+			q++;
+		mprotect(rdram + (p << page_shift), (q - p) << page_shift, prot);
+		p = q;
+	}
+}
+
+static void unlock_all()
+{
+	if (!any_locked)
+		return;
+	protect_runs([](size_t p) { return locked[p] != 0; }, PROT_READ | PROT_WRITE);
+	fill(locked.begin(), locked.end(), 0);
+	any_locked = false;
+}
+
+static void on_sync_full()
+{
+	sync_signal = frontend->signal_timeline();
+	if (++sync_count % 600 == 0)
+	{
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync: %u CPU waits in the last 600 SyncFulls.\n", faults);
+		faults = 0;
+	}
+	protect_runs([](size_t p) { return dirty[p] && !locked[p]; }, PROT_NONE);
+	for (size_t p = 0; p < dirty.size(); p++)
+		if (dirty[p])
+		{
+			locked[p] = 1;
+			dirty[p] = 0;
+			any_locked = true;
+		}
+}
+
+static void handler(int sig, siginfo_t *info, void *uc)
+{
+	uint8_t *addr = static_cast<uint8_t *>(info->si_addr);
+	if (any_locked && addr >= rdram && addr < rdram + rdram_size && locked[size_t(addr - rdram) >> page_shift])
+	{
+		frontend->wait_for_timeline(sync_signal);
+		unlock_all();
+		faults++;
+		return; // the access is retried, now with the RDP's results in RDRAM
+	}
+	// Not ours: hand it on.
+	if (old_action.sa_flags & SA_SIGINFO)
+	{
+		if (old_action.sa_sigaction)
+			old_action.sa_sigaction(sig, info, uc);
+	}
+	else if (old_action.sa_handler == SIG_DFL)
+	{
+		sigaction(sig, &old_action, nullptr);
+		raise(sig);
+	}
+	else if (old_action.sa_handler != SIG_IGN)
+		old_action.sa_handler(sig);
+}
+
+static bool requested()
+{
+	const char *env = getenv("N64_RDP_SMART");
+	return !env || env[0] != '0';
+}
+
+// host_imported: the GPU writes these pages itself. Otherwise paraLLEl-RDP copies results back on a worker
+// thread, which must use g_rdram_alias so it never touches a protected page.
+static void init(void *rdram_ptr, size_t size, bool host_imported)
+{
+	enabled = false;
+	if (!requested())
+		return;
+	if (!host_imported && !g_rdram_alias)
+	{
+		log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: smart sync needs shared RDRAM or VK_EXT_external_memory_host, staying as configured.\n");
+		return;
+	}
+	long ps = sysconf(_SC_PAGESIZE);
+	page_shift = 0;
+	while ((size_t(1) << page_shift) < size_t(ps))
+		page_shift++;
+	rdram = static_cast<uint8_t *>(rdram_ptr);
+	rdram_size = size;
+	dirty.assign(size >> page_shift, 0);
+	locked.assign(size >> page_shift, 0);
+	any_locked = false;
+	faults = 0;
+	if (!handler_installed)
+	{
+		struct sigaction sa = {};
+		sa.sa_sigaction = handler;
+		sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+		sigemptyset(&sa.sa_mask);
+		if (sigaction(SIGSEGV, &sa, &old_action) != 0)
+			return;
+		handler_installed = true;
+	}
+	enabled = true;
+	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync on (%ld-byte pages).\n", ps);
+}
+
+static void deinit()
+{
+	if (enabled)
+		unlock_all();
+	enabled = false;
+}
+
+static void track(RDP::Op op, uint32_t w1, uint32_t w2)
+{
+	switch (op)
+	{
+	case RDP::Op::SetColorImage:
+		color_addr = w2 & 0x00FFFFFF;
+		color_size = (w1 >> 19) & 3;
+		color_width = (w1 & 0x3FF) + 1;
+		break;
+	case RDP::Op::SetMaskImage:
+		depth_addr = w2 & 0x00FFFFFF;
+		break;
+	case RDP::Op::SetScissor:
+		scissor_yh = (w1 & 0xFFF) >> 2;
+		scissor_yl = (w2 & 0xFFF) >> 2;
+		break;
+	case RDP::Op::SetOtherModes:
+		// 1/2-cycle mode with Z update writes the depth buffer
+		depth_write = ((w1 >> 20) & 2) == 0 && ((w2 >> 5) & 1);
+		break;
+	case RDP::Op::FillTriangle:
+	case RDP::Op::TextureTriangle:
+	case RDP::Op::ShadeTriangle:
+	case RDP::Op::ShadeTextureTriangle:
+	case RDP::Op::TextureRectangle:
+	case RDP::Op::TextureRectangleFlip:
+	case RDP::Op::FillRectangle:
+		mark_draw(false);
+		break;
+	case RDP::Op::FillZBufferTriangle:
+	case RDP::Op::TextureZBufferTriangle:
+	case RDP::Op::ShadeZBufferTriangle:
+	case RDP::Op::ShadeTextureZBufferTriangle:
+		mark_draw(true);
+		break;
+	default:
+		break;
+	}
+}
+}
+
 static const unsigned cmd_len_lut[64] = {
 	1, 1, 1, 1, 1, 1, 1, 1, 4, 6, 12, 14, 12, 14, 20, 22,
 	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  1,  1,  1,  1,  1,
@@ -172,11 +382,15 @@ void process_commands()
 
 		if (command >= 8 && frontend)
 			frontend->enqueue_command(cmd_length * 2, &cmd_data[2 * cmd_cur]);
+		if (Smart::enabled)
+			Smart::track(RDP::Op(command), w1, cmd_data[2 * cmd_cur + 1]);
 
 		if (RDP::Op(command) == RDP::Op::SyncFull)
 		{
-			// For synchronous RDP:
-			if (synchronous && frontend)
+			// For synchronous RDP (smart sync waits only when the CPU touches what was drawn):
+			if (Smart::enabled && frontend)
+				Smart::on_sync_full();
+			else if (synchronous && frontend)
 				frontend->wait_for_timeline(frontend->signal_timeline());
 			*gfx_info.MI_INTR_REG |= DP_INTERRUPT;
 			gfx_info.CheckInterrupts();
@@ -261,6 +475,10 @@ bool init()
 	uintptr_t aligned_rdram = reinterpret_cast<uintptr_t>(gfx_info.RDRAM);
 	uintptr_t offset = 0;
 
+	// Smart sync without host import: paraLLEl-RDP's copies go through the second RDRAM mapping.
+	if (Smart::requested() && g_rdram_alias && !device->get_device_features().supports_external_memory_host)
+		aligned_rdram = reinterpret_cast<uintptr_t>(g_rdram_alias);
+
 	if (device->get_device_features().supports_external_memory_host)
 	{
 		size_t align = device->get_device_features().host_memory_properties.minImportedHostPointerAlignment;
@@ -334,11 +552,13 @@ bool init()
 	pending_timeline_value = 0;
 	width = 0;
 	height = 0;
+	Smart::init(gfx_info.RDRAM, rdram_size, device->get_device_features().supports_external_memory_host);
 	return true;
 }
 
 void deinit()
 {
+	Smart::deinit();
 	save_pipeline_cache();
 	begin_ts.reset();
 	end_ts.reset();

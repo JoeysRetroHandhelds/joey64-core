@@ -38,6 +38,11 @@
 #endif
 
 #include <assert.h>
+#ifdef __ANDROID__
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -240,9 +245,59 @@ enum {
 static void*    mem_rom = NULL;
 static uint32_t mem_rom_size = 0;
 
+void* g_rdram_alias = NULL;
+
+#ifdef __ANDROID__
+/* Full mem base from mmap, with RDRAM backed by a shared memory file so it can also be mapped a second time
+ * (g_rdram_alias). paraLLEl-RDP's smart sync protects pages of the first view while its own copy-back
+ * thread writes through the second. Returns NULL to fall back to the heap. */
+static void* mmap_region;
+static size_t mmap_region_size;
+
+static void* init_mem_base_shared(void)
+{
+    int fd = (int)syscall(__NR_memfd_create, "n64-rdram", 0);
+    if (fd < 0)
+        return NULL;
+    if (ftruncate(fd, RDRAM_MAX_SIZE) != 0) {
+        close(fd);
+        return NULL;
+    }
+    size_t size = MB_MAX_SIZE_FULL + MB_RDRAM_DRAM_ALIGNMENT_REQUIREMENT;
+    uint8_t* region = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (region == MAP_FAILED) {
+        close(fd);
+        return NULL;
+    }
+    uint8_t* base = (uint8_t*)(((uintptr_t)region + MB_RDRAM_DRAM_ALIGNMENT_REQUIREMENT - 1)
+        & ~(uintptr_t)(MB_RDRAM_DRAM_ALIGNMENT_REQUIREMENT - 1));
+    void* alias = mmap(NULL, RDRAM_MAX_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mmap(base + MB_RDRAM_DRAM, RDRAM_MAX_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED
+        || alias == MAP_FAILED) {
+        if (alias != MAP_FAILED)
+            munmap(alias, RDRAM_MAX_SIZE);
+        munmap(region, size);
+        close(fd);
+        return NULL;
+    }
+    close(fd);
+    mmap_region = region;
+    mmap_region_size = size;
+    g_rdram_alias = alias;
+    return base;
+}
+#endif
+
 void* init_mem_base(void)
 {
     void* mem_base;
+
+#ifdef __ANDROID__
+    if ((mem_base = init_mem_base_shared()) != NULL) {
+        DebugMessage(M64MSG_INFO, "Using full mem base, RDRAM in shared memory");
+        return mem_base;
+    }
+#endif
 
     /* First try the full mem base alloc */
 #ifdef _WIN32
@@ -277,6 +332,16 @@ void* init_mem_base(void)
 
 void release_mem_base(void* mem_base)
 {
+#ifdef __ANDROID__
+    if (mmap_region != NULL && MEM_BASE_PTR(mem_base) != NULL
+        && (uint8_t*)mem_base >= (uint8_t*)mmap_region && (uint8_t*)mem_base < (uint8_t*)mmap_region + mmap_region_size) {
+        munmap(g_rdram_alias, RDRAM_MAX_SIZE);
+        munmap(mmap_region, mmap_region_size);
+        g_rdram_alias = NULL;
+        mmap_region = NULL;
+        return;
+    }
+#endif
 #ifdef _WIN32
     if (MEM_BASE_MODE(mem_base) == 0)
         _aligned_free(MEM_BASE_PTR(mem_base));

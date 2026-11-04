@@ -96,6 +96,8 @@ static osal_inline void mem_write32(const struct mem_handler* handler, uint32_t 
 void apply_mem_mapping(struct memory* mem, const struct mem_mapping* mapping);
 
 void* init_mem_base(void);
+/* Second, always-writable mapping of RDRAM (Android), or NULL. */
+extern void* g_rdram_alias;
 void release_mem_base(void* mem_base);
 void* init_mem_rom(uint32_t size);
 void release_mem_rom(void);
