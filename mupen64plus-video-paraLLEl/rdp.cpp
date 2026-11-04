@@ -145,11 +145,38 @@ static bool debug;
 static unsigned faults_kind[4];
 static uint32_t last_fault_offset;
 static uintptr_t last_fault_pc;
+// Byte ranges drawn since the last SyncFull (drawn) and still locked (locked_ranges): a fault outside them only
+// shares a page with what the RDP drew. N64_RDP_SMART_PRECISE=1: such a fault unlocks that page without waiting.
+static bool precise;
+static vector<pair<uint32_t, uint32_t>> drawn, locked_ranges;
+static unsigned faults_inside, faults_outside;
+static uint32_t outside_page[8];
+static unsigned outside_count[8];
 
 // RDP state that decides where draws land
 static uint32_t color_addr, color_width, color_size, depth_addr;
 static uint32_t scissor_yh, scissor_yl;
 static bool depth_write;
+
+static void add_range(vector<pair<uint32_t, uint32_t>> &ranges, uint32_t start, uint32_t end)
+{
+	for (auto &r : ranges)
+		if (start <= r.second && end >= r.first)
+		{
+			r.first = min(r.first, start);
+			r.second = max(r.second, end);
+			return;
+		}
+	ranges.push_back({ start, end });
+}
+
+static bool in_locked_range(uint32_t offset)
+{
+	for (auto &r : locked_ranges)
+		if (offset >= r.first && offset < r.second)
+			return true;
+	return false;
+}
 
 static void set_pages(uint32_t start, uint32_t end, uint8_t kind)
 {
@@ -157,6 +184,8 @@ static void set_pages(uint32_t start, uint32_t end, uint8_t kind)
 		return;
 	if (end > rdram_size)
 		end = rdram_size;
+	if (precise || debug)
+		add_range(drawn, start, end);
 	for (size_t p = start >> page_shift; p <= ((end - 1) >> page_shift); p++)
 		dirty[p] |= kind;
 }
@@ -195,6 +224,7 @@ static void unlock_all()
 	protect_runs([](size_t p) { return locked[p] != 0; }, PROT_READ | PROT_WRITE);
 	fill(locked.begin(), locked.end(), 0);
 	any_locked = false;
+	locked_ranges.clear();
 }
 
 static void on_sync_full()
@@ -212,8 +242,20 @@ static void on_sync_full()
 			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart debug: color %u, depth %u, both %u; last at 0x%06x (color 0x%06x w %u, depth 0x%06x) by %s\n",
 			       faults_kind[1], faults_kind[2], faults_kind[3], last_fault_offset, color_addr, color_width, depth_addr, who);
 			faults_kind[1] = faults_kind[2] = faults_kind[3] = 0;
+			char pages[160];
+			int n = 0;
+			for (int i = 0; i < 8 && outside_count[i] && n < int(sizeof(pages)) - 24; i++)
+				n += snprintf(pages + n, sizeof(pages) - n, " 0x%06x:%u", outside_page[i], outside_count[i]);
+			pages[n] = 0;
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart debug: %u faults inside drawn bytes, %u only on a shared page;%s\n",
+			       faults_inside, faults_outside, pages);
+			faults_inside = faults_outside = 0;
+			memset(outside_count, 0, sizeof(outside_count));
 		}
 	}
+	for (auto &r : drawn)
+		add_range(locked_ranges, r.first, r.second);
+	drawn.clear();
 	protect_runs([](size_t p) { return dirty[p] && !locked[p]; }, PROT_NONE);
 	for (size_t p = 0; p < dirty.size(); p++)
 		if (dirty[p])
@@ -236,6 +278,33 @@ static void handler(int sig, siginfo_t *info, void *uc)
 #if defined(__aarch64__)
 			last_fault_pc = static_cast<ucontext_t *>(uc)->uc_mcontext.pc;
 #endif
+		}
+		uint32_t offset = uint32_t(addr - rdram);
+		bool inside = !(precise || debug) || in_locked_range(offset);
+		if (debug)
+		{
+			if (inside)
+				faults_inside++;
+			else
+			{
+				faults_outside++;
+				uint32_t page = offset >> page_shift << page_shift;
+				for (int i = 0; i < 8; i++)
+					if (!outside_count[i] || outside_page[i] == page)
+					{
+						outside_page[i] = page;
+						outside_count[i]++;
+						break;
+					}
+			}
+		}
+		if (precise && !inside)
+		{
+			// Only shares a page with the drawing: let this access through without waiting for the GPU.
+			size_t p = offset >> page_shift;
+			mprotect(rdram + (p << page_shift), size_t(1) << page_shift, PROT_READ | PROT_WRITE);
+			locked[p] = 0;
+			return;
 		}
 		frontend->wait_for_timeline(sync_signal);
 		unlock_all();
@@ -265,6 +334,7 @@ static void reset_after_drain()
 		return;
 	unlock_all();
 	fill(dirty.begin(), dirty.end(), 0);
+	drawn.clear();
 	sync_signal = 0;
 }
 
@@ -288,6 +358,10 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	}
 	const char *dbg = getenv("N64_RDP_SMART_DEBUG");
 	debug = dbg && dbg[0] == '1';
+	const char *pre = getenv("N64_RDP_SMART_PRECISE");
+	precise = pre && pre[0] == '1';
+	drawn.clear();
+	locked_ranges.clear();
 	long ps = sysconf(_SC_PAGESIZE);
 	page_shift = 0;
 	while ((size_t(1) << page_shift) < size_t(ps))
@@ -309,7 +383,7 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 		handler_installed = true;
 	}
 	enabled = true;
-	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync on (%ld-byte pages).\n", ps);
+	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync on (%ld-byte pages%s).\n", ps, precise ? ", precise" : "");
 }
 
 static void deinit()
