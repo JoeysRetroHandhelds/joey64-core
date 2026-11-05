@@ -57,6 +57,45 @@ static string pipeline_cache_path;
 static size_t pipeline_cache_saved_size;
 static unsigned frames_since_cache_check;
 
+// Joey64 EXPERIMENT N64_RDP_GPU_SPIN=<thousands of loop iterations>: after each scanout, one small compute dispatch
+// that just loops (joey/gpu_spin.comp), so the GPU's load, and with it the governor's clock, stays up between frames
+// (PCSX2 "Spin GPU"; the Flip's Mali drops to 384 MHz at 60 fps). Off when unset.
+static void joey_gpu_spin()
+{
+	static const unsigned thousands = getenv("N64_RDP_GPU_SPIN") ? unsigned(strtoul(getenv("N64_RDP_GPU_SPIN"), nullptr, 10)) : 0u;
+	if (!thousands || !device)
+		return;
+	static Vulkan::Program *program = nullptr;
+	static Vulkan::BufferHandle sink;
+	if (!program)
+	{
+		static const uint32_t code[] = {
+#include "joey/gpu_spin.inc"
+		};
+		Vulkan::ResourceLayout layout;
+		layout.sets[0].storage_buffer_mask = 1;
+		layout.sets[0].array_size[0] = 1;
+		layout.push_constant_size = 4;
+		program = device->request_program(code, sizeof(code), &layout);
+		Vulkan::BufferCreateInfo info = {};
+		info.size = 64;
+		info.domain = Vulkan::BufferDomain::Device;
+		info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		sink = device->create_buffer(info);
+		log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: GPU spin on, %u000 iterations per scanout (%s).\n", thousands,
+		       program && sink ? "ok" : "FAILED");
+	}
+	if (!program || !sink)
+		return;
+	auto cmd = device->request_command_buffer();
+	cmd->set_program(program);
+	cmd->set_storage_buffer(0, 0, *sink);
+	uint32_t iterations = thousands * 1000u;
+	cmd->push_constants(&iterations, 0, sizeof(iterations));
+	cmd->dispatch(1, 1, 1);
+	device->submit(cmd);
+}
+
 static void load_pipeline_cache()
 {
 	const char *dir = nullptr;
@@ -87,6 +126,7 @@ static void load_pipeline_cache()
 	frames_since_cache_check = 0;
 	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: pipeline cache %u bytes from %s.\n",
 	       unsigned(data.size()), pipeline_cache_path.c_str());
+
 }
 
 static void save_pipeline_cache()
@@ -1116,6 +1156,7 @@ void complete_frame()
 			scans = 0;
 		}
 	}
+	RDP::joey_gpu_spin();
 	unsigned index = vulkan->get_sync_index(vulkan->handle);
 
 	if (!image)

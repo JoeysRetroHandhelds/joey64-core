@@ -1,0 +1,14 @@
+#version 450
+// Joey64 EXPERIMENT N64_RDP_GPU_SPIN: busy work that keeps the GPU's load (and so its clock) up between frames.
+layout(local_size_x = 64) in;
+layout(push_constant) uniform Push { uint iterations; } push;
+layout(std430, set = 0, binding = 0) buffer Sink { uint value[]; } sink;
+void main()
+{
+	uint x = gl_GlobalInvocationID.x + 1u;
+	for (uint i = 0u; i < push.iterations; i++)
+		x = x * 1664525u + 1013904223u;
+	// Never true in practice; keeps the loop from being removed.
+	if (x == 0x9e3779b9u)
+		sink.value[0] = x;
+}
