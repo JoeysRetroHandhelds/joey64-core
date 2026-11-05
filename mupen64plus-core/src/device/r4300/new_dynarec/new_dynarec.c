@@ -357,6 +357,8 @@ static int is_delayslot;
 static int cop1_usable;
 static char *copy;
 static int expirep;
+// N64_DRC_STATS: blocks thrown away (invalidation), whole-cache flushes and expiry steps per window
+static unsigned drc_stat_inv_blocks, drc_stat_inv_all, drc_stat_expire;
 static u_int dirty_entry_count;
 static u_int copy_size;
 static struct ll_entry* hash_table[65536][2];
@@ -2858,6 +2860,7 @@ static void invalidate_page(u_int page)
   jump_in[page]=0;
   while(head!=NULL) {
     inv_debug("INVALIDATE: %x\n",head->vaddr);
+    drc_stat_inv_blocks++;
     remove_hash(head->vaddr);
     next=head->next;
     free(head);
@@ -2962,6 +2965,7 @@ void invalidate_block(u_int block)
 static void invalidate_all_pages(void)
 {
   u_int page;
+  drc_stat_inv_all++;
   for(page=0;page<4096;page++)
     invalidate_page(page);
   for(page=0;page<1048576;page++)
@@ -8884,8 +8888,9 @@ int new_recompile_block(int addr)
     if (d > worst_ms) worst_ms = d;
     if (window_start == 0) window_start = t0;
     if (t1 - window_start >= 5000) {
-      DebugMessage(M64MSG_INFO, "dynarec: %u blocks compiled in the last %.0f ms, %.2f ms total, worst %.2f ms",
-                   blocks, t1 - window_start, total_ms, worst_ms);
+      DebugMessage(M64MSG_INFO, "dynarec: %u blocks compiled in the last %.0f ms, %.2f ms total, worst %.2f ms; %u blocks invalidated, %u full flushes, %u expiry steps",
+                   blocks, t1 - window_start, total_ms, worst_ms, drc_stat_inv_blocks, drc_stat_inv_all, drc_stat_expire);
+      drc_stat_inv_blocks = drc_stat_inv_all = drc_stat_expire = 0;
       window_start = t1; total_ms = worst_ms = 0; blocks = 0;
     }
     return r;
@@ -12027,6 +12032,7 @@ static int new_recompile_block_impl(int addr)
         break;
     }
     expirep=(expirep+1)&65535;
+    drc_stat_expire++;
   }
   return 0;
 }
