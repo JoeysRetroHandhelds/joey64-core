@@ -1,4 +1,6 @@
 #include "rdp.hpp"
+#include <chrono>
+#include <atomic>
 #include "timeline_trace_file.hpp"
 #include "Gfx #1.3.h"
 #include "parallel.h"
@@ -29,6 +31,10 @@ extern "C" __attribute__((weak)) void *base_addr_rx;
 namespace RDP
 {
 const struct retro_hw_render_interface_vulkan *vulkan;
+// Joey64 N64_RDP_WAITSTATS (defined in parallel-rdp/rdp_device.cpp)
+extern std::atomic<uint64_t> joey_drain_ns, joey_timeline_ns;
+extern std::atomic<uint32_t> joey_timeline_waits;
+bool joey_waitstats_on();
 
 static int cmd_cur;
 static int cmd_ptr;
@@ -1092,7 +1098,24 @@ void complete_frame()
 	opts.upscale_deinterlacing = !interlacing;
 	opts.downscale_steps = downscaling_steps;
 	opts.crop_overscan_pixels = overscan;
+	const bool joey_ws = RDP::joey_waitstats_on();
+	const auto joey_t0 = std::chrono::steady_clock::now();
 	auto image = frontend->scanout(opts);
+	if (joey_ws)
+	{
+		static uint64_t scan_ns = 0;
+		static unsigned scans = 0;
+		scan_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - joey_t0).count());
+		if (++scans == 300)
+		{
+			const uint64_t drain = RDP::joey_drain_ns.exchange(0), tl = RDP::joey_timeline_ns.exchange(0);
+			const unsigned waits = RDP::joey_timeline_waits.exchange(0);
+			log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: wait stats per scanout (300): scanout %.3f ms (drain %.3f ms), GPU timeline waits %.3f ms (%.2f waits).\n",
+			       scan_ns / 300e6, drain / 300e6, tl / 300e6, waits / 300.0);
+			scan_ns = 0;
+			scans = 0;
+		}
+	}
 	unsigned index = vulkan->get_sync_index(vulkan->handle);
 
 	if (!image)

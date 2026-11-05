@@ -23,6 +23,8 @@
 #include "rdp_device.hpp"
 #include "rdp_common.hpp"
 #include <chrono>
+#include <atomic>
+#include <stdlib.h>
 
 #ifdef __SSE2__
 #include <emmintrin.h>
@@ -1066,14 +1068,35 @@ uint64_t CommandProcessor::signal_timeline()
 	return timeline_value;
 }
 
+// Joey64 EXPERIMENT N64_RDP_WAITSTATS=1: time the emulation thread spends draining the command ring (waiting for the
+// worker's CPU work) and waiting for timeline values (GPU work), read and reset by the plugin every 300 scanouts.
+std::atomic<uint64_t> joey_drain_ns{0}, joey_timeline_ns{0};
+std::atomic<uint32_t> joey_timeline_waits{0};
+bool joey_waitstats_on()
+{
+	static const bool on = getenv("N64_RDP_WAITSTATS") && *getenv("N64_RDP_WAITSTATS") == '1';
+	return on;
+}
+static inline uint64_t joey_now_ns()
+{
+	return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 void CommandProcessor::wait_for_timeline(uint64_t index)
 {
 	Vulkan::QueryPoolHandle start_ts, end_ts;
 	if (measure_stall_time)
 		start_ts = device.write_calibrated_timestamp();
+	const uint64_t joey_t0 = joey_waitstats_on() ? joey_now_ns() : 0;
 	timeline_worker.wait([this, index]() -> bool {
 		return thread_timeline_value >= index;
 	});
+	if (joey_t0)
+	{
+		joey_timeline_ns += joey_now_ns() - joey_t0;
+		++joey_timeline_waits;
+	}
 	if (measure_stall_time)
 	{
 		end_ts = device.write_calibrated_timestamp();
@@ -1121,7 +1144,10 @@ void CommandProcessor::drain_command_ring()
 	Vulkan::QueryPoolHandle start_ts, end_ts;
 	if (timestamp)
 		start_ts = device.write_calibrated_timestamp();
+	const uint64_t joey_t0 = joey_waitstats_on() ? joey_now_ns() : 0;
 	ring.drain();
+	if (joey_t0)
+		joey_drain_ns += joey_now_ns() - joey_t0;
 	if (timestamp)
 	{
 		end_ts = device.write_calibrated_timestamp();
