@@ -378,8 +378,17 @@ namespace ImplementationConstants
 {
 constexpr unsigned DefaultWorkgroupSize = 64;
 
-constexpr unsigned TileWidth = 8;
-constexpr unsigned TileHeight = 8;
+// Joey64 experiment (master list item 21): the per-tile shaders (rasterizer, depth/blend) take the tile size as
+// their workgroup size, so an 8x8 tile is a 64-thread workgroup: half a 128-wide Adreno wave. Build with
+// N64_XFLAGS="-DJOEY_RDP_TILE_W=16" (and/or _H) to try others; default 8x8.
+#ifndef JOEY_RDP_TILE_W
+#define JOEY_RDP_TILE_W 8
+#endif
+#ifndef JOEY_RDP_TILE_H
+#define JOEY_RDP_TILE_H 8
+#endif
+constexpr unsigned TileWidth = JOEY_RDP_TILE_W;
+constexpr unsigned TileHeight = JOEY_RDP_TILE_H;
 constexpr unsigned MaxTilesX = Limits::MaxWidth / TileWidth;
 constexpr unsigned MaxTilesY = Limits::MaxHeight / TileHeight;
 constexpr unsigned IncoherentPageSize = 1024;
