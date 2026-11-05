@@ -21,6 +21,7 @@
  */
 
 #include "command_buffer.hpp"
+#include <stdlib.h>
 #include "device.hpp"
 #include "format.hpp"
 #include "thread_id.hpp"
@@ -40,6 +41,19 @@ using namespace Util;
 
 namespace Vulkan
 {
+// Joey64 EXPERIMENT: N64_RDP_WAVE=<subgroup size> (see the compute pipeline build below); 0 = driver's choice
+static uint32_t forced_compute_wave_size()
+{
+	static const uint32_t size = [] {
+		const char *env = getenv("N64_RDP_WAVE");
+		uint32_t s = env ? uint32_t(strtoul(env, nullptr, 10)) : 0u;
+		if (s)
+			LOGI("Joey64: compute wave size forced to %u where the driver allows it.\n", s);
+		return s;
+	}();
+	return size;
+}
+
 static inline uint32_t get_combined_spec_constant_mask(const DeferredPipelineCompile &compile)
 {
 	return compile.potential_static_state.spec_constant_mask |
@@ -981,6 +995,20 @@ Pipeline CommandBuffer::build_compute_pipeline(Device *device, const DeferredPip
 			else
 				subgroup_size_info.requiredSubgroupSize = min_subgroups;
 
+			info.stage.pNext = &subgroup_size_info;
+		}
+	}
+	else if (uint32_t forced = forced_compute_wave_size())
+	{
+		// Joey64 EXPERIMENT N64_RDP_WAVE=<size>: compute shaders that don't set a subgroup size get this one instead
+		// of the driver's pick (Turnip: 64 or 128). Pair with PARALLEL_RDP_SUBGROUP=0 if a shader breaks.
+		auto &features = device->get_device_features();
+		auto &props = features.subgroup_size_control_properties;
+		if (features.subgroup_size_control_features.subgroupSizeControl &&
+		    (props.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+		    forced >= props.minSubgroupSize && forced <= props.maxSubgroupSize)
+		{
+			subgroup_size_info.requiredSubgroupSize = forced;
 			info.stage.pNext = &subgroup_size_info;
 		}
 	}
