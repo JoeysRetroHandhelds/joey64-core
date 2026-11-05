@@ -1,4 +1,5 @@
 #include "rsp_jit.hpp"
+#include <stdlib.h>
 #include "rsp_disasm.hpp"
 #include <utility>
 #include <assert.h>
@@ -48,16 +49,51 @@ void CPU::invalidate_imem()
 			state.dirty_blocks |= (0x3 << i) >> 1;
 }
 
+uint64_t CPU::chunk_key(const uint32_t *imem, unsigned chunk) const
+{
+	// FNV-1 over this chunk and the next one (the last chunk has none).
+	unsigned words = (chunk + 1 < CODE_BLOCKS ? 2 : 1) * CODE_BLOCK_WORDS;
+	const uint32_t *data = imem + chunk * CODE_BLOCK_WORDS;
+	uint64_t h = 0xcbf29ce484222325ull;
+	h = (h * 0x100000001b3ull) ^ chunk;
+	for (unsigned i = 0; i < words; i++)
+		h = (h * 0x100000001b3ull) ^ data[i];
+	return h;
+}
+
+static bool chunk_cache_on()
+{
+	static const bool on = getenv("N64_RSP_CHUNK_CACHE") && *getenv("N64_RSP_CHUNK_CACHE") == '1';
+	return on;
+}
+
 void CPU::invalidate_code()
 {
 	if (!state.dirty_blocks)
 		return;
 
+	const bool keep = chunk_cache_on();
+	if (keep && saved_chunks.size() > 4096)
+		saved_chunks.clear();
+
+	// Ascending order matters for the chunk cache: chunk i's old key reads cached_imem of chunk i + 1, which is
+	// only refreshed after it.
 	for (unsigned i = 0; i < CODE_BLOCKS; i++)
 	{
 		if (state.dirty_blocks & (1 << i))
 		{
-			memset(blocks + i * CODE_BLOCK_WORDS, 0, CODE_BLOCK_WORDS * sizeof(blocks[0]));
+			Func *table = blocks + i * CODE_BLOCK_WORDS;
+			if (keep)
+			{
+				memcpy(saved_chunks[chunk_key(cached_imem, i)].f, table, sizeof(ChunkBlocks));
+				auto itr = saved_chunks.find(chunk_key(state.imem, i));
+				if (itr != saved_chunks.end())
+					memcpy(table, itr->second.f, sizeof(ChunkBlocks));
+				else
+					memset(table, 0, CODE_BLOCK_WORDS * sizeof(blocks[0]));
+			}
+			else
+				memset(table, 0, CODE_BLOCK_WORDS * sizeof(blocks[0]));
 			memcpy(cached_imem + i * CODE_BLOCK_WORDS, state.imem + i * CODE_BLOCK_WORDS, CODE_BLOCK_SIZE);
 		}
 	}

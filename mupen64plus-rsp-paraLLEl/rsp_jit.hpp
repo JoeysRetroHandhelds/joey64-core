@@ -131,6 +131,11 @@ private:
 	alignas(64) uint32_t cached_imem[IMEM_WORDS] = {};
 
 	std::unordered_map<uint64_t, Func> cached_blocks[IMEM_WORDS];
+	// Joey64 EXPERIMENT N64_RSP_CHUNK_CACHE=1: the block table of each 256-byte IMEM chunk, saved by the contents of
+	// that chunk and the next (a block can run into the next chunk), restored in one copy when an overlay comes back.
+	struct ChunkBlocks { Func f[CODE_BLOCK_WORDS]; };
+	std::unordered_map<uint64_t, ChunkBlocks> saved_chunks;
+	uint64_t chunk_key(const uint32_t *imem, unsigned chunk) const;
 
 	Func jit_region(uint64_t hash, unsigned pc_word, unsigned instruction_count);
 
