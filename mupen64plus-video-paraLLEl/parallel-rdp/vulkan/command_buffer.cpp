@@ -1149,8 +1149,8 @@ Pipeline CommandBuffer::build_compute_pipeline(Device *device, const DeferredPip
 		// Joey64 EXPERIMENT N64_RDP_WAVE=<size>: compute shaders that don't set a subgroup size get this one instead
 		// of the driver's pick (Turnip: 64 or 128). Pair with PARALLEL_RDP_SUBGROUP=0 if a shader breaks.
 		auto &features = device->get_device_features();
-		auto &props = features.subgroup_size_control_properties;
-		if (features.subgroup_size_control_features.subgroupSizeControl &&
+		auto &props = features.vk13_props;
+		if (features.vk13_features.subgroupSizeControl &&
 		    (props.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
 		    forced >= props.minSubgroupSize && forced <= props.maxSubgroupSize)
 		{
