@@ -19,6 +19,7 @@
 #include <dlfcn.h>
 #include <ucontext.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <semaphore.h>
 #include <pthread.h>
@@ -840,12 +841,32 @@ static void stop()
 	texels = nullptr;
 }
 
+// Whether dir holds a pack for this ROM, named as GLideNHQ looks for it (':' and '/' in the name become '-'): the
+// <name>_HIRESTEXTURES.hts cache or a <name> PNG folder. Without one the switch stays off for this game, so it keeps the
+// stock shaders and skips the key hashing (both cost speed, master list 35).
+static bool pack_exists(const char *d, const char *romname)
+{
+	std::string base = std::string(d) + "/" + romname;
+	for (size_t i = strlen(d) + 1; i < base.size(); i++)
+		if (base[i] == ':' || base[i] == '/')
+			base[i] = '-';
+	struct stat st;
+	if (stat((base + "_HIRESTEXTURES.hts").c_str(), &st) == 0 && S_ISREG(st.st_mode))
+		return true;
+	return stat(base.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 static void init(const char *romname)
 {
 	stop();
 	const char *d = getenv("N64_RDP_TEXPACK");
 	if (!d || !*d || !frontend)
 		return;
+	if (!pack_exists(d, romname))
+	{
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture packs: no pack for '%s' in %s; off for this game.\n", romname, d);
+		return;
+	}
 	size_t mb = 256;
 	if (const char *e = getenv("N64_RDP_TEXPACK_MB"))
 		mb = strtoul(e, nullptr, 0);
