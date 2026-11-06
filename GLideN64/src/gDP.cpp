@@ -20,6 +20,8 @@
 #include "Config.h"
 #include "Combiner.h"
 #include "Performance.h"
+
+bool texkeys_gln_on(); // Textures.cpp, N64_GLN_TEXKEYS
 #include "DisplayWindow.h"
 #include <Graphics/Context.h>
 
@@ -770,7 +772,7 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
 
 	gDP.paletteCRC256 = CRC_Calculate(UINT64_MAX, gDP.paletteCRC16, sizeof(u64) * 16);
 
-	if (TFH.isInited()) {
+	if (TFH.isInited() || texkeys_gln_on()) {
 		const u16 start = static_cast<u16>(gDP.tiles[tile].tmem) - 256; // starting location in the palettes
 		u16 *spal = reinterpret_cast<u16*>(RDRAM + gDP.textureImage.address);
 		memcpy(reinterpret_cast<u8*>(gDP.TexFilterPalette + start), spal, u32(count)<<1);

@@ -2214,6 +2214,13 @@ static void framebuffer(u32 _t)
 }
 }
 
+// gDP.cpp: GLideN64 fills the hi-res palette copy only when a pack is loaded; the key log needs it too, or CI keys
+// carry an empty palette CRC. False (one load and compare) unless N64_GLN_TEXKEYS is set.
+bool texkeys_gln_on()
+{
+	return TexKeysG::state != 0 && TexKeysG::on();
+}
+
 void texkeys_gln_frame()
 {
 	using namespace TexKeysG;
