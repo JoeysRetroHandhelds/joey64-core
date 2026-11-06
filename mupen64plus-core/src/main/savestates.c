@@ -286,6 +286,12 @@ int savestates_load_m64p(struct device* dev, const void *data)
     if(strncmp((char *)curr, savestate_magic, 8)!=0)
     {
         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Savestate is not a valid Mupen64plus savestate.");
+        /* unlock like the other early returns: left locked, the emulation thread hung on the next state job */
+#ifdef USE_SDL
+        SDL_UnlockMutex(savestates_lock);
+#else
+        pthread_mutex_unlock(&savestates_lock);
+#endif
         return 0;
     }
 #endif

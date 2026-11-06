@@ -2198,6 +2198,10 @@ bool retro_unserialize(const void *data, size_t size)
    if (initializing)
       return false;
 
+   /* the loader copies a 44-byte header (magic, version, ROM MD5) from data without knowing its size */
+   if (!data || size < 44 || memcmp(data, "M64+SAVE", 8) != 0)
+      return false;
+
    retro_savestate_complete = false;
    retro_savestate_result = 0;
 
@@ -2223,7 +2227,8 @@ bool retro_unserialize(const void *data, size_t size)
       glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
    }
 
-   return true;
+   /* the load's own result (0 for another ROM's state or an incompatible version), as retro_serialize does */
+   return !!retro_savestate_result;
 }
 
 //Needed to be able to detach controllers for Lylat Wars multiplayer
