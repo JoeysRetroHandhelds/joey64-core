@@ -1305,15 +1305,19 @@ static bool hiresKey(uint32_t t, uint32_t ti, const uint32_t *rect_words, Rec &r
 	return true;
 }
 
-static bool uses_texel1()
+static bool uses_texel1(bool one_cycle)
 {
-	// color a/b/d = 2, c = 2 or 9 (TEXEL1_ALPHA); alpha a/b/c/d = 2, both cycles
+	// color a/b/d = 2, c = 2 or 9 (TEXEL1_ALPHA); alpha a/b/c/d = 2. As GLideN64's Combiner_GetStages: 1-cycle mode
+	// uses only the second cycle's equations, so TEXEL1 left in the first cycle does not make it update slot 1.
 	const uint32_t w0 = combine_w0, w1 = combine_w1;
+	const bool second = ((w0 >> 5) & 15) == 2 || ((w0 >> 0) & 31) == 2 || ((w0 >> 0) & 31) == 9 ||
+	                    ((w1 >> 24) & 15) == 2 || ((w1 >> 21) & 7) == 2 || ((w1 >> 18) & 7) == 2 ||
+	                    ((w1 >> 6) & 7) == 2 || ((w1 >> 3) & 7) == 2 || ((w1 >> 0) & 7) == 2;
+	if (one_cycle || second)
+		return second;
 	return ((w0 >> 20) & 15) == 2 || ((w0 >> 15) & 31) == 2 || ((w0 >> 15) & 31) == 9 || ((w0 >> 12) & 7) == 2 ||
-	       ((w0 >> 9) & 7) == 2 || ((w0 >> 5) & 15) == 2 || ((w0 >> 0) & 31) == 2 || ((w0 >> 0) & 31) == 9 ||
-	       ((w1 >> 28) & 15) == 2 || ((w1 >> 24) & 15) == 2 || ((w1 >> 21) & 7) == 2 || ((w1 >> 18) & 7) == 2 ||
-	       ((w1 >> 15) & 7) == 2 || ((w1 >> 12) & 7) == 2 || ((w1 >> 9) & 7) == 2 || ((w1 >> 6) & 7) == 2 ||
-	       ((w1 >> 3) & 7) == 2 || ((w1 >> 0) & 7) == 2;
+	       ((w0 >> 9) & 7) == 2 || ((w1 >> 28) & 15) == 2 || ((w1 >> 15) & 7) == 2 || ((w1 >> 12) & 7) == 2 ||
+	       ((w1 >> 9) & 7) == 2;
 }
 
 static void count(const Rec &r) { counts[r]++; }
@@ -1321,7 +1325,7 @@ static void count(const Rec &r) { counts[r]++; }
 static void draw(uint32_t tile, uint8_t kind, const uint32_t *rect_words)
 {
 	draws_tex++;
-	const bool two = cycleType <= 1 && uses_texel1(); // 1/2-cycle combiner reads TEXEL1: GLideN64 updates slot 1
+	const bool two = cycleType <= 1 && uses_texel1(cycleType == 0); // combiner reads TEXEL1: GLideN64 updates slot 1
 	const uint32_t ti[2] = { tile, (tile + 1) & 7 };
 	for (uint32_t t = 0; t < (two ? 2u : 1u); t++)
 	{
