@@ -25,6 +25,7 @@
 #include "rdp_device.hpp"
 #include "thread_id.hpp"
 #include <assert.h>
+#include <stdlib.h>
 
 namespace RDP
 {
@@ -41,6 +42,11 @@ void CommandRing::init(
 	write_count = 0;
 	read_count = 0;
 	completed_count = 0;
+	const char *env = getenv("N64_RDP_RING_LAZY");
+	lazy = !(env && env[0] == '0');
+	env = getenv("N64_RDP_RING_ADAPT");
+	adapt = !(env && env[0] == '0');
+	eager_until = 0;
 #ifdef PARALLEL_RDP_SHADER_DIR
 	global_handles = std::move(global_handles_);
 #endif
@@ -52,6 +58,7 @@ void CommandRing::teardown_thread()
 	if (thr.joinable())
 	{
 		enqueue_command(0, nullptr);
+		kick();
 		thr.join();
 	}
 }
@@ -68,11 +75,18 @@ void CommandRing::wake()
 	cond.notify_all();
 }
 
+void CommandRing::kick()
+{
+	if (reader_waiting)
+		wake();
+}
+
 void CommandRing::drain()
 {
 	uint64_t written = write_count.load(std::memory_order_relaxed);
 	if (completed_count.load() == written)
 		return;
+	kick();
 	std::unique_lock<std::mutex> holder{lock};
 	drain_waiting = true;
 	cond.wait(holder, [this, written]() {
@@ -89,6 +103,7 @@ void CommandRing::enqueue_command(unsigned num_words, const uint32_t *words)
 	};
 	if (!has_room())
 	{
+		kick();
 		std::unique_lock<std::mutex> holder{lock};
 		writer_waiting = true;
 		cond.wait(holder, has_room);
@@ -103,8 +118,17 @@ void CommandRing::enqueue_command(unsigned num_words, const uint32_t *words)
 
 	// Wake the worker only when it sleeps: a lock and notify per command cost futex syscalls
 	// and contention (thousands per frame), and the worker takes everything queued per wakeup.
-	if (reader_waiting)
+	// Lazy: only once a batch has built up (see lazy in the header), unless the emulation thread waited on
+	// the worker recently (see eager_until).
+	bool eager = !lazy || write < eager_until;
+	if (reader_waiting && (eager || write - read_count.load() >= lazy_words))
 		wake();
+}
+
+void CommandRing::note_wait()
+{
+	if (adapt)
+		eager_until = write_count.load(std::memory_order_relaxed) + eager_words;
 }
 
 void CommandRing::thread_loop()
