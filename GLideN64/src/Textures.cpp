@@ -22,6 +22,10 @@
 #include "Graphics/Parameters.h"
 #include "DisplayWindow.h"
 #include <mupen64plus-next_common.h>
+#include <unordered_map>
+#include <stdio.h>
+#include <stdlib.h>
+#include "GLideNHQ/TxUtil.h"
 
 using namespace std;
 using namespace graphics;
@@ -2062,17 +2066,191 @@ void TextureCache::toggleDumpTex()
 	}
 }
 
+// Texture pack key log, measurement only (env N64_GLN_TEXKEYS=<file>; Joey64 master list item 35, step A). Off:
+// nothing runs. At every texture update, logs the key _loadHiresTexture would look a pack up with (same code, minus
+// the lookup), so the PC can check it against a pack and compare with parallel-RDP's keys. Hires textures stay off.
+namespace TexKeysG
+{
+static int state = -1;
+static FILE *out;
+struct Rec
+{
+	u64 crc;
+	u16 fmt, siz, w, h;
+	u8 kind, fb;
+	bool operator==(const Rec &o) const
+	{
+		return crc == o.crc && fmt == o.fmt && siz == o.siz && w == o.w && h == o.h && kind == o.kind && fb == o.fb;
+	}
+};
+struct RecHash
+{
+	size_t operator()(const Rec &r) const
+	{
+		return size_t(r.crc * 0x9E3779B97F4A7C15ull) ^ (size_t(r.fmt) << 1) ^ (size_t(r.siz) << 5) ^ (size_t(r.w) << 9) ^
+			(size_t(r.h) << 20) ^ (size_t(r.kind) << 40) ^ (size_t(r.fb) << 48);
+	}
+};
+static std::unordered_map<Rec, u32, RecHash> counts;
+static unsigned frames, updates, nokey, lookups;
+static u64 frameTotal;
+
+static bool on()
+{
+	if (state < 0) {
+		const char *path = getenv("N64_GLN_TEXKEYS");
+		out = (path && *path) ? fopen(path, "w") : nullptr;
+		state = out ? 1 : 0;
+		if (out)
+			fprintf(out, "# texkeys gln v1 mk64hack %d altcrc %d\n",
+				(config.generalEmulation.hacks & hack_MK64) != 0 ? 1 : 0, int(config.textureFilter.txHresAltCRC));
+	}
+	return state == 1;
+}
+
+static void add(u64 crc, u32 fmt, u32 siz, u32 w, u32 h, u8 kind)
+{
+	Rec r{ crc, u16(fmt), u16(siz), u16(w), u16(h), kind, 0 };
+	counts[r]++;
+}
+
+static u8 *palAddr(u32 size, u32 format, u32 palette)
+{
+	if (size < G_IM_SIZ_16b && (gDP.otherMode.textureLUT != G_TT_NONE || format == G_IM_FMT_CI)) {
+		if (size == G_IM_SIZ_8b)
+			return (u8*)(gDP.TexFilterPalette);
+		if (config.textureFilter.txHresAltCRC)
+			return (u8*)(gDP.TexFilterPalette + (palette << 5));
+		return (u8*)(gDP.TexFilterPalette + (palette << 4));
+	}
+	return nullptr;
+}
+
+static bool rangeOk(u32 addr, int bpl, int width, int height, u32 size)
+{
+	const int bytesPerLine = width << size >> 1;
+	if (width <= 0 || height <= 0 || bpl < 0 || int64_t(addr) + std::min(0, bytesPerLine - 4) < 0)
+		return false;
+	return uint64_t(addr) + uint64_t(bpl) * uint64_t(height - 1) + uint64_t(std::max(bytesPerLine, 4)) <= uint64_t(RDRAMSize) + 1;
+}
+
+// _loadHiresTexture's key (copied; _pTexture's fields are pTile's and sizes.width at this point)
+static void texture(u32 _tile, const gDPTile *pTile, u32 texWidth, u32 texHeight)
+{
+	updates++;
+	gDPLoadTileInfo & info = gDP.loadInfo[pTile->tmem];
+	if (info.texAddress == 0) {
+		nokey++;
+		return;
+	}
+	int bpl;
+	int width, height;
+	u32 addr = info.texAddress;
+	if (info.loadType == LOADTYPE_TILE) {
+		bpl = info.texWidth << info.size >> 1;
+		addr += (info.ult * bpl) + (((info.uls << info.size) + 1) >> 1);
+		width = std::min(info.width, info.texWidth);
+		if (info.size > pTile->size)
+			width <<= info.size - pTile->size;
+		height = info.height;
+		if ((config.generalEmulation.hacks & hack_MK64) != 0 && (height % 2) != 0)
+			height--;
+	} else {
+		const gDPTile * pT = gSP.textureTile[_tile];
+		int tile_width = ((pT->lrs - pT->uls) & 0x03FF) + 1;
+		int tile_height = ((pT->lrt - pT->ult) & 0x03FF) + 1;
+		int mask_width = (pT->masks == 0) ? (tile_width) : (1 << pT->masks);
+		int mask_height = (pT->maskt == 0) ? (tile_height) : (1 << pT->maskt);
+		if ((pT->clamps && tile_width <= 256))
+			width = std::min(mask_width, tile_width);
+		else
+			width = mask_width;
+		if ((pT->clampt && tile_height <= 256) || (mask_height > 256))
+			height = std::min(mask_height, tile_height);
+		else
+			height = mask_height;
+		if (pT->size == G_IM_SIZ_32b)
+			bpl = pT->line << 4;
+		else if (info.dxt == 0)
+			bpl = pT->line << 3;
+		else {
+			u32 dxt = info.dxt;
+			if (dxt > 1)
+				dxt = ReverseDXT(dxt, info.width, texWidth, pTile->size);
+			bpl = dxt << 3;
+		}
+	}
+	if (!rangeOk(addr, bpl, width, height, pTile->size)) {
+		nokey++;
+		return;
+	}
+	lookups++;
+	const u64 crc = TxUtil::checksum64(RDRAM + addr, width, height, pTile->size, bpl,
+		palAddr(pTile->size, pTile->format, pTile->palette));
+	add(crc, pTile->format, pTile->size, texWidth, texHeight, u8(_tile ? 8 : 0));
+}
+
+// _loadHiresBackground's key (S2DEX backgrounds: whole image), kind 16
+static void background()
+{
+	updates++;
+	const int w = gSP.bgImage.width, h = gSP.bgImage.height;
+	const int bpl = w << gSP.bgImage.size >> 1;
+	if (!rangeOk(gSP.bgImage.address, bpl, w, h, gSP.bgImage.size)) {
+		nokey++;
+		return;
+	}
+	lookups++;
+	const u64 crc = TxUtil::checksum64(RDRAM + gSP.bgImage.address, w, h, gSP.bgImage.size, bpl,
+		palAddr(gSP.bgImage.size, gSP.bgImage.format, gSP.bgImage.palette));
+	add(crc, gSP.bgImage.format, gSP.bgImage.size, w, h, 16);
+}
+
+// framebuffer textures: no pack key, counted as kind 32
+static void framebuffer(u32 _t)
+{
+	updates++;
+	add(0, 0, 0, 0, 0, u8(32 | (_t ? 8 : 0)));
+}
+}
+
+void texkeys_gln_frame()
+{
+	using namespace TexKeysG;
+	if (state != 1)
+		return;
+	frames++;
+	frameTotal++;
+	if (frames < 60)
+		return;
+	fprintf(out, "W %llu frames %u updates %u nokey %u keys %u lookups %u\n", (unsigned long long)frameTotal, frames,
+		updates, nokey, unsigned(counts.size()), lookups);
+	for (auto &kv : counts)
+		fprintf(out, "K %016llx %u %u %u %u %u %u %u\n", (unsigned long long)kv.first.crc, kv.first.fmt, kv.first.siz,
+			kv.first.w, kv.first.h, kv.first.kind, kv.first.fb, kv.second);
+	fflush(out);
+	counts.clear();
+	frames = updates = nokey = lookups = 0;
+}
+
 void TextureCache::update(u32 _t)
 {
 	const gDPTile * pTile = gSP.textureTile[_t];
+	const bool texKeys = TexKeysG::state != 0 && TexKeysG::on();
 	switch (pTile->textureMode) {
 	case TEXTUREMODE_BGIMAGE:
+		if (texKeys)
+			TexKeysG::background();
 		_updateBackground();
 		return;
 	case TEXTUREMODE_FRAMEBUFFER:
+		if (texKeys)
+			TexKeysG::framebuffer(_t);
 		FrameBuffer_ActivateBufferTexture( _t, pTile->frameBufferAddress );
 		return;
 	case TEXTUREMODE_FRAMEBUFFER_BG:
+		if (texKeys)
+			TexKeysG::framebuffer(_t);
 		FrameBuffer_ActivateBufferTextureBG( _t, pTile->frameBufferAddress );
 		return;
 	}
@@ -2096,6 +2274,8 @@ void TextureCache::update(u32 _t)
 
 	TileSizes sizes;
 	_calcTileSizes(_t, sizes, gDP.loadTile);
+	if (texKeys)
+		TexKeysG::texture(_t, pTile, sizes.width, sizes.height);
 	TextureParams params;
 	const u32 texLevel = _t == 0 ? 0U : gSP.texture.level;
 	params.flags = pTile->masks	|

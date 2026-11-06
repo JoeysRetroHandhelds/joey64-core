@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
+#include <unordered_map>
 #include <string.h>
 #include <signal.h>
 #include <dlfcn.h>
@@ -716,6 +717,624 @@ static bool same_as_last()
 }
 }
 
+// Texture pack keys, measurement only (env N64_RDP_TEXKEYS=<file>; master list item 35, step A). Off: nothing runs.
+// Computes, for every textured draw, the key GLideN64 would look a texture pack up with (TextureCache::update ->
+// _calcTileSizes -> _loadHiresTexture, GLideN64/src/Textures.cpp; state from gDPSetTextureImage, gDPSetTile,
+// gDPSetTileSize, gDPLoadTile, gDPLoadBlock, gDPLoadTLUT in gDP.cpp, decoded as RDP.cpp does), hashed with GLideNHQ's
+// Rice CRC (TxUtil::checksum64, copied). Nothing is rendered differently. Every 60 frames the key counts go to the
+// file; the pack lookup happens on the PC (tools/htsindex.py), so the pack never has to be on the device.
+// GLideN64 code: GPLv2-or-later (Joey64 is GPL-3.0-or-later).
+namespace TexKeys
+{
+static bool enabled;
+static FILE *out;
+
+// G_IM_SIZ_*, G_IM_FMT_*, LOADTYPE_*
+enum { SIZ_4b = 0, SIZ_8b = 1, SIZ_16b = 2, SIZ_32b = 3 };
+enum { FMT_CI = 2 };
+enum { LOADTYPE_BLOCK = 0, LOADTYPE_TILE = 1 };
+
+struct Tile
+{
+	uint32_t format, size, line, tmem, palette, cmt, cms, maskt, masks, originalMaskT, originalMaskS;
+	uint32_t uls, ult, lrs, lrt, loadType, imageAddress;
+	uint16_t loadWidth, loadHeight;
+	uint32_t clamps() const { return (cms >> 1) & 1; }
+	uint32_t clampt() const { return (cmt >> 1) & 1; }
+};
+struct LoadInfo
+{
+	uint8_t size, loadType;
+	uint16_t uls, ult, lrs, lrt, width, height, texWidth;
+	uint32_t texAddress, dxt, bytes;
+};
+static Tile tiles[8];
+static LoadInfo loadInfo[512];
+static uint16_t palette[512]; // gDP.TexFilterPalette
+static uint32_t timg_format, timg_size, timg_width, timg_address, timg_bpl;
+static uint32_t loadTileIdx;
+static uint32_t textureLUT, cycleType, scissorLry;
+static uint32_t gspTextureTile; // gSP.texture.tile: set by LLE triangles only
+static uint32_t combine_w0, combine_w1;
+static bool hackMK64;
+static uint8_t const *mem;
+static uint32_t memSize;
+
+// colour images drawn this frame and last (framebuffer textures)
+static uint32_t color_addr, color_width, color_size;
+static vector<pair<uint32_t, uint32_t>> drawn_now, drawn_prev;
+
+// Key record: what the PC needs to look it up and to sort the misses.
+struct Rec
+{
+	uint64_t crc;
+	uint16_t fmt, siz, w, h;
+	uint8_t kind, fb;
+	bool operator==(const Rec &o) const
+	{
+		return crc == o.crc && fmt == o.fmt && siz == o.siz && w == o.w && h == o.h && kind == o.kind && fb == o.fb;
+	}
+};
+struct RecHash
+{
+	size_t operator()(const Rec &r) const
+	{
+		return size_t(r.crc * 0x9E3779B97F4A7C15ull) ^ (size_t(r.fmt) << 1) ^ (size_t(r.siz) << 5) ^ (size_t(r.w) << 9) ^
+		       (size_t(r.h) << 20) ^ (size_t(r.kind) << 40) ^ (size_t(r.fb) << 48);
+	}
+};
+static std::unordered_map<Rec, uint32_t, RecHash> counts;
+static unsigned frames, draws_tex, draws_nokey, lookups;
+static uint64_t frame_total;
+
+// cached keys per texture slot until the tile/TMEM state changes (GLideN64 only re-runs update() on CHANGED_TILE /
+// CHANGED_TMEM; _calcTileSizes has side effects on loadInfo, so it must not run more often than GLideN64 runs it)
+static bool dirty = true;
+static bool have[2];
+static Rec cached[2];
+static uint32_t cached_tile[2];
+
+// ---- GLideNHQ TxUtil.cpp (C paths) ----
+static uint32_t RiceCRC32(const uint8_t *src, int width, int height, int size, int rowStride)
+{
+	uint32_t crc32Ret = 0;
+	const uint32_t bytesPerLine = width << size >> 1;
+	int y = height - 1;
+	do
+	{
+		uint32_t esi = 0;
+		int x = int(bytesPerLine) - 4;
+		do
+		{
+			memcpy(&esi, src + x, 4);
+			esi ^= uint32_t(x);
+			crc32Ret = (crc32Ret << 4) + ((crc32Ret >> 28) & 15);
+			crc32Ret += esi;
+			x -= 4;
+		} while (x >= 0);
+		esi ^= uint32_t(y);
+		crc32Ret += esi;
+		src += rowStride;
+		--y;
+	} while (y >= 0);
+	return crc32Ret;
+}
+
+static uint8_t CalculateMaxCI8b(const uint8_t *src, uint32_t width, uint32_t height, uint32_t rowStride)
+{
+	uint8_t val = 0;
+	for (uint32_t y = 0; y < height; ++y)
+	{
+		const uint8_t *buf = src + rowStride * y;
+		for (uint32_t x = 0; x < width; ++x)
+		{
+			if (buf[x] > val)
+				val = buf[x];
+			if (val == 0xFF)
+				return 0xFF;
+		}
+	}
+	return val;
+}
+
+static uint8_t CalculateMaxCI4b(const uint8_t *src, uint32_t width, uint32_t height, uint32_t rowStride)
+{
+	uint8_t val = 0;
+	width >>= 1;
+	for (uint32_t y = 0; y < height; ++y)
+	{
+		const uint8_t *buf = src + rowStride * y;
+		for (uint32_t x = 0; x < width; ++x)
+		{
+			uint8_t v1 = buf[x] >> 4, v2 = buf[x] & 0xF;
+			if (v1 > val) val = v1;
+			if (v2 > val) val = v2;
+			if (val == 0xF)
+				return 0xF;
+		}
+	}
+	return val;
+}
+
+static uint64_t checksum64(const uint8_t *src, int width, int height, int size, int rowStride, const uint8_t *pal)
+{
+	uint64_t crc64Ret = 0;
+	if (pal)
+	{
+		uint32_t crc32 = 0, cimax = 0;
+		switch (size & 0xff)
+		{
+		case 1:
+			crc32 = RiceCRC32(src, width, height, 1, rowStride);
+			cimax = CalculateMaxCI8b(src, width, height, rowStride);
+			crc64Ret = uint64_t(RiceCRC32(pal, cimax + 1, 1, 2, 512)) << 32 | crc32;
+			break;
+		case 0:
+			crc32 = RiceCRC32(src, width, height, 0, rowStride);
+			cimax = CalculateMaxCI4b(src, width, height, rowStride);
+			crc64Ret = uint64_t(RiceCRC32(pal, cimax + 1, 1, 2, 32)) << 32 | crc32;
+			break;
+		}
+	}
+	if (!crc64Ret)
+		crc64Ret = RiceCRC32(src, width, height, size, rowStride);
+	return crc64Ret;
+}
+
+// ---- GLideN64 Textures.cpp ----
+static const uint32_t sizeBytes[4] = { 0, 1, 2, 4 };
+static uint32_t CalculateDXT(uint32_t txl2words) { return txl2words == 0 ? 1 : (2048 + txl2words - 1) / txl2words; }
+static uint32_t Txl2Words(uint32_t width, uint32_t size)
+{
+	return size == 0 ? max(1u, width / 16) : max(1u, width * sizeBytes[size] / 8);
+}
+static uint32_t ReverseDXT(uint32_t val, uint32_t lrs, uint32_t width, uint32_t size)
+{
+	(void)lrs;
+	if (val == 0x800) return 1;
+	int low = 2047 / int(val);
+	if (CalculateDXT(uint32_t(low)) > val) low++;
+	int high = 2047 / int(val - 1);
+	if (low == high) return uint32_t(low);
+	for (int i = low; i <= high; i++)
+		if (Txl2Words(width, size) == uint32_t(i))
+			return uint32_t(i);
+	return uint32_t((low + high) / 2);
+}
+// ImageFormat::tlp[textureLUT][size][format].maxTexels
+static uint32_t maxTexels(uint32_t lut, uint32_t size, uint32_t format)
+{
+	if (size >= SIZ_32b) return 1024;
+	if (size == SIZ_16b) return 2048;
+	if (lut == 0) return size == SIZ_4b ? 8192 : 4096;
+	if (format == 1) return size == SIZ_4b ? 8192 : 4096; // YUV
+	return size == SIZ_4b ? 4096 : 2048;
+}
+
+struct TileSizes { uint32_t width, height, clampWidth, clampHeight, bytes; };
+
+static void calcTileSizes(uint32_t ti, TileSizes &s, const uint32_t *rect_words)
+{
+	Tile &t = tiles[ti];
+	Tile &lt = tiles[loadTileIdx];
+	t.masks = t.originalMaskS;
+	t.maskt = t.originalMaskT;
+	uint32_t tileWidth = ((t.lrs - t.uls) & 0x03FF) + 1;
+	uint32_t tileHeight = ((t.lrt - t.ult) & 0x03FF) + 1;
+	const uint32_t tMemMask = textureLUT == 0 ? 0x1FF : 0xFF;
+	LoadInfo &info = loadInfo[t.tmem & tMemMask];
+	if (t.tmem == lt.tmem)
+	{
+		if (lt.loadWidth != 0 && lt.masks == 0)
+			info.width = lt.loadWidth;
+		if (lt.loadHeight != 0 && lt.maskt == 0)
+		{
+			info.height = lt.loadHeight;
+			info.bytes = info.height * (lt.line << 3);
+			if (lt.size == SIZ_32b)
+				info.bytes *= 2;
+		}
+	}
+	lt.loadWidth = lt.loadHeight = 0;
+	s.bytes = info.bytes;
+	if (tileWidth == 1 && tileHeight == 1 && cycleType == 2 && rect_words)
+	{
+		// RDP.w1 / RDP.w0 of the texrect: GLideN64's w0 is the command word, w1 the second word
+		const uint32_t w0 = rect_words[0], w1 = rect_words[1];
+		const uint32_t ulx = (w1 >> 14) & 0x3FF, uly = (w1 >> 2) & 0x3FF;
+		const uint32_t lrx = (w0 >> 14) & 0x3FF, lry = (w0 >> 2) & 0x3FF;
+		tileWidth = lrx - ulx + 1;
+		tileHeight = lry - uly + 1;
+	}
+	uint32_t width = 0, height = 0;
+	if (info.loadType == LOADTYPE_TILE)
+	{
+		width = min<uint32_t>(info.width, info.texWidth);
+		if (width == 0) width = tileWidth;
+		if (info.size > t.size) width <<= info.size - t.size;
+		height = info.height;
+		if (height == 0) height = tileHeight;
+		if (hackMK64 && (height % 2) != 0) height--;
+	}
+	else
+	{
+		const uint32_t mt = maxTexels(textureLUT, t.size, t.format);
+		int tile_width = int(t.lrs - t.uls + 1);
+		int tile_height = int(t.lrt - t.ult + 1);
+		int mask_width = t.masks == 0 ? tile_width : (1 << t.masks);
+		int mask_height = t.maskt == 0 ? tile_height : (1 << t.maskt);
+		if (t.clamps())
+			width = uint32_t(min(mask_width, tile_width));
+		else if (uint32_t(mask_width * mask_height) <= mt)
+			width = uint32_t(mask_width);
+		else
+			width = tileWidth;
+		if (t.clampt())
+			height = uint32_t(min(mask_height, tile_height));
+		else if (uint32_t(mask_width * mask_height) <= mt)
+			height = uint32_t(mask_height);
+		else
+			height = tileHeight;
+	}
+	s.clampWidth = (t.clamps() && cycleType != 2) ? tileWidth : width;
+	s.clampHeight = (t.clampt() && cycleType != 2) ? tileHeight : height;
+	s.width = (info.loadType == LOADTYPE_TILE && t.clamps() != 0 && t.masks == 0) ? s.clampWidth : width;
+	s.height = (info.loadType == LOADTYPE_TILE && t.clampt() != 0 && t.maskt == 0) ? s.clampHeight : height;
+}
+
+static bool in_framebuffer(uint32_t addr)
+{
+	for (auto &r : drawn_now)
+		if (addr >= r.first && addr < r.second) return true;
+	for (auto &r : drawn_prev)
+		if (addr >= r.first && addr < r.second) return true;
+	return false;
+}
+
+// _loadHiresTexture's key for texture slot t (tile index ti), or false where GLideN64 computes none.
+static bool hiresKey(uint32_t t, uint32_t ti, const uint32_t *rect_words, Rec &rec)
+{
+	const Tile &tile = tiles[ti];
+	TileSizes sz;
+	calcTileSizes(ti, sz, rect_words);
+	LoadInfo &info = loadInfo[tile.tmem & 511];
+	if (info.texAddress == 0)
+		return false;
+	int bpl, width, height;
+	uint32_t addr = info.texAddress;
+	if (info.loadType == LOADTYPE_TILE)
+	{
+		bpl = info.texWidth << info.size >> 1;
+		addr += info.ult * bpl + (((info.uls << info.size) + 1) >> 1);
+		width = min<int>(info.width, info.texWidth);
+		if (info.size > tile.size) width <<= info.size - tile.size;
+		height = info.height;
+		if (hackMK64 && (height % 2) != 0) height--;
+	}
+	else
+	{
+		int tile_width = int(((tile.lrs - tile.uls) & 0x03FF) + 1);
+		int tile_height = int(((tile.lrt - tile.ult) & 0x03FF) + 1);
+		int mask_width = tile.masks == 0 ? tile_width : (1 << tile.masks);
+		int mask_height = tile.maskt == 0 ? tile_height : (1 << tile.maskt);
+		width = (tile.clamps() && tile_width <= 256) ? min(mask_width, tile_width) : mask_width;
+		height = ((tile.clampt() && tile_height <= 256) || mask_height > 256) ? min(mask_height, tile_height) : mask_height;
+		if (tile.size == SIZ_32b)
+			bpl = int(tile.line << 4);
+		else if (info.dxt == 0)
+			bpl = int(tile.line << 3);
+		else
+		{
+			uint32_t dxt = info.dxt;
+			if (dxt > 1)
+				dxt = ReverseDXT(dxt, info.width, sz.width, tile.size);
+			bpl = int(dxt << 3);
+		}
+	}
+	const uint8_t *pal = nullptr;
+	if (tile.size < SIZ_16b && (textureLUT != 0 || tile.format == FMT_CI))
+		pal = reinterpret_cast<const uint8_t *>(tile.size == SIZ_8b ? palette : palette + (tile.palette << 4));
+	// GLideN64 reads RDRAM unchecked; skip what would run past it (and degenerate sizes the CRC can't take)
+	// (a line under 4 bytes still reads 4 bytes from bytesPerLine - 4, before the line, as GLideNHQ does)
+	const int bytesPerLine = width << tile.size >> 1;
+	const int64_t first = int64_t(addr) + min(0, bytesPerLine - 4);
+	if (width <= 0 || height <= 0 || bpl < 0 || first < 0 ||
+	    uint64_t(addr) + uint64_t(bpl) * uint64_t(height - 1) + uint64_t(max(bytesPerLine, 4)) > memSize)
+		return false;
+	lookups++;
+	rec.crc = checksum64(mem + addr, width, height, int(tile.size), bpl, pal);
+	rec.fmt = uint16_t(tile.format);
+	rec.siz = uint16_t(tile.size);
+	rec.w = uint16_t(sz.width);
+	rec.h = uint16_t(sz.height);
+	rec.kind = 0;
+	rec.fb = in_framebuffer(info.texAddress) ? 1 : 0;
+	(void)t;
+	return true;
+}
+
+static bool uses_texel1()
+{
+	// color a/b/d = 2, c = 2 or 9 (TEXEL1_ALPHA); alpha a/b/c/d = 2, both cycles
+	const uint32_t w0 = combine_w0, w1 = combine_w1;
+	return ((w0 >> 20) & 15) == 2 || ((w0 >> 15) & 31) == 2 || ((w0 >> 15) & 31) == 9 || ((w0 >> 12) & 7) == 2 ||
+	       ((w0 >> 9) & 7) == 2 || ((w0 >> 5) & 15) == 2 || ((w0 >> 0) & 31) == 2 || ((w0 >> 0) & 31) == 9 ||
+	       ((w1 >> 28) & 15) == 2 || ((w1 >> 24) & 15) == 2 || ((w1 >> 21) & 7) == 2 || ((w1 >> 18) & 7) == 2 ||
+	       ((w1 >> 15) & 7) == 2 || ((w1 >> 12) & 7) == 2 || ((w1 >> 9) & 7) == 2 || ((w1 >> 6) & 7) == 2 ||
+	       ((w1 >> 3) & 7) == 2 || ((w1 >> 0) & 7) == 2;
+}
+
+static void count(const Rec &r) { counts[r]++; }
+
+static void draw(uint32_t tile, uint8_t kind, const uint32_t *rect_words)
+{
+	draws_tex++;
+	const bool two = cycleType <= 1 && uses_texel1(); // 1/2-cycle combiner reads TEXEL1: GLideN64 updates slot 1
+	const uint32_t ti[2] = { tile, (tile + 1) & 7 };
+	for (uint32_t t = 0; t < (two ? 2u : 1u); t++)
+	{
+		if (dirty || !have[t] || cached_tile[t] != ti[t])
+		{
+			uint32_t use = ti[t];
+			// update(): gSP.texture.tile == 7 && LoadBlock && same tmem -> slot 0 uses slot 1's tile
+			if (t == 0 && gspTextureTile == 7 && use == loadTileIdx && tiles[loadTileIdx].loadType == LOADTYPE_BLOCK &&
+			    tiles[ti[0]].tmem == tiles[ti[1]].tmem)
+				use = ti[1];
+			have[t] = hiresKey(t, use, rect_words, cached[t]);
+			cached_tile[t] = ti[t];
+		}
+		if (have[t])
+		{
+			Rec r = cached[t];
+			r.kind = uint8_t(kind | (t ? 8 : 0));
+			count(r);
+		}
+		else if (t == 0)
+			draws_nokey++;
+	}
+	dirty = false;
+}
+
+static void add_drawn()
+{
+	uint32_t stride = color_size ? (color_width << (color_size - 1)) : (color_width >> 1);
+	uint32_t rows = scissorLry + 1;
+	pair<uint32_t, uint32_t> r(color_addr, color_addr + rows * stride);
+	for (auto &d : drawn_now)
+		if (d == r) return;
+	if (drawn_now.size() < 16)
+		drawn_now.push_back(r);
+}
+
+static void track(RDP::Op op, const uint32_t *w)
+{
+	const uint32_t w0 = w[0], w1 = w[1];
+	switch (op)
+	{
+	case RDP::Op::SetTextureImage:
+		timg_format = (w0 >> 21) & 7;
+		timg_size = (w0 >> 19) & 3;
+		timg_width = (w0 & 0xFFF) + 1;
+		timg_address = w1 & 0x00FFFFFF;
+		timg_bpl = timg_width << timg_size >> 1;
+		break;
+	case RDP::Op::SetTile:
+	{
+		Tile &t = tiles[(w1 >> 24) & 7];
+		t.format = (w0 >> 21) & 7;
+		t.size = (w0 >> 19) & 3;
+		t.line = (w0 >> 9) & 0x1FF;
+		t.tmem = w0 & 0x1FF;
+		t.palette = (w1 >> 20) & 15;
+		t.cmt = (w1 >> 18) & 3;
+		t.cms = (w1 >> 8) & 3;
+		t.maskt = t.originalMaskT = (w1 >> 14) & 15;
+		t.masks = t.originalMaskS = (w1 >> 4) & 15;
+		if (!t.masks) t.cms |= 2;
+		if (!t.maskt) t.cmt |= 2;
+		dirty = true;
+		break;
+	}
+	case RDP::Op::SetTileSize:
+	{
+		Tile &t = tiles[(w1 >> 24) & 7];
+		t.uls = (w0 >> 14) & 0x3FF;
+		t.ult = (w0 >> 2) & 0x3FF;
+		t.lrs = (w1 >> 14) & 0x3FF;
+		t.lrt = (w1 >> 2) & 0x3FF;
+		dirty = true;
+		break;
+	}
+	case RDP::Op::LoadTile:
+	{
+		const uint32_t ti = (w1 >> 24) & 7;
+		Tile &t = tiles[ti];
+		t.uls = (w0 >> 14) & 0x3FF;
+		t.ult = (w0 >> 2) & 0x3FF;
+		t.lrs = (w1 >> 14) & 0x3FF;
+		t.lrt = (w1 >> 2) & 0x3FF;
+		loadTileIdx = ti;
+		t.loadType = LOADTYPE_TILE;
+		t.imageAddress = timg_address;
+		dirty = true;
+		if (t.lrs < t.uls || t.lrt < t.ult)
+			break;
+		const uint32_t width = (t.lrs - t.uls + 1) & 0x03FF;
+		const uint32_t height = (t.lrt - t.ult + 1) & 0x03FF;
+		const uint32_t bpl = t.line << 3;
+		LoadInfo &info = loadInfo[t.tmem];
+		info.texAddress = t.imageAddress;
+		info.uls = uint16_t(t.uls);
+		info.ult = uint16_t(t.ult);
+		info.lrs = uint16_t(t.lrs);
+		info.lrt = uint16_t(t.lrt);
+		info.width = uint16_t(t.masks != 0 ? min(width, 1u << t.masks) : width);
+		info.height = uint16_t(t.maskt != 0 ? min(height, 1u << t.maskt) : height);
+		info.texWidth = uint16_t(timg_width);
+		info.size = uint8_t(timg_size);
+		info.loadType = LOADTYPE_TILE;
+		info.bytes = bpl * height;
+		if (t.size == SIZ_32b)
+			info.bytes *= 2;
+		if (t.line == 0)
+			break;
+		if (t.masks == 0)
+			t.loadWidth = max<uint16_t>(t.loadWidth, info.width);
+		if (t.maskt == 0)
+		{
+			if (cycleType != 1 && t.tmem % t.line == 0)
+				t.loadHeight = max<uint16_t>(t.loadHeight, uint16_t(info.height + t.tmem / t.line));
+			else
+				t.loadHeight = max<uint16_t>(t.loadHeight, info.height);
+		}
+		break;
+	}
+	case RDP::Op::LoadBlock:
+	{
+		const uint32_t ti = (w1 >> 24) & 7;
+		const uint32_t uls = (w0 >> 12) & 0xFFF, ult = w0 & 0xFFF, lrs = (w1 >> 12) & 0xFFF, dxt = w1 & 0xFFF;
+		Tile &t = tiles[ti];
+		t.uls = (uls >> 2) & 0x3FF;
+		t.ult = (ult >> 2) & 0x3FF;
+		t.lrs = (lrs >> 2) & 0x3FF;
+		t.lrt = (dxt >> 2) & 0x3FF;
+		loadTileIdx = ti;
+		t.loadType = LOADTYPE_BLOCK;
+		t.imageAddress = timg_address;
+		dirty = true;
+		LoadInfo &info = loadInfo[t.tmem];
+		info.texAddress = t.imageAddress;
+		info.uls = uint16_t(t.uls);
+		info.ult = uint16_t(t.ult);
+		info.lrs = uint16_t(t.lrs);
+		info.lrt = uint16_t(t.lrt);
+		info.width = uint16_t(t.lrs);
+		info.dxt = dxt;
+		info.size = uint8_t(timg_size);
+		info.loadType = LOADTYPE_BLOCK;
+		const uint32_t width = (lrs - uls + 1) & 0x0FFF;
+		uint32_t bytes = width << t.size >> 1;
+		if ((bytes & 7) != 0)
+			bytes = (bytes & ~7u) + 8;
+		info.bytes = bytes;
+		const uint32_t address = timg_address + ult * timg_bpl + (uls << timg_size >> 1);
+		if (bytes == 0 || address + bytes > memSize)
+			break;
+		const uint32_t lo = t.tmem, hi = t.tmem + (bytes >> 3);
+		for (uint32_t i = 0; i < ti; ++i)
+			if (tiles[i].tmem >= lo && tiles[i].tmem < hi)
+				loadInfo[tiles[i].tmem].loadType = LOADTYPE_BLOCK;
+		break;
+	}
+	case RDP::Op::LoadTLut:
+	{
+		Tile &t = tiles[(w1 >> 24) & 7];
+		t.uls = (w0 >> 14) & 0x3FF;
+		t.ult = (w0 >> 2) & 0x3FF;
+		t.lrs = (w1 >> 14) & 0x3FF;
+		t.lrt = (w1 >> 2) & 0x3FF;
+		dirty = true;
+		if (t.tmem < 256)
+			break;
+		uint32_t count = uint16_t((t.lrs - t.uls + 1) * (t.lrt - t.ult + 1));
+		const uint32_t start = t.tmem - 256;
+		if (start + count > 512) count = 512 - start;
+		if (uint64_t(timg_address) + count * 2 <= memSize)
+			memcpy(palette + start, mem + timg_address, count * 2);
+		break;
+	}
+	case RDP::Op::SetOtherModes:
+		cycleType = (w0 >> 20) & 3;
+		textureLUT = (w0 >> 14) & 3;
+		break;
+	case RDP::Op::SetCombine:
+		combine_w0 = w0 & 0x00FFFFFF;
+		combine_w1 = w1;
+		break;
+	case RDP::Op::SetScissor:
+		scissorLry = (w1 & 0xFFF) >> 2;
+		break;
+	case RDP::Op::SetColorImage:
+		color_addr = w1 & 0x00FFFFFF;
+		color_size = (w0 >> 19) & 3;
+		color_width = (w0 & 0x3FF) + 1;
+		break;
+	case RDP::Op::FillTriangle:
+	case RDP::Op::ShadeTriangle:
+	case RDP::Op::FillZBufferTriangle:
+	case RDP::Op::ShadeZBufferTriangle:
+	case RDP::Op::FillRectangle:
+		add_drawn();
+		break;
+	case RDP::Op::TextureTriangle:
+	case RDP::Op::ShadeTextureTriangle:
+	case RDP::Op::TextureZBufferTriangle:
+	case RDP::Op::ShadeTextureZBufferTriangle:
+		add_drawn();
+		gspTextureTile = (w0 >> 16) & 7;
+		draw((w0 >> 16) & 7, 1, nullptr);
+		break;
+	case RDP::Op::TextureRectangle:
+	case RDP::Op::TextureRectangleFlip:
+		add_drawn();
+		draw((w1 >> 24) & 7, uint8_t(cycleType == 2 ? 6 : 2), w);
+		break;
+	default:
+		break;
+	}
+}
+
+static void on_frame()
+{
+	frames++;
+	frame_total++;
+	drawn_prev.swap(drawn_now);
+	drawn_now.clear();
+	if (frames < 60 || !out)
+		return;
+	// window line, then one line per key record: K crc fmt siz w h kind fb count
+	// kind bits: 1 triangle, 2 texrect, 4 copy mode, 8 second texture (TEXEL1)
+	fprintf(out, "W %llu frames %u textured %u nokey %u keys %u lookups %u\n", (unsigned long long)frame_total, frames,
+	        draws_tex, draws_nokey, unsigned(counts.size()), lookups);
+	for (auto &kv : counts)
+		fprintf(out, "K %016llx %u %u %u %u %u %u %u\n", (unsigned long long)kv.first.crc, kv.first.fmt, kv.first.siz,
+		        kv.first.w, kv.first.h, kv.first.kind, kv.first.fb, kv.second);
+	fflush(out);
+	counts.clear();
+	frames = draws_tex = draws_nokey = lookups = 0;
+}
+
+static void init(const uint8_t *rdram, uint32_t size)
+{
+	enabled = false;
+	const char *path = getenv("N64_RDP_TEXKEYS");
+	if (!path || !*path)
+		return;
+	if (!out)
+		out = fopen(path, "w");
+	if (!out)
+	{
+		log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture keys: can't open %s.\n", path);
+		return;
+	}
+	mem = g_rdram_alias ? static_cast<const uint8_t *>(g_rdram_alias) : rdram;
+	memSize = size;
+	// GLideN64's hack_MK64 (RSP.cpp: ROM name "MARIOKART64"); header bytes may be word-swapped
+	char a[21] = {}, b[21] = {};
+	const uint8_t *hdr = GET_GFX_INFO(HEADER);
+	for (int i = 0; i < 20 && hdr; i++)
+	{
+		a[i] = char(hdr[0x20 + i]);
+		b[i] = char(hdr[(0x20 + i) ^ 3]);
+	}
+	hackMK64 = strstr(a, "MARIOKART64") || strstr(b, "MARIOKART64");
+	fprintf(out, "# texkeys v1 rom '%s' mk64hack %d\n", b, hackMK64 ? 1 : 0);
+	enabled = true;
+	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture pack keys logged to %s.\n", path);
+}
+}
+
+
 void process_commands()
 {
 	const uint32_t DP_CURRENT = *GET_GFX_INFO(DPC_CURRENT_REG) & 0x00FFFFF8;
@@ -781,6 +1400,8 @@ void process_commands()
 			Smart::track(RDP::Op(command), w1, cmd_data[2 * cmd_cur + 1]);
 		if (Dup::enabled)
 			Dup::track(RDP::Op(command), w1, cmd_data[2 * cmd_cur + 1]);
+		if (TexKeys::enabled)
+			TexKeys::track(RDP::Op(command), &cmd_data[2 * cmd_cur]);
 
 		if (RDP::Op(command) == RDP::Op::SyncFull)
 		{
@@ -952,6 +1573,7 @@ static bool create_frontend()
 	frontend.reset(new CommandProcessor(*device, reinterpret_cast<void *>(frontend_rdram),
 				frontend_offset, frontend_rdram_size, frontend_rdram_size / 2, flags));
 	active_upscaling = upscaling;
+	TexKeys::init(DRAM, frontend_rdram_size);
 
 	if (!frontend->device_is_supported())
 	{
@@ -1073,6 +1695,8 @@ void complete_frame()
 	}
 
 	timeline_value = frontend->signal_timeline();
+	if (TexKeys::enabled)
+		TexKeys::on_frame();
 
 	// New pipelines show up as the game reaches new effects; check every ~10 s.
 	if (++frames_since_cache_check >= 600)
