@@ -922,6 +922,77 @@ i16x4 sample_texture(TileInfo tile, uint tmem_instance, ivec2 st, bool tlut, boo
 	return accum;
 }
 
+#ifdef TEXPACK
+// Joey64 texture packs. rep comes from load_tile_replace(): x = texel offset into texpack.texels, y = replacement
+// width | height << 16, z = width | height << 16 of the texture the pack key describes. The replacement spans that
+// texture exactly (as GLideN64 draws it), so a tile-relative N64 texel position u maps to u * (width / original width).
+// Wrap: repeat (mirrored with the mirror bit) when the tile has a mask, otherwise clamp; the N64 clamp to the tile
+// bounds has already happened in clamp_and_shift_coord.
+i16x4 texpack_texel(uint base, int w, ivec2 p)
+{
+	uint c = texpack.texels[base + uint(p.y * w + p.x)];
+	return i16x4((uvec4(c) >> uvec4(0, 8, 16, 24)) & 0xffu);
+}
+
+int texpack_wrap(int i, int n, bool repeat, bool mirror)
+{
+	if (!repeat)
+		return clamp(i, 0, n - 1);
+	if (mirror)
+	{
+		int m = i % (2 * n);
+		if (m < 0)
+			m += 2 * n;
+		return m < n ? m : 2 * n - 1 - m;
+	}
+	int m = i % n;
+	return m < 0 ? m + n : m;
+}
+
+i16x4 sample_replacement(TileInfo tile, uvec4 rep, ivec2 st, bool bilinear, bool convert, i16x4 conversion_factors)
+{
+	st.x = clamp_and_shift_coord((tile.flags & TILE_INFO_CLAMP_S_BIT) != 0, st.x, int(tile.slo), int(tile.shi), int(tile.shift_s));
+	st.y = clamp_and_shift_coord((tile.flags & TILE_INFO_CLAMP_T_BIT) != 0, st.y, int(tile.tlo), int(tile.thi), int(tile.shift_t));
+
+	ivec2 size = ivec2(rep.y & 0xffffu, rep.y >> 16u);
+	vec2 scale = vec2(size) / vec2(uvec2(rep.z & 0xffffu, rep.z >> 16u));
+	bvec2 repeat = bvec2(tile.mask_s != 0, tile.mask_t != 0);
+	bvec2 mirror = bvec2((tile.flags & TILE_INFO_MIRROR_S_BIT) != 0, (tile.flags & TILE_INFO_MIRROR_T_BIT) != 0);
+	vec2 u = vec2(st) * (1.0 / 32.0);
+
+	i16x4 accum;
+	if (bilinear)
+	{
+		// N64 texel centres sit on whole coordinates; the replacement's texel centres on half ones.
+		vec2 p = (u + 0.5) * scale - 0.5;
+		vec2 pf = floor(p);
+		vec2 f = p - pf;
+		ivec2 p0 = ivec2(pf);
+		int x0 = texpack_wrap(p0.x, size.x, repeat.x, mirror.x);
+		int x1 = texpack_wrap(p0.x + 1, size.x, repeat.x, mirror.x);
+		int y0 = texpack_wrap(p0.y, size.y, repeat.y, mirror.y);
+		int y1 = texpack_wrap(p0.y + 1, size.y, repeat.y, mirror.y);
+		vec4 t00 = vec4(texpack_texel(rep.x, size.x, ivec2(x0, y0)));
+		vec4 t10 = vec4(texpack_texel(rep.x, size.x, ivec2(x1, y0)));
+		vec4 t01 = vec4(texpack_texel(rep.x, size.x, ivec2(x0, y1)));
+		vec4 t11 = vec4(texpack_texel(rep.x, size.x, ivec2(x1, y1)));
+		accum = i16x4(round(mix(mix(t00, t10, f.x), mix(t01, t11, f.x), f.y)));
+	}
+	else
+	{
+		ivec2 p = ivec2(floor(u * scale));
+		p.x = texpack_wrap(p.x, size.x, repeat.x, mirror.x);
+		p.y = texpack_wrap(p.y, size.y, repeat.y, mirror.y);
+		accum = texpack_texel(rep.x, size.x, p);
+	}
+
+	// As sample_texture: a cycle that spends no math on bilerp gets the conversion instead.
+	if (convert)
+		accum = texture_convert_factors(accum, conversion_factors);
+	return accum;
+}
+#endif
+
 void compute_lod_2cycle(inout uint tile0, inout uint tile1, out i16 lod_frac, uint max_level, int min_lod,
                         ivec2 st, ivec2 st_dx, ivec2 st_dy,
                         bool perspective_overflow, bool tex_lod_en, bool sharpen_tex_en, bool detail_tex_en)

@@ -100,6 +100,13 @@ layout(set = 1, binding = 7, std430) readonly buffer TileInfoBuffer
 {
 	TileInfoMem elems[];
 } tile_infos;
+#ifdef TEXPACK
+// Joey64 texture packs: replacement texels, RGBA8 (R in the low byte).
+layout(set = 1, binding = 13, std430) readonly buffer TexPackTexels
+{
+	uint texels[];
+} texpack;
+#endif
 #include "load_tile_info.h"
 
 layout(set = 1, binding = 8, std430) readonly buffer SpanSetups

@@ -34,6 +34,7 @@
 #include "os_filesystem.hpp"
 #else
 #include "shaders/slangmosh.hpp"
+#include "shaders/slangmosh_texpack.hpp"
 #endif
 
 namespace RDP
@@ -46,6 +47,29 @@ Renderer::Renderer(CommandProcessor &processor_)
 
 Renderer::~Renderer()
 {
+}
+
+void Renderer::set_texpack(const TexpackShaderBank *bank, Vulkan::BufferHandle texels)
+{
+	texpack_bank = bank;
+	texpack_texels = std::move(texels);
+}
+
+void Renderer::set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig)
+{
+	// Packed into the upper 20 bits of the tile's slo/shi/tlo/thi; layout in shaders/load_tile_info.h.
+	auto &r = tile_replace[tile & 7];
+	if (!present)
+	{
+		memset(&r, 0, sizeof(r));
+		return;
+	}
+	const uint32_t w = (size & 0xffff) - 1, h = (size >> 16) - 1;
+	const uint32_t ow = (orig & 0xffff) - 1, oh = (orig >> 16) - 1;
+	r.bits[0] = (offset & 0xfffff) << 12;
+	r.bits[1] = (((offset >> 20) & 0xff) | ((w & 0xfff) << 8)) << 12;
+	r.bits[2] = ((h & 0xfff) | ((ow & 0xff) << 12)) << 12;
+	r.bits[3] = (((ow >> 8) & 3) | ((oh & 0x3ff) << 2) | (1u << 12)) << 12;
 }
 
 void Renderer::set_shader_bank(const ShaderBank *bank)
@@ -1508,7 +1532,20 @@ void Renderer::draw_shaded_primitive(TriangleSetup &setup, const AttributeSetup 
 	indices.depth_blend_index = stream.depth_blend_state_cache.add(stream.depth_blend_state);
 	indices.tile_instance_index = uint8_t(stream.tmem_upload_infos.size());
 	for (unsigned i = 0; i < 8; i++)
-		indices.tile_indices[i] = stream.tile_info_state_cache.add(tiles[i]);
+	{
+		if (tile_replace[i].bits[3])
+		{
+			// Joey64 texture packs: the replacement rides in the tile's unused coordinate bits.
+			TileInfo t = tiles[i];
+			t.size.slo |= tile_replace[i].bits[0];
+			t.size.shi |= tile_replace[i].bits[1];
+			t.size.tlo |= tile_replace[i].bits[2];
+			t.size.thi |= tile_replace[i].bits[3];
+			indices.tile_indices[i] = stream.tile_info_state_cache.add(t);
+		}
+		else
+			indices.tile_indices[i] = stream.tile_info_state_cache.add(tiles[i]);
+	}
 	stream.state_indices.add(indices);
 
 	fb.color_write_pending = true;
@@ -1775,8 +1812,10 @@ void Renderer::submit_rasterization(Vulkan::CommandBuffer &cmd, Vulkan::Buffer &
 		{ "SMALL_TYPES", caps.supports_small_integer_arithmetic ? 1 : 0 },
 	});
 #else
-	cmd.set_program(shader_bank->rasterizer);
+	cmd.set_program(texpack_bank ? texpack_bank->rasterizer : shader_bank->rasterizer);
 #endif
+	if (texpack_bank)
+		cmd.set_storage_buffer(0, 13, *texpack_texels);
 
 	cmd.set_specialization_constant(0, ImplementationConstants::TileWidth);
 	cmd.set_specialization_constant(1, ImplementationConstants::TileHeight);
@@ -2189,8 +2228,10 @@ void Renderer::submit_depth_blend(Vulkan::CommandBuffer &cmd, Vulkan::Buffer &tm
 				{ "SUBGROUP", caps.subgroup_depth_blend ? 1 : 0 },
 		});
 #else
-		cmd.set_program(shader_bank->ubershader);
+		cmd.set_program(texpack_bank ? texpack_bank->ubershader : shader_bank->ubershader);
 #endif
+		if (texpack_bank)
+			cmd.set_storage_buffer(1, 13, *texpack_texels);
 	}
 	else
 	{

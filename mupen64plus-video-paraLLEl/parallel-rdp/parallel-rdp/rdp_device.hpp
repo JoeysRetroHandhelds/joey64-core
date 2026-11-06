@@ -139,6 +139,14 @@ public:
 
 	void set_quirks(const Quirks &quirks);
 
+	// Joey64 texture packs. enable_texpack: call once before any command; makes a host-visible replacement texel
+	// buffer of up to max_bytes (capped at the device's storage buffer range) and switches every draw to the TEXPACK
+	// shaders. Returns the mapped buffer (texels are RGBA8, R in the low byte) and its size, or nullptr.
+	// The loader may write any part of it no queued draw uses. set_tile_replace: queues which replacement the next
+	// draws use for a tile (offset/size/orig in texels; present false clears it).
+	void *enable_texpack(size_t max_bytes, size_t &bytes);
+	void set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig);
+
 	// Interact with memory.
 	void *begin_read_rdram();
 	void end_write_rdram();
@@ -208,6 +216,7 @@ private:
 	CommandProcessorFlags flags;
 #ifndef PARALLEL_RDP_SHADER_DIR
 	std::unique_ptr<ShaderBank> shader_bank;
+	std::unique_ptr<TexpackShaderBank> texpack_bank;
 #endif
 
 	// Tear-down order is important here.

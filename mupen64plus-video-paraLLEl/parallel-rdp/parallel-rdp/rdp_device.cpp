@@ -34,6 +34,7 @@
 
 #ifndef PARALLEL_RDP_SHADER_DIR
 #include "shaders/slangmosh.hpp"
+#include "shaders/slangmosh_texpack.hpp"
 #endif
 
 using namespace Vulkan;
@@ -224,6 +225,51 @@ void CommandProcessor::init_renderer()
 	renderer.set_shader_bank(shader_bank.get());
 	vi.set_shader_bank(shader_bank.get());
 #endif
+}
+
+void *CommandProcessor::enable_texpack(size_t max_bytes, size_t &bytes)
+{
+	bytes = 0;
+#ifdef PARALLEL_RDP_SHADER_DIR
+	(void)max_bytes;
+	return nullptr;
+#else
+	if (!is_supported || texpack_bank)
+		return nullptr;
+	size_t size = std::min<size_t>(max_bytes, device.get_gpu_properties().limits.maxStorageBufferRange) & ~size_t(255);
+	if (size == 0)
+		return nullptr;
+
+	Vulkan::BufferCreateInfo info = {};
+	info.size = size;
+	info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+	info.domain = Vulkan::BufferDomain::LinkedDeviceHost;
+	auto texels = device.create_buffer(info);
+	if (!texels)
+		return nullptr;
+	device.set_name(*texels, "texpack-texels");
+	void *ptr = device.map_host_buffer(*texels, Vulkan::MEMORY_ACCESS_WRITE_BIT);
+	if (!ptr)
+		return nullptr;
+
+	Vulkan::ResourceLayout layout;
+	texpack_bank.reset(new TexpackShaderBank(device, layout, [&](const char *name, const char *define) -> int {
+		return renderer.resolve_shader_define(name, define);
+	}));
+	renderer.set_texpack(texpack_bank.get(), std::move(texels));
+	bytes = size;
+	LOGI("Texture packs: %u MB replacement buffer.\n", unsigned(size >> 20));
+	return ptr;
+#endif
+}
+
+void CommandProcessor::set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig)
+{
+	const uint32_t words[4] = {
+		(uint32_t(Op::MetaTileReplace) << 24u) | (tile & 7u) | (present ? 8u : 0u),
+		offset, size, orig,
+	};
+	enqueue_command_inner(4, words);
 }
 
 bool CommandProcessor::device_is_supported() const
@@ -952,6 +998,12 @@ void CommandProcessor::enqueue_command_direct(unsigned, const uint32_t *words)
 	case Op::MetaSetQuirks:
 	{
 		quirks.u.words[0] = words[1];
+		break;
+	}
+
+	case Op::MetaTileReplace:
+	{
+		renderer.set_tile_replace(words[0] & 7u, (words[0] & 8u) != 0, words[1], words[2], words[3]);
 		break;
 	}
 

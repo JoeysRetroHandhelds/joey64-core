@@ -224,6 +224,12 @@ bool shade_pixel(int x, int y, uint primitive_index, out ShadedData shaded)
 			tile_info0.size = u8(TEX_SIZE);
 		}
 #endif
+#ifdef TEXPACK
+		uvec4 rep0 = load_tile_replace(tile_info_index0);
+		if (rep0.w != 0u && int(tile_info0.fmt) != TEXTURE_FORMAT_YUV)
+			texel0 = sample_replacement(tile_info0, rep0, st, bilerp0 && (sample_quad || tlut), !bilerp0, derived.factors);
+		else
+#endif
 		texel0 = sample_texture(tile_info0, tmem_instance_index, st, tlut, tlut_type,
 		                        sample_quad, mid_texel, false, bilerp0, derived.factors, i16x4(0));
 	}
@@ -269,6 +275,12 @@ bool shade_pixel(int x, int y, uint primitive_index, out ShadedData shaded)
 				tile_info1.fmt = u8(TEX_FMT);
 				tile_info1.size = u8(TEX_SIZE);
 			}
+#endif
+#ifdef TEXPACK
+			uvec4 rep1 = load_tile_replace(tile_info_index1);
+			if (rep1.w != 0u && !convert_one && int(tile_info1.fmt) != TEXTURE_FORMAT_YUV)
+				texel1 = sample_replacement(tile_info1, rep1, st, bilerp1 && (sample_quad || tlut), !bilerp1, derived.factors);
+			else
 #endif
 			texel1 = sample_texture(tile_info1, tmem_instance_index, st, tlut, tlut_type, sample_quad, mid_texel,
 			                        convert_one, bilerp1, derived.factors, texel0);

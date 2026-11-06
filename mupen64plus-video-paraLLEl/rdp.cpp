@@ -1,6 +1,10 @@
 #include "rdp.hpp"
 #include <chrono>
 #include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include "joey/texpack_ghq.h"
 #include "timeline_trace_file.hpp"
 #include "Gfx #1.3.h"
 #include "parallel.h"
@@ -724,6 +728,201 @@ static bool same_as_last()
 // Rice CRC (TxUtil::checksum64, copied). Nothing is rendered differently. Every 60 frames the key counts go to the
 // file; the pack lookup happens on the PC (tools/htsindex.py), so the pack never has to be on the device.
 // GLideN64 code: GPLv2-or-later (Joey64 is GPL-3.0-or-later).
+// Texture packs (env N64_RDP_TEXPACK=<folder>; master list item 35, step B). The folder holds a GLideN64 pack for this
+// ROM (<ROM name>_HIRESTEXTURES.hts, or a PNG pack folder named after the ROM); GLideNHQ reads it (joey/texpack_ghq).
+// TexKeys computes GLideN64's key at each textured draw; the first time a key is seen, a worker thread looks it up,
+// decodes it to RGBA8 and writes it into the renderer's replacement buffer (N64_RDP_TEXPACK_MB, default 256, capped at
+// the GPU's storage buffer range). Until it is there the draw keeps the N64 texture (as Dolphin, PCSX2, PPSSPP and Azahar
+// do with async loading), so loading never stalls a frame. Draws whose texture has a replacement get it through
+// CommandProcessor::set_tile_replace, queued just before the draw; the TEXPACK shaders sample it in place of TMEM.
+// Off: nothing runs and the stock shaders are used.
+namespace TexPack
+{
+static bool enabled;
+static uint32_t *texels;
+static size_t capacity; // texels
+static size_t used;     // worker only
+static std::string dir, rom;
+
+struct Entry
+{
+	std::atomic<int> state{0}; // 0 pending, 1 ready, 2 none
+	uint32_t offset = 0, size = 0;
+};
+struct Key
+{
+	uint64_t crc;
+	uint16_t fmt, siz;
+	bool operator==(const Key &o) const { return crc == o.crc && fmt == o.fmt && siz == o.siz; }
+};
+struct KeyHash
+{
+	size_t operator()(const Key &k) const { return size_t(k.crc * 0x9E3779B97F4A7C15ull) ^ (size_t(k.fmt) << 3) ^ k.siz; }
+};
+static std::unordered_map<Key, Entry, KeyHash> entries; // render thread only (pointers stay valid)
+
+static std::thread worker;
+static std::mutex lock;
+static std::condition_variable wake;
+static std::vector<std::pair<Key, Entry *>> queue;
+static bool stopping;
+static std::atomic<unsigned> loaded_count, loaded_kb, failed_count;
+static bool full_logged;
+
+// what the renderer was last told per tile (present, offset, size, orig)
+static uint32_t sent[8][4];
+static unsigned frames, hits, pending_draws;
+
+static void run()
+{
+	if (!texpack_ghq_init(dir.c_str(), rom.c_str()))
+		log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture packs: no pack for '%s' in %s.\n", rom.c_str(), dir.c_str());
+	else
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture packs: '%s' from %s.\n", rom.c_str(), dir.c_str());
+	std::vector<uint32_t> img;
+	for (;;)
+	{
+		std::pair<Key, Entry *> job;
+		{
+			std::unique_lock<std::mutex> l(lock);
+			wake.wait(l, [] { return stopping || !queue.empty(); });
+			if (stopping)
+				return;
+			job = queue.back(); // newest first: what is on screen now
+			queue.pop_back();
+		}
+		unsigned w = 0, h = 0;
+		int state = 2;
+		if (texpack_ghq_lookup(job.first.crc, job.first.fmt, job.first.siz, nullptr, img, w, h))
+		{
+			const size_t n = size_t(w) * h;
+			if (w > 4096 || h > 4096)
+				failed_count++;
+			else if (used + n > capacity || used + n >= (size_t(1) << 28))
+			{
+				if (!full_logged)
+					log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture packs: replacement buffer full (%u MB); "
+					       "set N64_RDP_TEXPACK_MB higher.\n", unsigned((capacity * 4) >> 20));
+				full_logged = true;
+				failed_count++;
+			}
+			else
+			{
+				memcpy(texels + used, img.data(), n * 4);
+				job.second->offset = uint32_t(used);
+				job.second->size = w | (h << 16);
+				used += n;
+				state = 1;
+				loaded_count++;
+				loaded_kb += unsigned(n * 4 / 1024);
+			}
+		}
+		// The texels are in the (coherent) buffer before a draw can see state 1, and that draw is submitted after.
+		job.second->state.store(state, std::memory_order_release);
+	}
+}
+
+static void stop()
+{
+	if (worker.joinable())
+	{
+		{
+			std::lock_guard<std::mutex> l(lock);
+			stopping = true;
+		}
+		wake.notify_all();
+		worker.join();
+	}
+	stopping = false;
+	queue.clear();
+	entries.clear(); // offsets are into the renderer's buffer, which goes with it
+	enabled = false;
+	texels = nullptr;
+}
+
+static void init(const char *romname)
+{
+	stop();
+	const char *d = getenv("N64_RDP_TEXPACK");
+	if (!d || !*d || !frontend)
+		return;
+	size_t mb = 256;
+	if (const char *e = getenv("N64_RDP_TEXPACK_MB"))
+		mb = strtoul(e, nullptr, 0);
+	size_t bytes = 0;
+	texels = static_cast<uint32_t *>(frontend->enable_texpack(mb << 20, bytes));
+	if (!texels)
+	{
+		log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture packs: could not make the replacement buffer.\n");
+		return;
+	}
+	capacity = bytes / 4;
+	used = 0;
+	full_logged = false;
+	memset(sent, 0, sizeof(sent));
+	dir = d;
+	rom = romname;
+	worker = std::thread(run);
+	enabled = true;
+}
+
+// The entry for a key; the first time, queued for the worker.
+static Entry *find(uint64_t crc, uint16_t fmt, uint16_t siz)
+{
+	Key k = { crc, fmt, siz };
+	auto it = entries.find(k);
+	if (it != entries.end())
+		return &it->second;
+	Entry *e = &entries[k];
+	{
+		std::lock_guard<std::mutex> l(lock);
+		queue.emplace_back(k, e);
+	}
+	wake.notify_one();
+	return e;
+}
+
+// Before a textured draw: the draw's tiles get their replacement (when loaded), every other tile none.
+static void apply(const uint32_t *tiles, unsigned count, Entry *const *e, const uint16_t (*orig)[2])
+{
+	uint32_t want[8][4] = {};
+	for (unsigned t = 0; t < count; t++)
+	{
+		if (!e[t])
+			continue;
+		const int s = e[t]->state.load(std::memory_order_acquire);
+		if (s == 0)
+			pending_draws++;
+		if (s != 1 || orig[t][0] == 0 || orig[t][1] == 0 || orig[t][0] > 1024 || orig[t][1] > 1024)
+			continue;
+		if (t == 0)
+			hits++;
+		uint32_t *w = want[tiles[t] & 7];
+		w[0] = 1;
+		w[1] = e[t]->offset;
+		w[2] = e[t]->size;
+		w[3] = orig[t][0] | (uint32_t(orig[t][1]) << 16);
+	}
+	for (unsigned i = 0; i < 8; i++)
+	{
+		if (memcmp(want[i], sent[i], sizeof(want[i])) == 0)
+			continue;
+		frontend->set_tile_replace(i, want[i][0] != 0, want[i][1], want[i][2], want[i][3]);
+		memcpy(sent[i], want[i], sizeof(want[i]));
+	}
+}
+
+static void on_frame(unsigned textured)
+{
+	if (++frames < 600)
+		return;
+	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture packs: %u loaded (%u MB of %u), %u failed; last 600 frames: %u of %u "
+	       "textured draws replaced, %u waiting.\n", loaded_count.load(), loaded_kb.load() >> 10,
+	       unsigned((capacity * 4) >> 20), failed_count.load(), hits, textured, pending_draws);
+	frames = hits = pending_draws = 0;
+}
+}
+
 namespace TexKeys
 {
 static bool enabled;
@@ -793,6 +992,7 @@ static bool dirty = true;
 static bool have[2];
 static Rec cached[2];
 static uint32_t cached_tile[2];
+static TexPack::Entry *cached_entry[2]; // texture packs: the pack entry for cached[t]
 
 // ---- GLideNHQ TxUtil.cpp (C paths) ----
 static uint32_t RiceCRC32(const uint8_t *src, int width, int height, int size, int rowStride)
@@ -1082,17 +1282,25 @@ static void draw(uint32_t tile, uint8_t kind, const uint32_t *rect_words)
 				use = ti[1];
 			have[t] = hiresKey(t, use, rect_words, cached[t]);
 			cached_tile[t] = ti[t];
+			cached_entry[t] = (have[t] && TexPack::enabled && !cached[t].fb) ?
+			                  TexPack::find(cached[t].crc, cached[t].fmt, cached[t].siz) : nullptr;
 		}
-		if (have[t])
+		if (have[t] && out)
 		{
 			Rec r = cached[t];
 			r.kind = uint8_t(kind | (t ? 8 : 0));
 			count(r);
 		}
-		else if (t == 0)
+		else if (t == 0 && !have[t])
 			draws_nokey++;
 	}
 	dirty = false;
+	if (TexPack::enabled)
+	{
+		TexPack::Entry *e[2] = { have[0] ? cached_entry[0] : nullptr, (two && have[1]) ? cached_entry[1] : nullptr };
+		const uint16_t orig[2][2] = { { cached[0].w, cached[0].h }, { cached[1].w, cached[1].h } };
+		TexPack::apply(ti, two ? 2u : 1u, e, orig);
+	}
 }
 
 static void add_drawn()
@@ -1290,7 +1498,15 @@ static void on_frame()
 	frame_total++;
 	drawn_prev.swap(drawn_now);
 	drawn_now.clear();
-	if (frames < 60 || !out)
+	if (TexPack::enabled)
+		TexPack::on_frame(draws_tex);
+	if (!out)
+	{
+		if (frames >= 600)
+			frames = draws_tex = draws_nokey = lookups = 0;
+		return;
+	}
+	if (frames < 60)
 		return;
 	// window line, then one line per key record: K crc fmt siz w h kind fb count
 	// kind bits: 1 triangle, 2 texrect, 4 copy mode, 8 second texture (TEXEL1)
@@ -1307,15 +1523,15 @@ static void on_frame()
 static void init(const uint8_t *rdram, uint32_t size)
 {
 	enabled = false;
+	dirty = true;
+	have[0] = have[1] = false;
+	cached_entry[0] = cached_entry[1] = nullptr;
 	const char *path = getenv("N64_RDP_TEXKEYS");
-	if (!path || !*path)
-		return;
-	if (!out)
-		out = fopen(path, "w");
-	if (!out)
+	if (path && *path && !out)
 	{
-		log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture keys: can't open %s.\n", path);
-		return;
+		out = fopen(path, "w");
+		if (!out)
+			log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture keys: can't open %s.\n", path);
 	}
 	mem = g_rdram_alias ? static_cast<const uint8_t *>(g_rdram_alias) : rdram;
 	memSize = size;
@@ -1328,9 +1544,18 @@ static void init(const uint8_t *rdram, uint32_t size)
 		b[i] = char(hdr[(0x20 + i) ^ 3]);
 	}
 	hackMK64 = strstr(a, "MARIOKART64") || strstr(b, "MARIOKART64");
-	fprintf(out, "# texkeys v1 rom '%s' mk64hack %d\n", b, hackMK64 ? 1 : 0);
-	enabled = true;
-	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture pack keys logged to %s.\n", path);
+	// GLideN64's RSP.romname: the header name (b, byte order as RSP.cpp reads it) without trailing spaces
+	char romname[21];
+	memcpy(romname, b, sizeof(romname));
+	for (int i = int(strlen(romname)) - 1; i >= 0 && romname[i] == ' '; i--)
+		romname[i] = 0;
+	TexPack::init(romname);
+	if (out)
+	{
+		fprintf(out, "# texkeys v1 rom '%s' mk64hack %d\n", b, hackMK64 ? 1 : 0);
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture pack keys logged to %s.\n", path);
+	}
+	enabled = out != nullptr || TexPack::enabled;
 }
 }
 
@@ -1394,14 +1619,15 @@ void process_commands()
 			return;
 		}
 
+		// before the command is queued: texture packs queue the draw's replacements ahead of it
+		if (TexKeys::enabled)
+			TexKeys::track(RDP::Op(command), &cmd_data[2 * cmd_cur]);
 		if (command >= 8 && frontend)
 			frontend->enqueue_command(cmd_length * 2, &cmd_data[2 * cmd_cur]);
 		if (Smart::enabled && synchronous)
 			Smart::track(RDP::Op(command), w1, cmd_data[2 * cmd_cur + 1]);
 		if (Dup::enabled)
 			Dup::track(RDP::Op(command), w1, cmd_data[2 * cmd_cur + 1]);
-		if (TexKeys::enabled)
-			TexKeys::track(RDP::Op(command), &cmd_data[2 * cmd_cur]);
 
 		if (RDP::Op(command) == RDP::Op::SyncFull)
 		{
@@ -1578,6 +1804,7 @@ static bool create_frontend()
 	if (!frontend->device_is_supported())
 	{
 		log_cb(RETRO_LOG_ERROR, "This device probably does not support 8/16-bit storage. Make sure you're using up-to-date drivers!\n");
+		TexPack::stop();
 		frontend.reset();
 		return false;
 	}
@@ -1599,6 +1826,7 @@ static void apply_upscaling_change()
 	frontend->wait_for_timeline(frontend->signal_timeline());
 	Smart::reset_after_drain();
 	unsigned from = active_upscaling;
+	TexPack::stop();
 	frontend.reset();
 	if (!create_frontend())
 	{
@@ -1618,6 +1846,8 @@ void deinit()
 	end_ts.reset();
 	retro_image_handles.clear();
 	retro_images.clear();
+	TexPack::stop();
+	texpack_ghq_shutdown(); // the worker is gone; the next ROM opens its own pack
 	frontend.reset();
 	device.reset();
 	context.reset();
