@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string>
 #include <unordered_map>
+#include <map>
 #include <string.h>
 #include <signal.h>
 #include <dlfcn.h>
@@ -736,25 +737,36 @@ static bool same_as_last()
 // the GPU's storage buffer range). Until it is there the draw keeps the N64 texture (as Dolphin, PCSX2, PPSSPP and Azahar
 // do with async loading), so loading never stalls a frame. Draws whose texture has a replacement get it through
 // CommandProcessor::set_tile_replace, queued just before the draw; the TEXPACK shaders sample it in place of TMEM.
+// The buffer is a ring: when it is full, the worker evicts the replacements in its way that no draw has used for a
+// while (first 10 s, then down to 8 frames, past what the GPU can still have in flight) and skips the ones in use; an
+// evicted replacement loads again the next time a draw wants it. Without this a whole pack (Mario Kart 64 Reloaded:
+// 217 MB in 40 s) fills the buffer and new textures stop being replaced; 256 MB is also the Mali-G52's limit.
 // Off: nothing runs and the stock shaders are used.
 namespace TexPack
 {
 static bool enabled;
 static uint32_t *texels;
 static size_t capacity; // texels
-static size_t used;     // worker only
 static std::string dir, rom;
 
-struct Entry
-{
-	std::atomic<int> state{0}; // 0 pending, 1 ready, 2 none
-	uint32_t offset = 0, size = 0;
-};
 struct Key
 {
 	uint64_t crc;
 	uint16_t fmt, siz;
 	bool operator==(const Key &o) const { return crc == o.crc && fmt == o.fmt && siz == o.siz; }
+};
+// state: 0 queued, 1 ready, 2 none (not in the pack, or too big), 3 being evicted (worker), 4 evicted or found no room
+// (a draw from frame retry_at on queues it again). last_used: the frame of the last draw that wanted it. Eviction and
+// use meet as in Dekker's algorithm (both sequentially consistent): a draw stores last_used, then reads state; the
+// worker moves state 1 -> 3, then reads last_used and backs out if it is recent. So either the draw sees 3 and keeps
+// the N64 texture, or the worker sees the draw and leaves the replacement alone.
+struct Entry
+{
+	std::atomic<int> state{0};
+	std::atomic<uint32_t> last_used{0};
+	std::atomic<uint32_t> retry_at{0};
+	uint32_t offset = 0, size = 0;
+	Key key{};
 };
 struct KeyHash
 {
@@ -767,8 +779,78 @@ static std::mutex lock;
 static std::condition_variable wake;
 static std::vector<std::pair<Key, Entry *>> queue;
 static bool stopping;
-static std::atomic<unsigned> loaded_count, loaded_kb, failed_count;
+static std::atomic<unsigned> loaded_count, loaded_kb, failed_count, evicted_count;
 static bool full_logged;
+static std::atomic<uint32_t> frame_no{1}; // render thread counts frames, the worker reads them
+static std::map<uint32_t, Entry *> resident; // worker only: ready replacements by offset
+static size_t cursor;                         // worker only: where the ring places the next replacement
+
+static size_t texels_of(const Entry *e) { return size_t(e->size & 0xffffu) * (e->size >> 16); }
+
+// Worker: take e out of the buffer unless a draw used it in the last `hot` frames.
+static bool try_evict(Entry *e, uint32_t hot)
+{
+	int one = 1;
+	if (!e->state.compare_exchange_strong(one, 3))
+		return false;
+	if (frame_no.load() - e->last_used.load() < hot)
+	{
+		e->state.store(1);
+		return false;
+	}
+	loaded_kb -= unsigned(texels_of(e) * 4 / 1024);
+	evicted_count++;
+	e->state.store(4);
+	return true;
+}
+
+// Worker: room for n texels at the ring cursor, evicting what is in the way. Returns the offset or SIZE_MAX.
+static size_t place(size_t n)
+{
+	if (n > capacity)
+		return SIZE_MAX;
+	for (uint32_t hot : { 600u, 120u, 8u })
+	{
+		size_t travelled = 0;
+		while (travelled <= capacity + n)
+		{
+			if (cursor + n > capacity)
+			{
+				travelled += capacity - cursor;
+				cursor = 0;
+			}
+			const size_t end = cursor + n;
+			// replacements overlapping [cursor, end): the one starting before cursor, then those starting inside
+			auto it = resident.upper_bound(uint32_t(cursor));
+			if (it != resident.begin())
+			{
+				auto prev = std::prev(it);
+				if (prev->first + texels_of(prev->second) > cursor)
+					it = prev;
+			}
+			bool blocked = false;
+			while (it != resident.end() && it->first < end)
+			{
+				Entry *e = it->second;
+				if (!try_evict(e, hot))
+				{
+					const size_t past = it->first + texels_of(e);
+					travelled += past - cursor;
+					cursor = past;
+					blocked = true;
+					break;
+				}
+				it = resident.erase(it);
+			}
+			if (blocked)
+				continue;
+			const size_t at = cursor;
+			cursor = end;
+			return at;
+		}
+	}
+	return SIZE_MAX;
+}
 
 // what the renderer was last told per tile (present, offset, size, orig)
 static uint32_t sent[8][4];
@@ -797,22 +879,28 @@ static void run()
 		if (texpack_ghq_lookup(job.first.crc, job.first.fmt, job.first.siz, nullptr, img, w, h))
 		{
 			const size_t n = size_t(w) * h;
-			if (w > 4096 || h > 4096)
-				failed_count++;
-			else if (used + n > capacity || used + n >= (size_t(1) << 28))
+			const size_t at = (w > 4096 || h > 4096) ? SIZE_MAX : place(n);
+			if (at == SIZE_MAX)
 			{
-				if (!full_logged)
-					log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture packs: replacement buffer full (%u MB); "
-					       "set N64_RDP_TEXPACK_MB higher.\n", unsigned((capacity * 4) >> 20));
-				full_logged = true;
+				if (w <= 4096 && h <= 4096 && !full_logged)
+					log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture packs: no room in the replacement buffer (%u MB) "
+					       "for a %ux%u replacement: what is in use fills it; set N64_RDP_TEXPACK_MB higher.\n",
+					       unsigned((capacity * 4) >> 20), w, h);
+				if (w <= 4096 && h <= 4096)
+				{
+					// everything in the buffer is in use: try again in 2 s, when the scene may have moved on
+					full_logged = true;
+					job.second->retry_at.store(frame_no.load() + 120);
+					state = 4;
+				}
 				failed_count++;
 			}
 			else
 			{
-				memcpy(texels + used, img.data(), n * 4);
-				job.second->offset = uint32_t(used);
+				memcpy(texels + at, img.data(), n * 4);
+				job.second->offset = uint32_t(at);
 				job.second->size = w | (h << 16);
-				used += n;
+				resident[uint32_t(at)] = job.second;
 				state = 1;
 				loaded_count++;
 				loaded_kb += unsigned(n * 4 / 1024);
@@ -836,6 +924,8 @@ static void stop()
 	}
 	stopping = false;
 	queue.clear();
+	resident.clear();
+	cursor = 0;
 	entries.clear(); // offsets are into the renderer's buffer, which goes with it
 	enabled = false;
 	texels = nullptr;
@@ -877,8 +967,13 @@ static void init(const char *romname)
 		log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture packs: could not make the replacement buffer.\n");
 		return;
 	}
-	capacity = bytes / 4;
-	used = 0;
+	capacity = std::min(bytes / 4, size_t(1) << 28); // texel offsets are 28 bits in the tile
+	resident.clear();
+	cursor = 0;
+	loaded_count = 0;
+	loaded_kb = 0;
+	failed_count = 0;
+	evicted_count = 0;
 	full_logged = false;
 	memset(sent, 0, sizeof(sent));
 	dir = d;
@@ -895,6 +990,8 @@ static Entry *find(uint64_t crc, uint16_t fmt, uint16_t siz)
 	if (it != entries.end())
 		return &it->second;
 	Entry *e = &entries[k];
+	e->key = k;
+	e->last_used.store(frame_no.load(std::memory_order_relaxed), std::memory_order_relaxed);
 	{
 		std::lock_guard<std::mutex> l(lock);
 		queue.emplace_back(k, e);
@@ -911,7 +1008,19 @@ static void apply(const uint32_t *tiles, unsigned count, Entry *const *e, const 
 	{
 		if (!e[t])
 			continue;
-		const int s = e[t]->state.load(std::memory_order_acquire);
+		e[t]->last_used.store(frame_no.load(std::memory_order_relaxed)); // before reading state: see Entry
+		int s = e[t]->state.load();
+		if (s == 4 && int32_t(frame_no.load(std::memory_order_relaxed) - e[t]->retry_at.load(std::memory_order_relaxed)) >= 0 &&
+		    e[t]->state.compare_exchange_strong(s, 0))
+		{
+			// evicted earlier: load it again
+			{
+				std::lock_guard<std::mutex> l(lock);
+				queue.emplace_back(e[t]->key, e[t]);
+			}
+			wake.notify_one();
+			s = 0;
+		}
 		if (s == 0)
 			pending_draws++;
 		if (s != 1 || orig[t][0] == 0 || orig[t][1] == 0 || orig[t][0] > 1024 || orig[t][1] > 1024)
@@ -935,11 +1044,12 @@ static void apply(const uint32_t *tiles, unsigned count, Entry *const *e, const 
 
 static void on_frame(unsigned textured)
 {
+	frame_no.fetch_add(1, std::memory_order_relaxed);
 	if (++frames < 600)
 		return;
-	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture packs: %u loaded (%u MB of %u), %u failed; last 600 frames: %u of %u "
-	       "textured draws replaced, %u waiting.\n", loaded_count.load(), loaded_kb.load() >> 10,
-	       unsigned((capacity * 4) >> 20), failed_count.load(), hits, textured, pending_draws);
+	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture packs: %u loaded (%u MB of %u in use), %u failed, %u evicted; last "
+	       "600 frames: %u of %u textured draws replaced, %u waiting.\n", loaded_count.load(), loaded_kb.load() >> 10,
+	       unsigned((capacity * 4) >> 20), failed_count.load(), evicted_count.load(), hits, textured, pending_draws);
 	frames = hits = pending_draws = 0;
 }
 }
