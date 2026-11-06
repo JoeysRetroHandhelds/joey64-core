@@ -144,7 +144,17 @@ public:
 	// shaders. Returns the mapped buffer (texels are RGBA8, R in the low byte) and its size, or nullptr.
 	// The loader may write any part of it no queued draw uses. set_tile_replace: queues which replacement the next
 	// draws use for a tile (offset/size/orig in texels; present false clears it).
-	void *enable_texpack(size_t max_bytes, size_t &bytes);
+	// image: where the driver allows it, the replacements go into a linear-tiled host-visible RGBA8 image instead
+	// (sampled with hardware bilinear; N64_RDP_TEXPACK_IMAGE=0 keeps the buffer): then image->width/height/row_pitch
+	// describe it, the returned pointer is its first texel, and the loader calls texpack_flush after each write.
+	struct TexpackImage
+	{
+		unsigned width = 0, height = 0;
+		size_t row_pitch = 0; // bytes
+	};
+	void *enable_texpack(size_t max_bytes, size_t &bytes, TexpackImage *image = nullptr);
+	// Any thread: make bytes [offset, offset + size) of the image (from the returned pointer) visible to the GPU.
+	void texpack_flush(size_t offset, size_t size);
 	void set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig);
 
 	// Interact with memory.
@@ -217,6 +227,7 @@ private:
 #ifndef PARALLEL_RDP_SHADER_DIR
 	std::unique_ptr<ShaderBank> shader_bank;
 	std::unique_ptr<TexpackShaderBank> texpack_bank;
+	Vulkan::LinearHostImageHandle texpack_image;
 #endif
 
 	// Tear-down order is important here.

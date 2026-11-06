@@ -739,7 +739,9 @@ static bool same_as_last()
 // CommandProcessor::set_tile_replace, queued just before the draw; the TEXPACK shaders sample it in place of TMEM.
 // The buffer is a ring: when it is full, the worker evicts the replacements in its way that no draw has used for a
 // while (first 10 s, then down to 8 frames, past what the GPU can still have in flight) and skips the ones in use; an
-// evicted replacement loads again the next time a draw wants it. Without this a whole pack (Mario Kart 64 Reloaded:
+// evicted replacement loads again the next time a draw wants it. Where the driver allows it the replacements go into a
+// 2D image instead (CommandProcessor::enable_texpack), sampled with one hardware bilinear read: placed on shelves (rows
+// of one height class, 2^k + 2 for the 1-texel wrap gutter around each), each shelf its own eviction ring. Without this a whole pack (Mario Kart 64 Reloaded:
 // 217 MB in 40 s) fills the buffer and new textures stop being replaced; 256 MB is also the Mali-G52's limit.
 // Off: nothing runs and the stock shaders are used.
 namespace TexPack
@@ -747,6 +749,7 @@ namespace TexPack
 static bool enabled;
 static uint32_t *texels;
 static size_t capacity; // texels
+static RDP::CommandProcessor::TexpackImage image; // width 0: the buffer path
 static std::string dir, rom;
 
 struct Key
@@ -765,7 +768,8 @@ struct Entry
 	std::atomic<int> state{0};
 	std::atomic<uint32_t> last_used{0};
 	std::atomic<uint32_t> retry_at{0};
-	uint32_t offset = 0, size = 0;
+	uint32_t offset = 0, size = 0; // offset: texels into the buffer, or x | y << 14 of the first texel in the image
+	uint32_t span = 0;             // worker only: length in its ring (texels, or the image slot's width)
 	Key key{};
 };
 struct KeyHash
@@ -782,14 +786,29 @@ static bool stopping;
 static std::atomic<unsigned> loaded_count, loaded_kb, failed_count, evicted_count;
 static bool full_logged;
 static std::atomic<uint32_t> frame_no{1}; // render thread counts frames, the worker reads them
-static std::map<uint32_t, Entry *> resident; // worker only: ready replacements by offset
-static size_t cursor;                         // worker only: where the ring places the next replacement
+// Worker only. A ring of positions [0, len): the buffer, or one image shelf (x positions).
+struct Ring
+{
+	size_t len = 0, cursor = 0;
+	std::map<uint32_t, Entry *> resident; // ready replacements by position
+};
+struct Shelf
+{
+	uint32_t y, height;
+	Ring ring;
+};
+static Ring buffer_ring;
+static std::vector<Shelf> shelves; // image path
+static uint32_t shelves_end;       // image rows below this belong to a shelf
+static const uint32_t NEVER = UINT32_MAX;
 
 static size_t texels_of(const Entry *e) { return size_t(e->size & 0xffffu) * (e->size >> 16); }
 
-// Worker: take e out of the buffer unless a draw used it in the last `hot` frames.
+// Worker: take e out of the buffer unless a draw used it in the last `hot` frames (NEVER: leave everything).
 static bool try_evict(Entry *e, uint32_t hot)
 {
+	if (frame_no.load() - e->last_used.load() < hot)
+		return false; // recent: not even the brief state 3, which would make a draw skip it
 	int one = 1;
 	if (!e->state.compare_exchange_strong(one, 3))
 		return false;
@@ -804,52 +823,119 @@ static bool try_evict(Entry *e, uint32_t hot)
 	return true;
 }
 
-// Worker: room for n texels at the ring cursor, evicting what is in the way. Returns the offset or SIZE_MAX.
-static size_t place(size_t n)
+// Worker: room for n in ring r from its cursor on, evicting what is in the way and was not used in the last `hot`
+// frames. Returns the position or SIZE_MAX after a full lap.
+static size_t ring_place(Ring &r, size_t n, uint32_t hot)
 {
-	if (n > capacity)
+	if (n > r.len)
 		return SIZE_MAX;
-	for (uint32_t hot : { 600u, 120u, 8u })
+	size_t travelled = 0;
+	while (travelled <= r.len + n)
 	{
-		size_t travelled = 0;
-		while (travelled <= capacity + n)
+		if (r.cursor + n > r.len)
 		{
-			if (cursor + n > capacity)
-			{
-				travelled += capacity - cursor;
-				cursor = 0;
-			}
-			const size_t end = cursor + n;
-			// replacements overlapping [cursor, end): the one starting before cursor, then those starting inside
-			auto it = resident.upper_bound(uint32_t(cursor));
-			if (it != resident.begin())
-			{
-				auto prev = std::prev(it);
-				if (prev->first + texels_of(prev->second) > cursor)
-					it = prev;
-			}
-			bool blocked = false;
-			while (it != resident.end() && it->first < end)
-			{
-				Entry *e = it->second;
-				if (!try_evict(e, hot))
-				{
-					const size_t past = it->first + texels_of(e);
-					travelled += past - cursor;
-					cursor = past;
-					blocked = true;
-					break;
-				}
-				it = resident.erase(it);
-			}
-			if (blocked)
-				continue;
-			const size_t at = cursor;
-			cursor = end;
-			return at;
+			travelled += r.len - r.cursor;
+			r.cursor = 0;
 		}
+		const size_t end = r.cursor + n;
+		// replacements overlapping [cursor, end): the one starting before cursor, then those starting inside
+		auto it = r.resident.upper_bound(uint32_t(r.cursor));
+		if (it != r.resident.begin())
+		{
+			auto prev = std::prev(it);
+			if (prev->first + prev->second->span > r.cursor)
+				it = prev;
+		}
+		bool blocked = false;
+		while (it != r.resident.end() && it->first < end)
+		{
+			Entry *e = it->second;
+			if (!try_evict(e, hot))
+			{
+				const size_t past = it->first + e->span;
+				travelled += past - r.cursor;
+				r.cursor = past;
+				blocked = true;
+				break;
+			}
+			it = r.resident.erase(it);
+		}
+		if (blocked)
+			continue;
+		const size_t at = r.cursor;
+		r.cursor = end;
+		return at;
 	}
 	return SIZE_MAX;
+}
+
+// Worker, buffer path: n texels. Returns the offset or SIZE_MAX.
+static size_t place(size_t n)
+{
+	for (uint32_t hot : { 600u, 120u, 8u })
+	{
+		const size_t at = ring_place(buffer_ring, n, hot);
+		if (at != SIZE_MAX)
+			return at;
+	}
+	return SIZE_MAX;
+}
+
+// Worker, image path: a slot of sw x sh texels (replacement plus gutter). Free room on a shelf of its height class
+// first, then a new shelf, then eviction on shelves of its class and then taller ones. Returns the shelf or -1.
+static int place2d(uint32_t sw, uint32_t sh, uint32_t &x)
+{
+	uint32_t cls = 18;
+	while (cls < sh)
+		cls = (cls - 2) * 2 + 2;
+	if (cls > image.height || sw > image.width)
+		return -1;
+	for (size_t i = 0; i < shelves.size(); i++)
+		if (shelves[i].height == cls)
+		{
+			const size_t at = ring_place(shelves[i].ring, sw, NEVER);
+			if (at != SIZE_MAX)
+				return x = uint32_t(at), int(i);
+		}
+	if (shelves_end + cls <= image.height)
+	{
+		Shelf sh_new;
+		sh_new.y = shelves_end;
+		sh_new.height = cls;
+		sh_new.ring.len = image.width;
+		shelves.push_back(std::move(sh_new));
+		shelves_end += cls;
+		const size_t at = ring_place(shelves.back().ring, sw, NEVER);
+		if (at != SIZE_MAX)
+			return x = uint32_t(at), int(shelves.size() - 1);
+	}
+	for (uint32_t hot : { 600u, 120u, 8u })
+		for (uint32_t c = cls; c <= 4098; c = (c - 2) * 2 + 2)
+			for (size_t i = 0; i < shelves.size(); i++)
+				if (shelves[i].height == c)
+				{
+					const size_t at = ring_place(shelves[i].ring, sw, hot);
+					if (at != SIZE_MAX)
+						return x = uint32_t(at), int(i);
+				}
+	return -1;
+}
+
+// Worker, image path: writes the w x h replacement with its first texel at (ox, oy) and the 1-texel gutter around it
+// (the texels a repeating texture has there), then flushes those rows.
+static void write2d(const uint32_t *src, uint32_t w, uint32_t h, uint32_t ox, uint32_t oy)
+{
+	uint8_t *base = reinterpret_cast<uint8_t *>(texels);
+	for (int y = -1; y <= int(h); y++)
+	{
+		const uint32_t *srow = src + size_t((y + int(h)) % int(h)) * w;
+		uint32_t *row = reinterpret_cast<uint32_t *>(base + size_t(int(oy) + y) * image.row_pitch) + ox;
+		row[-1] = srow[w - 1];
+		memcpy(row, srow, size_t(w) * 4);
+		row[w] = srow[0];
+	}
+	const size_t first = size_t(oy - 1) * image.row_pitch;
+	frontend->texpack_flush(first, size_t(h + 2) * image.row_pitch);
 }
 
 // what the renderer was last told per tile (present, offset, size, orig)
@@ -879,7 +965,33 @@ static void run()
 		if (texpack_ghq_lookup(job.first.crc, job.first.fmt, job.first.siz, nullptr, img, w, h))
 		{
 			const size_t n = size_t(w) * h;
-			const size_t at = (w > 4096 || h > 4096) ? SIZE_MAX : place(n);
+			size_t at = SIZE_MAX;
+			uint32_t span = 0;
+			Ring *ring = nullptr;
+			if (w <= 4096 && h <= 4096)
+			{
+				if (image.width)
+				{
+					uint32_t x = 0;
+					const int s = place2d(w + 2, h + 2, x);
+					if (s >= 0)
+					{
+						const uint32_t ox = x + 1, oy = shelves[s].y + 1;
+						write2d(img.data(), w, h, ox, oy);
+						at = ox | (oy << 14);
+						span = w + 2;
+						ring = &shelves[s].ring;
+						ring->resident[x] = job.second;
+					}
+				}
+				else if ((at = place(n)) != SIZE_MAX)
+				{
+					memcpy(texels + at, img.data(), n * 4);
+					span = uint32_t(n);
+					ring = &buffer_ring;
+					ring->resident[uint32_t(at)] = job.second;
+				}
+			}
 			if (at == SIZE_MAX)
 			{
 				if (w <= 4096 && h <= 4096 && !full_logged)
@@ -897,10 +1009,9 @@ static void run()
 			}
 			else
 			{
-				memcpy(texels + at, img.data(), n * 4);
 				job.second->offset = uint32_t(at);
 				job.second->size = w | (h << 16);
-				resident[uint32_t(at)] = job.second;
+				job.second->span = span;
 				state = 1;
 				loaded_count++;
 				loaded_kb += unsigned(n * 4 / 1024);
@@ -924,8 +1035,9 @@ static void stop()
 	}
 	stopping = false;
 	queue.clear();
-	resident.clear();
-	cursor = 0;
+	buffer_ring = Ring();
+	shelves.clear();
+	shelves_end = 0;
 	entries.clear(); // offsets are into the renderer's buffer, which goes with it
 	enabled = false;
 	texels = nullptr;
@@ -961,15 +1073,17 @@ static void init(const char *romname)
 	if (const char *e = getenv("N64_RDP_TEXPACK_MB"))
 		mb = strtoul(e, nullptr, 0);
 	size_t bytes = 0;
-	texels = static_cast<uint32_t *>(frontend->enable_texpack(mb << 20, bytes));
+	texels = static_cast<uint32_t *>(frontend->enable_texpack(mb << 20, bytes, &image));
 	if (!texels)
 	{
 		log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture packs: could not make the replacement buffer.\n");
 		return;
 	}
 	capacity = std::min(bytes / 4, size_t(1) << 28); // texel offsets are 28 bits in the tile
-	resident.clear();
-	cursor = 0;
+	buffer_ring = Ring();
+	buffer_ring.len = capacity;
+	shelves.clear();
+	shelves_end = 0;
 	loaded_count = 0;
 	loaded_kb = 0;
 	failed_count = 0;

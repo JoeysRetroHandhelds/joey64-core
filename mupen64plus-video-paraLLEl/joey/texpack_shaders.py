@@ -32,14 +32,19 @@ SPIRV_VAL = os.path.join(TOOLS, 'spirv-val')
 # 11 u32 masks + u8 array_size[32] + u32 padding (80 bytes), then 5 u32. storage_buffer_mask is the 4th mask.
 REFL_SIZE = 348
 SET_SIZE = 80
+SAMPLED_IMAGE_MASK = 0 * 4
 STORAGE_BUFFER_MASK = 3 * 4
+FP_MASK = 9 * 4
 ARRAY_SIZE = 11 * 4
 TEXPACK_BINDING = 13
 
-# name -> (texel buffer set, [(define values in slangmosh.hpp's order)])
+# program -> (stock shader, replacement set, image path, [define names in slangmosh.hpp's order]). The _img programs
+# (TEXPACK_IMAGE=1) read the replacements from a sampled image at binding 13 instead of a storage buffer.
 SHADERS_TO_BUILD = {
-    'ubershader': (1, ['SUBGROUP', 'SMALL_TYPES']),
-    'rasterizer': (0, ['SMALL_TYPES']),
+    'ubershader': ('ubershader', 1, False, ['SUBGROUP', 'SMALL_TYPES']),
+    'rasterizer': ('rasterizer', 0, False, ['SMALL_TYPES']),
+    'ubershader_img': ('ubershader', 1, True, ['SUBGROUP', 'SMALL_TYPES']),
+    'rasterizer_img': ('rasterizer', 0, True, ['SMALL_TYPES']),
 }
 
 def parse_stock():
@@ -56,18 +61,24 @@ def parse_stock():
         variants.setdefault(m.group(2), [({}, int(m.group(1)))])
     return refl, variants
 
-def patch_reflection(r, set_index):
+def patch_reflection(r, set_index, image):
     r = bytearray(r)
     base = 8 + set_index * SET_SIZE
-    mask, = struct.unpack_from('<I', r, base + STORAGE_BUFFER_MASK)
-    assert not (mask >> TEXPACK_BINDING) & 1, 'binding %d already used' % TEXPACK_BINDING
-    struct.pack_into('<I', r, base + STORAGE_BUFFER_MASK, mask | (1 << TEXPACK_BINDING))
+    for m in range(11):
+        mask, = struct.unpack_from('<I', r, base + 4 * m)
+        assert not (mask >> TEXPACK_BINDING) & 1, 'binding %d already used' % TEXPACK_BINDING
+    masks = [SAMPLED_IMAGE_MASK, FP_MASK] if image else [STORAGE_BUFFER_MASK]
+    for off in masks:
+        mask, = struct.unpack_from('<I', r, base + off)
+        struct.pack_into('<I', r, base + off, mask | (1 << TEXPACK_BINDING))
     assert r[base + ARRAY_SIZE + TEXPACK_BINDING] == 0
     r[base + ARRAY_SIZE + TEXPACK_BINDING] = 1
     return bytes(r)
 
-def compile_variant(name, conds, out):
+def compile_variant(name, conds, out, image):
     args = [GLSLC, '--target-env=vulkan1.1', '-O', '-fshader-stage=compute', '-DTEXPACK=1']
+    if image:
+        args.append('-DTEXPACK_IMAGE=1')
     # dev measurements only (the committed header is built without): e.g. TEXPACK_DEFINES="-DTEXPACK_NOSAMPLE=1"
     args += os.environ.get('TEXPACK_DEFINES', '').split()
     args += ['-D%s=%d' % (d, v) for d, v in sorted(conds.items())]
@@ -83,14 +94,14 @@ def main():
     tmp = os.path.join(HERE, 'texpack_tmp.spv')
     spirv_words, refl_out, code = [], bytearray(), []
     members = []
-    for name, (set_index, defines) in SHADERS_TO_BUILD.items():
+    for name, (stock, set_index, image, defines) in SHADERS_TO_BUILD.items():
         members.append(name)
-        for conds, roff in variants[name]:
+        for conds, roff in variants[stock]:
             assert set(conds) == set(defines), (name, conds)
-            spv = compile_variant(name, conds, tmp)
+            spv = compile_variant(stock, conds, tmp, image)
             woff = len(spirv_words)
             spirv_words += struct.unpack('<%dI' % (len(spv) // 4), spv)
-            rnew = patch_reflection(refl_stock[roff:roff + REFL_SIZE], set_index)
+            rnew = patch_reflection(refl_stock[roff:roff + REFL_SIZE], set_index, image)
             ro = len(refl_out)
             refl_out += rnew
             cond = ' &&\n\t\t    '.join('resolver("%s", "%s") == %d' % (name, d, conds[d]) for d in defines)

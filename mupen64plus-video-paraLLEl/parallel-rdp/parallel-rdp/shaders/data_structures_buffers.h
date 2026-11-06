@@ -101,11 +101,16 @@ layout(set = 1, binding = 7, std430) readonly buffer TileInfoBuffer
 	TileInfoMem elems[];
 } tile_infos;
 #ifdef TEXPACK
+#if defined(TEXPACK_IMAGE) && TEXPACK_IMAGE
+// Joey64 texture packs: the replacement image (RGBA8, linear filter), 1-texel wrap gutter around each replacement.
+layout(set = 1, binding = 13) uniform sampler2D texpack_image;
+#else
 // Joey64 texture packs: replacement texels, RGBA8 (R in the low byte).
 layout(set = 1, binding = 13, std430) readonly buffer TexPackTexels
 {
 	uint texels[];
 } texpack;
+#endif
 #endif
 #include "load_tile_info.h"
 

@@ -928,11 +928,30 @@ i16x4 sample_texture(TileInfo tile, uint tmem_instance, ivec2 st, bool tlut, boo
 // texture exactly (as GLideN64 draws it), so a tile-relative N64 texel position u maps to u * (width / original width).
 // Wrap: repeat (mirrored with the mirror bit) when the tile has a mask, otherwise clamp; the N64 clamp to the tile
 // bounds has already happened in clamp_and_shift_coord.
+#if !(defined(TEXPACK_IMAGE) && TEXPACK_IMAGE)
 i16x4 texpack_texel(uint base, int w, ivec2 p)
 {
 	uint c = texpack.texels[base + uint(p.y * w + p.x)];
 	return i16x4((uvec4(c) >> uvec4(0, 8, 16, 24)) & 0xffu);
 }
+#else
+// Image path: rep.x = x | y << 14 of the replacement's first texel in the image. Filtered coordinates are in replacement
+// texels, centres on half ones. Repeat wraps into [0, n): the gutter holds the wrapped neighbours, so the hardware
+// filter blends across the seam as the four-read path does. Clamp and mirror clamp to the outer texel centres, where
+// the neighbour a mirror would read is the texel itself, so the gutter is never read for them.
+float texpack_wrapf(float p, float n, bool repeat, bool mirror)
+{
+	if (!repeat)
+		return clamp(p, 0.5, n - 0.5);
+	if (mirror)
+	{
+		float m = mod(p, 2.0 * n);
+		m = m < n ? m : 2.0 * n - m;
+		return clamp(m, 0.5, n - 0.5);
+	}
+	return mod(p, n);
+}
+#endif
 
 int texpack_wrap(int i, int n, bool repeat, bool mirror)
 {
@@ -964,6 +983,24 @@ i16x4 sample_replacement(TileInfo tile, uvec4 rep, ivec2 st, bool bilinear, bool
 	vec2 u = vec2(st) * (1.0 / 32.0);
 
 	i16x4 accum;
+#if defined(TEXPACK_IMAGE) && TEXPACK_IMAGE
+	ivec2 origin = ivec2(int(rep.x & 0x3fffu), int(rep.x >> 14u));
+	if (bilinear)
+	{
+		vec2 p = (u + 0.5) * scale;
+		p.x = texpack_wrapf(p.x, float(size.x), repeat.x, mirror.x);
+		p.y = texpack_wrapf(p.y, float(size.y), repeat.y, mirror.y);
+		vec4 c = textureLod(texpack_image, (vec2(origin) + p) / vec2(textureSize(texpack_image, 0)), 0.0);
+		accum = i16x4(round(c * 255.0));
+	}
+	else
+	{
+		ivec2 p = ivec2(floor(u * scale));
+		p.x = texpack_wrap(p.x, size.x, repeat.x, mirror.x);
+		p.y = texpack_wrap(p.y, size.y, repeat.y, mirror.y);
+		accum = i16x4(round(texelFetch(texpack_image, origin + p, 0) * 255.0));
+	}
+#else
 	if (bilinear)
 	{
 		// N64 texel centres sit on whole coordinates; the replacement's texel centres on half ones.
@@ -988,6 +1025,7 @@ i16x4 sample_replacement(TileInfo tile, uvec4 rep, ivec2 st, bool bilinear, bool
 		p.y = texpack_wrap(p.y, size.y, repeat.y, mirror.y);
 		accum = texpack_texel(rep.x, size.x, p);
 	}
+#endif
 
 	// As sample_texture: a cycle that spends no math on bilerp gets the conversion instead.
 	if (convert)

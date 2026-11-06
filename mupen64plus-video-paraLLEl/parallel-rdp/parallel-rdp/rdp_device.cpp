@@ -227,15 +227,59 @@ void CommandProcessor::init_renderer()
 #endif
 }
 
-void *CommandProcessor::enable_texpack(size_t max_bytes, size_t &bytes)
+void *CommandProcessor::enable_texpack(size_t max_bytes, size_t &bytes, TexpackImage *image)
 {
 	bytes = 0;
+	if (image)
+		*image = {};
 #ifdef PARALLEL_RDP_SHADER_DIR
 	(void)max_bytes;
 	return nullptr;
 #else
 	if (!is_supported || texpack_bank)
 		return nullptr;
+
+	const char *env = getenv("N64_RDP_TEXPACK_IMAGE");
+	if (image && !(env && env[0] == '0'))
+	{
+		const unsigned max_dim = device.get_gpu_properties().limits.maxImageDimension2D;
+		const unsigned w = std::min(8192u, max_dim);
+		const unsigned h = unsigned(std::min<size_t>(max_dim, max_bytes / (size_t(w) * 4)));
+		Vulkan::LinearHostImageHandle img;
+		void *ptr = nullptr;
+		if (h >= 4098)
+		{
+			Vulkan::LinearHostImageCreateInfo info;
+			info.width = w;
+			info.height = h;
+			info.format = VK_FORMAT_R8G8B8A8_UNORM;
+			info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+			info.stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+			info.flags = Vulkan::LINEAR_HOST_IMAGE_REQUIRE_LINEAR_FILTER_BIT;
+			img = device.create_linear_host_image(info);
+			// a staging fallback would need copies the loader does not make: use the buffer then
+			if (img && !img->need_staging_copy())
+				ptr = device.map_linear_host_image(*img, Vulkan::MEMORY_ACCESS_WRITE_BIT);
+		}
+		if (ptr)
+		{
+			texpack_image = img;
+			Vulkan::ResourceLayout layout;
+			texpack_bank.reset(new TexpackShaderBank(device, layout, [&](const char *name, const char *define) -> int {
+				return renderer.resolve_shader_define(name, define);
+			}));
+			renderer.set_texpack(texpack_bank.get(), {}, img);
+			image->width = w;
+			image->height = h;
+			image->row_pitch = img->get_row_pitch_bytes();
+			bytes = image->row_pitch * h;
+			LOGI("Texture packs: %ux%u replacement image (%u MB, row pitch %u).\n", w, h, unsigned(bytes >> 20),
+			     unsigned(image->row_pitch));
+			return static_cast<uint8_t *>(ptr) + img->get_offset();
+		}
+		LOGW("Texture packs: no linear replacement image here, using the buffer.\n");
+	}
+
 	size_t size = std::min<size_t>(max_bytes, device.get_gpu_properties().limits.maxStorageBufferRange) & ~size_t(255);
 	if (size == 0)
 		return nullptr;
@@ -256,11 +300,28 @@ void *CommandProcessor::enable_texpack(size_t max_bytes, size_t &bytes)
 	texpack_bank.reset(new TexpackShaderBank(device, layout, [&](const char *name, const char *define) -> int {
 		return renderer.resolve_shader_define(name, define);
 	}));
-	renderer.set_texpack(texpack_bank.get(), std::move(texels));
+	renderer.set_texpack(texpack_bank.get(), std::move(texels), {});
 	bytes = size;
 	LOGI("Texture packs: %u MB replacement buffer.\n", unsigned(size >> 20));
 	return ptr;
 #endif
+}
+
+void CommandProcessor::texpack_flush(size_t offset, size_t size)
+{
+	if (!texpack_image || size == 0)
+		return;
+	const auto &alloc = texpack_image->get_host_visible_allocation();
+	const VkDeviceSize atom = std::max<VkDeviceSize>(1, device.get_gpu_properties().limits.nonCoherentAtomSize);
+	VkDeviceSize begin = alloc.get_offset() + texpack_image->get_offset() + offset;
+	VkDeviceSize end = begin + size;
+	begin -= begin % atom;
+	end = std::min<VkDeviceSize>((end + atom - 1) / atom * atom, alloc.get_offset() + alloc.get_size());
+	VkMappedMemoryRange range = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+	range.memory = alloc.get_memory();
+	range.offset = begin;
+	range.size = end - begin;
+	device.get_device_table().vkFlushMappedMemoryRanges(device.get_device(), 1, &range);
 }
 
 void CommandProcessor::set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig)

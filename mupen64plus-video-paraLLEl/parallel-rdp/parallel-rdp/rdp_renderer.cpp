@@ -49,10 +49,12 @@ Renderer::~Renderer()
 {
 }
 
-void Renderer::set_texpack(const TexpackShaderBank *bank, Vulkan::BufferHandle texels)
+void Renderer::set_texpack(const TexpackShaderBank *bank, Vulkan::BufferHandle texels,
+                           Vulkan::LinearHostImageHandle image)
 {
 	texpack_bank = bank;
 	texpack_texels = std::move(texels);
+	texpack_image = std::move(image);
 }
 
 void Renderer::set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig)
@@ -1812,9 +1814,12 @@ void Renderer::submit_rasterization(Vulkan::CommandBuffer &cmd, Vulkan::Buffer &
 		{ "SMALL_TYPES", caps.supports_small_integer_arithmetic ? 1 : 0 },
 	});
 #else
-	cmd.set_program(texpack_bank ? texpack_bank->rasterizer : shader_bank->rasterizer);
+	cmd.set_program(texpack_bank ? (texpack_image ? texpack_bank->rasterizer_img : texpack_bank->rasterizer) :
+	                shader_bank->rasterizer);
 #endif
-	if (texpack_bank)
+	if (texpack_image)
+		cmd.set_texture(0, 13, texpack_image->get_view(), Vulkan::StockSampler::LinearClamp);
+	else if (texpack_bank)
 		cmd.set_storage_buffer(0, 13, *texpack_texels);
 
 	cmd.set_specialization_constant(0, ImplementationConstants::TileWidth);
@@ -2228,9 +2233,12 @@ void Renderer::submit_depth_blend(Vulkan::CommandBuffer &cmd, Vulkan::Buffer &tm
 				{ "SUBGROUP", caps.subgroup_depth_blend ? 1 : 0 },
 		});
 #else
-		cmd.set_program(texpack_bank ? texpack_bank->ubershader : shader_bank->ubershader);
+		cmd.set_program(texpack_bank ? (texpack_image ? texpack_bank->ubershader_img : texpack_bank->ubershader) :
+		                shader_bank->ubershader);
 #endif
-		if (texpack_bank)
+		if (texpack_image)
+			cmd.set_texture(1, 13, texpack_image->get_view(), Vulkan::StockSampler::LinearClamp);
+		else if (texpack_bank)
 			cmd.set_storage_buffer(1, 13, *texpack_texels);
 	}
 	else
