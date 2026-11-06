@@ -23,6 +23,7 @@
 #include "DisplayWindow.h"
 #include <mupen64plus-next_common.h>
 #include <unordered_map>
+#include <string>
 #include <stdio.h>
 #include <stdlib.h>
 #include "GLideNHQ/TxUtil.h"
@@ -2092,6 +2093,9 @@ struct RecHash
 	}
 };
 static std::unordered_map<Rec, u32, RecHash> counts;
+// how each key's texture was found (L lines) and why updates got no key (F lines), to compare with parallel-RDP
+static std::unordered_map<Rec, std::string, RecHash> detail; // kind 0
+static std::unordered_map<std::string, u32> fails;
 static unsigned frames, updates, nokey, lookups;
 static u64 frameTotal;
 
@@ -2139,8 +2143,11 @@ static void texture(u32 _tile, const gDPTile *pTile, u32 texWidth, u32 texHeight
 {
 	updates++;
 	gDPLoadTileInfo & info = gDP.loadInfo[pTile->tmem];
+	char why[200];
 	if (info.texAddress == 0) {
 		nokey++;
+		snprintf(why, sizeof(why), "noaddr t%u tmem %u fmt %u siz %u", _tile, pTile->tmem, pTile->format, pTile->size);
+		fails[why]++;
 		return;
 	}
 	int bpl;
@@ -2182,12 +2189,22 @@ static void texture(u32 _tile, const gDPTile *pTile, u32 texWidth, u32 texHeight
 	}
 	if (!rangeOk(addr, bpl, width, height, pTile->size)) {
 		nokey++;
+		snprintf(why, sizeof(why), "range t%u tmem %u fmt %u siz %u addr %06x w %d h %d bpl %d lt %u", _tile, pTile->tmem,
+			pTile->format, pTile->size, addr, width, height, bpl, unsigned(info.loadType));
+		fails[why]++;
 		return;
 	}
 	lookups++;
 	const u64 crc = TxUtil::checksum64(RDRAM + addr, width, height, pTile->size, bpl,
 		palAddr(pTile->size, pTile->format, pTile->palette));
 	add(crc, pTile->format, pTile->size, texWidth, texHeight, u8(_tile ? 8 : 0));
+	Rec k{ crc, u16(pTile->format), u16(pTile->size), u16(texWidth), u16(texHeight), 0, 0 };
+	if (detail.find(k) == detail.end()) {
+		snprintf(why, sizeof(why), "addr %06x w %d h %d bpl %d lt %u tmem %u pal %u uls %u ult %u lw %u lh %u tw %u lsz %u dxt %u",
+			addr, width, height, bpl, unsigned(info.loadType), pTile->tmem, pTile->palette, info.uls, info.ult,
+			info.width, info.height, info.texWidth, unsigned(info.size), info.dxt);
+		detail.emplace(k, why);
+	}
 }
 
 // _loadHiresBackground's key (S2DEX backgrounds: whole image), kind 16
@@ -2235,6 +2252,20 @@ void texkeys_gln_frame()
 	for (auto &kv : counts)
 		fprintf(out, "K %016llx %u %u %u %u %u %u %u\n", (unsigned long long)kv.first.crc, kv.first.fmt, kv.first.siz,
 			kv.first.w, kv.first.h, kv.first.kind, kv.first.fb, kv.second);
+	// L crc fmt siz w h : <how its texture was found>; F count <why an update got no key>
+	std::unordered_map<Rec, bool, RecHash> said;
+	for (auto &kv : counts) {
+		Rec k = kv.first;
+		k.kind = 0;
+		k.fb = 0;
+		auto d = detail.find(k);
+		if (d == detail.end() || !said.emplace(k, true).second)
+			continue;
+		fprintf(out, "L %016llx %u %u %u %u : %s\n", (unsigned long long)k.crc, k.fmt, k.siz, k.w, k.h, d->second.c_str());
+	}
+	for (auto &kv : fails)
+		fprintf(out, "F %u %s\n", kv.second, kv.first.c_str());
+	fails.clear();
 	fflush(out);
 	counts.clear();
 	frames = updates = nokey = lookups = 0;

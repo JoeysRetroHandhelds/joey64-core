@@ -983,6 +983,9 @@ struct RecHash
 	}
 };
 static std::unordered_map<Rec, uint32_t, RecHash> counts;
+// key log only: how each key's texture was found (L lines) and why draws got no key (F lines), to compare with GLideN64
+static std::unordered_map<Rec, std::string, RecHash> detail; // kind 0, fb 0
+static std::unordered_map<std::string, uint32_t> fails;
 static unsigned frames, draws_tex, draws_nokey, lookups;
 static uint64_t frame_total;
 
@@ -1198,8 +1201,16 @@ static bool hiresKey(uint32_t t, uint32_t ti, const uint32_t *rect_words, Rec &r
 	TileSizes sz;
 	calcTileSizes(ti, sz, rect_words);
 	LoadInfo &info = loadInfo[tile.tmem & 511];
+	char why[200];
 	if (info.texAddress == 0)
+	{
+		if (out)
+		{
+			snprintf(why, sizeof(why), "noaddr t%u tile %u tmem %u fmt %u siz %u", t, ti, tile.tmem, tile.format, tile.size);
+			fails[why]++;
+		}
 		return false;
+	}
 	int bpl, width, height;
 	uint32_t addr = info.texAddress;
 	if (info.loadType == LOADTYPE_TILE)
@@ -1240,7 +1251,15 @@ static bool hiresKey(uint32_t t, uint32_t ti, const uint32_t *rect_words, Rec &r
 	const int64_t first = int64_t(addr) + min(0, bytesPerLine - 4);
 	if (width <= 0 || height <= 0 || bpl < 0 || first < 0 ||
 	    uint64_t(addr) + uint64_t(bpl) * uint64_t(height - 1) + uint64_t(max(bytesPerLine, 4)) > memSize)
+	{
+		if (out)
+		{
+			snprintf(why, sizeof(why), "range t%u tile %u tmem %u fmt %u siz %u addr %06x w %d h %d bpl %d lt %u", t, ti,
+			         tile.tmem, tile.format, tile.size, addr, width, height, bpl, unsigned(info.loadType));
+			fails[why]++;
+		}
 		return false;
+	}
 	lookups++;
 	rec.crc = checksum64(mem + addr, width, height, int(tile.size), bpl, pal);
 	rec.fmt = uint16_t(tile.format);
@@ -1249,6 +1268,18 @@ static bool hiresKey(uint32_t t, uint32_t ti, const uint32_t *rect_words, Rec &r
 	rec.h = uint16_t(sz.height);
 	rec.kind = 0;
 	rec.fb = in_framebuffer(info.texAddress) ? 1 : 0;
+	if (out)
+	{
+		Rec k = rec;
+		k.fb = 0;
+		if (detail.find(k) == detail.end())
+		{
+			snprintf(why, sizeof(why), "addr %06x w %d h %d bpl %d lt %u tile %u tmem %u pal %u uls %u ult %u lw %u lh %u tw %u lsz %u dxt %u",
+			         addr, width, height, bpl, unsigned(info.loadType), ti, tile.tmem, tile.palette, info.uls, info.ult,
+			         info.width, info.height, info.texWidth, unsigned(info.size), info.dxt);
+			detail.emplace(k, why);
+		}
+	}
 	(void)t;
 	return true;
 }
@@ -1515,6 +1546,21 @@ static void on_frame()
 	for (auto &kv : counts)
 		fprintf(out, "K %016llx %u %u %u %u %u %u %u\n", (unsigned long long)kv.first.crc, kv.first.fmt, kv.first.siz,
 		        kv.first.w, kv.first.h, kv.first.kind, kv.first.fb, kv.second);
+	// L crc fmt siz w h : <how its texture was found>; F count <why a draw got no key>
+	std::unordered_map<Rec, bool, RecHash> said;
+	for (auto &kv : counts)
+	{
+		Rec k = kv.first;
+		k.kind = 0;
+		k.fb = 0;
+		auto d = detail.find(k);
+		if (d == detail.end() || !said.emplace(k, true).second)
+			continue;
+		fprintf(out, "L %016llx %u %u %u %u : %s\n", (unsigned long long)k.crc, k.fmt, k.siz, k.w, k.h, d->second.c_str());
+	}
+	for (auto &kv : fails)
+		fprintf(out, "F %u %s\n", kv.second, kv.first.c_str());
+	fails.clear();
 	fflush(out);
 	counts.clear();
 	frames = draws_tex = draws_nokey = lookups = 0;
