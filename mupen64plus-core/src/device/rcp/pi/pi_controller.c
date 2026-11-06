@@ -23,6 +23,7 @@
 
 #define M64P_CORE_PROTOTYPES 1
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "api/callbacks.h"
@@ -95,6 +96,24 @@ static void dma_pi_write(struct pi_controller* pi)
     uint32_t dram_addr = pi->regs[PI_DRAM_ADDR_REG] & 0xfffffe;
     uint32_t length = (pi->regs[PI_WR_LEN_REG] & UINT32_C(0x00ffffff)) + 1;
     uint8_t* dram = (uint8_t*)pi->ri->rdram->dram;
+
+    /* dev (Joey64 master list item 26): N64_PI_DMA_DEBUG=1 counts cart -> RDRAM DMAs from odd cart addresses */
+    {
+        static int dbg = -1;
+        static unsigned odd, total;
+        if (dbg < 0)
+            dbg = getenv("N64_PI_DMA_DEBUG") && atoi(getenv("N64_PI_DMA_DEBUG")) != 0;
+        if (dbg) {
+            total++;
+            if (pi->regs[PI_CART_ADDR_REG] & 1) {
+                odd++;
+                if (odd <= 8 || (odd & (odd - 1)) == 0)
+                    DebugMessage(M64MSG_ERROR, "PI DMA from odd cart address %08" PRIX32 " -> %06" PRIX32 " len %" PRIX32
+                                 " (%s; %u odd of %u DMAs)", pi->regs[PI_CART_ADDR_REG], dram_addr, length,
+                                 (pi->cart_addr_mask & 1) ? "kept odd" : "aligned", odd, total);
+            }
+        }
+    }
 
     const struct pi_dma_handler* handler = NULL;
     void* opaque = NULL;
