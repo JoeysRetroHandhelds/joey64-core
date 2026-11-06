@@ -68,6 +68,8 @@ def patch_reflection(r, set_index):
 
 def compile_variant(name, conds, out):
     args = [GLSLC, '--target-env=vulkan1.1', '-O', '-fshader-stage=compute', '-DTEXPACK=1']
+    # dev measurements only (the committed header is built without): e.g. TEXPACK_DEFINES="-DTEXPACK_NOSAMPLE=1"
+    args += os.environ.get('TEXPACK_DEFINES', '').split()
     args += ['-D%s=%d' % (d, v) for d, v in sorted(conds.items())]
     args += [os.path.join(SHADERS, name + '.comp'), '-o', out]
     subprocess.check_call(args)

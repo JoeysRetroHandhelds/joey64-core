@@ -951,6 +951,9 @@ int texpack_wrap(int i, int n, bool repeat, bool mirror)
 
 i16x4 sample_replacement(TileInfo tile, uvec4 rep, ivec2 st, bool bilinear, bool convert, i16x4 conversion_factors)
 {
+#if defined(TEXPACK_NEAREST) && TEXPACK_NEAREST
+	bilinear = false; // dev measurement: what the bilinear path costs
+#endif
 	st.x = clamp_and_shift_coord((tile.flags & TILE_INFO_CLAMP_S_BIT) != 0, st.x, int(tile.slo), int(tile.shi), int(tile.shift_s));
 	st.y = clamp_and_shift_coord((tile.flags & TILE_INFO_CLAMP_T_BIT) != 0, st.y, int(tile.tlo), int(tile.thi), int(tile.shift_t));
 

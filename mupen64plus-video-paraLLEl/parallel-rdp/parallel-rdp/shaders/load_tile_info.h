@@ -32,6 +32,10 @@
 // Returns (offset, width | height << 16, original width | original height << 16, present).
 uvec4 load_tile_replace(uint index)
 {
+#if defined(TEXPACK_NOSAMPLE) && TEXPACK_NOSAMPLE
+	// dev measurement: never replace, so the sampling code compiles out (what the rest of the variant costs)
+	return uvec4(0u);
+#endif
 	uvec4 raw = uvec4(tile_infos.elems[index].slo, tile_infos.elems[index].shi,
 	                  tile_infos.elems[index].tlo, tile_infos.elems[index].thi) >> 12u;
 	uint offset = raw.x | ((raw.y & 0xffu) << 20u);
