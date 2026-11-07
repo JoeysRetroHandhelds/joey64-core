@@ -26,7 +26,7 @@ The following projects have been incorporated into this repository:
 - [GLideN64](https://github.com/gonetz/GLideN64)
 - [cxd4](https://github.com/cxd4/rsp)
 - [parallel-rsp](https://github.com/Themaister/parallel-rsp)
-- [angrylion-rdp-plus](https://github.com/ata4/angrylion-rdp-plus) (Currently based on it's [ParaLLel](https://github.com/libretro/parallel-n64/) variant)
+- [angrylion-rdp-plus](https://github.com/ata4/angrylion-rdp-plus) (Currently based on it's [ParaLLel](https://github.com/libretro/parallel-n64/) variant): removed from Joey64's core (2026-11-07), its old MAME licence is non-commercial
 
 #### Acknowledgments
 

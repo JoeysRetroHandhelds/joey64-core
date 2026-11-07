@@ -183,7 +183,6 @@ else ifneq (,$(findstring rpi,$(platform)))
          ARM_CPUFLAGS = -mfpu=neon-fp-armv8
       endif
       HAVE_PARALLEL_RSP = 1
-      HAVE_THR_AL = 1
       LLE = 1
    else ifneq (,$(findstring rpi,$(platform)))
       CPUFLAGS += -mcpu=arm1176jzf-s
@@ -231,7 +230,6 @@ else ifeq ($(platform), jetson-xavier)
    WITH_DYNAREC = aarch64
    HAVE_PARALLEL_RSP = 1
    HAVE_PARALLEL_RDP = 1
-   HAVE_THR_AL = 1
    LLE = 1
    COREFLAGS += -ftree-vectorize -ftree-vectorizer-verbose=2 -funsafe-math-optimizations -fno-finite-math-only
 
@@ -413,7 +411,6 @@ else ifneq (,$(findstring osx,$(platform)))
 
    HAVE_PARALLEL_RSP = 1
    HAVE_PARALLEL_RDP = 1
-   HAVE_THR_AL = 1
    LLE = 1
 
    COREFLAGS += -DOS_LINUX
@@ -438,7 +435,6 @@ else ifneq (,$(findstring ios,$(platform)))
 	ifeq ($(platform),ios-arm64)
 		HAVE_PARALLEL_RSP = 1
 		HAVE_PARALLEL_RDP = 1
-		HAVE_THR_AL = 1
 		LLE = 1
 		WITH_DYNAREC=
 		GLES=1
@@ -493,7 +489,6 @@ else ifneq (,$(findstring tvos,$(platform)))
    EGL := 0
    HAVE_PARALLEL_RSP = 1
    HAVE_PARALLEL_RDP = 1
-   HAVE_THR_AL = 1
    LLE = 1
    PLATCFLAGS += -DHAVE_POSIX_MEMALIGN -DIOS -DOS_IOS
    PLATCFLAGS += -Ofast -ffast-math -funsafe-math-optimizations -DNO_ASM
@@ -599,7 +594,6 @@ else
 
    HAVE_PARALLEL_RSP = 1
    HAVE_PARALLEL_RDP = 1
-   HAVE_THR_AL = 1
    LLE = 1
    COREFLAGS += -DOS_WINDOWS -DMINGW -DUNICODE
    CXXFLAGS += -fpermissive
