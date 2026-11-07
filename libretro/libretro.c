@@ -2203,6 +2203,18 @@ bool retro_unserialize(const void *data, size_t size)
    /* the loader copies a 44-byte header (magic, version, ROM MD5) from data without knowing its size */
    if (!data || size < 44 || memcmp(data, "M64+SAVE", 8) != 0)
       return false;
+   /* Joey64: and then the body for its version (savestates_load_m64p, libretro path): 16788244 bytes of state,
+    * the 1024-byte event queue, from 1.1 4 bytes of using_tlb, from 1.2 4096 bytes of extra state. A shorter
+    * buffer (a state file cut short) was read past its end. */
+   {
+      const unsigned char *h = (const unsigned char *)data;
+      uint32_t version = ((uint32_t)h[8] << 24) | ((uint32_t)h[9] << 16) | ((uint32_t)h[10] << 8) | h[11];
+      size_t need = 44 + 16788244 + 1024;
+      if (version >= 0x00010100) need += 4;
+      if (version >= 0x00010200) need += 4096;
+      if (size < need)
+         return false;
+   }
 
    retro_savestate_complete = false;
    retro_savestate_result = 0;
