@@ -23,7 +23,8 @@ STRINGS      ?= $(NDK_ROOT)/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strin
 TR           ?= tr
 HAVE_PARALLEL_RSP ?= 0
 HAVE_PARALLEL_RDP ?= 0
-HAVE_THR_AL       ?= 0
+# angrylion is not part of Joey64 (its old MAME licence is non-commercial): never built.
+HAVE_THR_AL       := 0
 LLE               ?= 0
 LOCAL_SHORT_COMMANDS := true
 WITH_DYNAREC :=
@@ -34,7 +35,6 @@ ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
   LLE = 1
   HAVE_PARALLEL_RSP = 1
   HAVE_PARALLEL_RDP = 1
-  HAVE_THR_AL = 1
 else ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
   WITH_DYNAREC := aarch64
   HAVE_NEON := 1
@@ -42,7 +42,6 @@ else ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
   LLE = 1
   HAVE_PARALLEL_RSP = 1
   HAVE_PARALLEL_RDP = 1
-  HAVE_THR_AL = 1
 else ifeq ($(TARGET_ARCH_ABI),x86)
   WITH_DYNAREC := x86
   COREASMFLAGS := -f elf -d ELF_TYPE -DPIC

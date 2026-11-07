@@ -932,10 +932,12 @@ static void update_variables(bool startup)
           {
             plugin_connect_rdp_api(RDP_PLUGIN_GLIDEN64);
           }
+#ifdef HAVE_THR_AL
           else if (!strcmp(var.value, "angrylion"))
           {
              plugin_connect_rdp_api(RDP_PLUGIN_ANGRYLION);
           }
+#endif
           else if (!strcmp(var.value, "parallel"))
           {
              plugin_connect_rdp_api(RDP_PLUGIN_PARALLEL);
