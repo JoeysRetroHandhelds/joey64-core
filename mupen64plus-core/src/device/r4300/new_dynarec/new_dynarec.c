@@ -359,6 +359,19 @@ static char *copy;
 static int expirep;
 // N64_DRC_STATS: blocks thrown away (invalidation), whole-cache flushes and expiry steps per window
 static unsigned drc_stat_inv_blocks, drc_stat_inv_all, drc_stat_expire;
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+#define DRC_STAT_RUNS drc_stat_runs
+#define DRC_STAT_INS drc_stat_ins
+#define DRC_STAT_FORCED drc_stat_forced
+#define DRC_STAT_RESET (drc_stat_runs = drc_stat_ins = drc_stat_forced = 0)
+static unsigned drc_stat_runs, drc_stat_ins, drc_stat_forced;
+#else
+#define DRC_STAT_RUNS 0u
+#define DRC_STAT_INS 0u
+#define DRC_STAT_FORCED 0u
+#define DRC_STAT_RESET ((void)0)
+#endif
+
 static u_int dirty_entry_count;
 static u_int copy_size;
 static struct ll_entry* hash_table[65536][2];
@@ -2602,6 +2615,159 @@ static struct ll_entry *get_dirty(struct r4300_core* r4300,u_int vaddr,u_int fla
   return NULL;
 }
 
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+/* Joey64 (2026-11-07, README order item 7, step 1): compile only warm blocks. N64_DRC_HOT=<n> (2-255; unset, 0
+ * or 1 = off): a block nobody compiled yet runs in the pure interpreter until its n-th lookup, so code that runs
+ * once or twice (boot, loading, a new area's setup) is never compiled and a burst of new code (Mario Kart 64's
+ * 2122 blocks in 4 frames on the Flip) is spread out. The lookups return drc_interp_stub, which calls
+ * drc_interp_block. It runs one stretch of RDRAM code up to and including the first branch, with the state the
+ * dynarec keeps in memory (regs, pcaddr, cycle_count), and stops before anything that would need the dynarec's
+ * own handling: COP0, CACHE, SYSCALL/BREAK, traps, LL/SC, FPU arithmetic (rounding mode), memory outside RDRAM
+ * (MMIO, TLB-mapped data, the cartridge), self-branches (idle loops), a delay slot that isn't plain arithmetic,
+ * and getting within a few instructions of the next interrupt. If it can't run even the first instruction it
+ * compiles from there, as before. */
+extern void drc_interp_stub(void);
+void pure_interp_step(struct r4300_core* r4300);
+void dynarec_gen_interrupt(void);
+void *get_addr(u_int vaddr);
+void *get_addr_ht(u_int vaddr);
+static int drc_hot = -1, drc_force;
+static unsigned char drc_heat[65536];
+
+static int drc_in_rdram(u_int a)
+{
+  return (a >= 0x80000000u && a < 0x80800000u) || (a >= 0xA0000000u && a < 0xA0800000u);
+}
+
+/* 1: run vaddr in the interpreter this time; 0: compile it. */
+static int drc_cold(u_int vaddr)
+{
+  if (drc_hot < 0) {
+    const char* e = getenv("N64_DRC_HOT");
+    drc_hot = e && *e ? atoi(e) : 0;
+    if (drc_hot > 255) drc_hot = 255;
+    if (drc_hot > 1) DebugMessage(M64MSG_INFO, "dynarec: blocks compile on their %dth lookup, the pure interpreter runs them before", drc_hot);
+  }
+  if (drc_hot <= 1 || drc_force || (vaddr & 3) || !drc_in_rdram(vaddr)) return 0;
+  unsigned char* h = &drc_heat[((vaddr >> 2) ^ (vaddr >> 18)) & 0xFFFF];
+  if (*h + 1 >= drc_hot) { *h = 0; return 0; }
+  (*h)++;
+  return 1;
+}
+
+static int drc_mem_ok(struct r4300_core* r4300, u_int op)
+{
+  u_int a = (u_int)r4300_regs(r4300)[(op >> 21) & 31] + (u_int)(int)(short)op;
+  return drc_in_rdram(a) && drc_in_rdram(a + 7);
+}
+
+static int drc_cu1(struct r4300_core* r4300)
+{
+  return (r4300_cp0_regs(&r4300->cp0)[CP0_STATUS_REG] & CP0_STATUS_CU1) != 0;
+}
+
+/* 0: stop before it; 1: an ordinary instruction; 2: a branch or jump (the interpreter runs its delay slot);
+ * 3: like 1, but a load or store (not allowed in a linking branch's delay slot). */
+static int drc_classify(struct r4300_core* r4300, u_int op)
+{
+  u_int p = op >> 26, f = op & 63, rt = (op >> 16) & 31;
+  switch (p) {
+  case 0x00:
+    if (f == 0x08 || f == 0x09) return 2;                         /* JR, JALR */
+    if (f <= 0x07) return f == 0x01 || f == 0x05 ? 0 : 1;         /* shifts */
+    if (f == 0x0F) return 1;                                      /* SYNC */
+    if (f >= 0x10 && f <= 0x17) return f == 0x15 ? 0 : 1;         /* HI/LO moves, DSLLV.. */
+    if (f >= 0x18 && f <= 0x27) return 1;                         /* MULT..DDIVU, ADD..NOR */
+    if (f == 0x2A || f == 0x2B || (f >= 0x2C && f <= 0x2F)) return 1;
+    if (f == 0x38 || f == 0x3A || f == 0x3B || f == 0x3C || f == 0x3E || f == 0x3F) return 1;
+    return 0;                                                     /* SYSCALL, BREAK, traps, reserved */
+  case 0x01:
+    return (rt <= 0x03 || (rt >= 0x10 && rt <= 0x13)) ? 2 : 0;    /* BLTZ.., BLTZAL..; traps */
+  case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07:
+  case 0x14: case 0x15: case 0x16: case 0x17:
+    return 2;
+  case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D: case 0x0E: case 0x0F:
+  case 0x18: case 0x19:
+    return 1;
+  case 0x11:
+    return (((op >> 21) & 31) == 8 && drc_cu1(r4300)) ? 2 : 0;    /* BC1x; FPU arithmetic and moves stop */
+  case 0x1A: case 0x1B: case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
+  case 0x28: case 0x29: case 0x2A: case 0x2B: case 0x2C: case 0x2D: case 0x2E: case 0x37: case 0x3F:
+    return drc_mem_ok(r4300, op) ? 3 : 0;
+  case 0x31: case 0x35: case 0x39: case 0x3D:
+    return drc_cu1(r4300) && drc_mem_ok(r4300, op) ? 3 : 0;
+  default:
+    return 0;                                                     /* COP0, COP2, CACHE, LL/SC, reserved */
+  }
+}
+
+/* A branch the interpreter may run: not to itself (idle loops get the dynarec's handling) and its delay slot an
+ * ordinary instruction (a load/store only when the branch doesn't link, as the link could be its base). */
+static int drc_branch_ok(struct r4300_core* r4300, u_int pc, u_int op)
+{
+  u_int p = op >> 26, target = 0, link = 0;
+  if (p == 0x02 || p == 0x03) { target = ((pc + 4) & 0xF0000000u) | ((op & 0x3FFFFFF) << 2); link = p == 0x03; }
+  else if (p == 0x00) link = (op & 63) == 0x09;
+  else { target = pc + 4 + ((u_int)(int)(short)op << 2); link = p == 0x01 && ((op >> 16) & 31) >= 0x10; }
+  if (target == pc) return 0;
+  uint32_t* ds = fast_mem_access(r4300, pc + 4);
+  if (!ds) return 0;
+  int k = drc_classify(r4300, *ds);
+  return k == 1 || (k == 3 && !link);
+}
+
+void *drc_interp_block(void)
+{
+  struct r4300_core* r4300 = &g_dev.r4300;
+  struct new_dynarec_hot_state* hs = &r4300->new_dynarec_hot_state;
+  int* cc = r4300_cp0_cycle_count(&r4300->cp0);
+  const int64_t cpo = r4300->cp0.count_per_op ? r4300->cp0.count_per_op : 2;
+  u_int pc = hs->pcaddr;
+
+  if (*cc >= 0) {                 /* an interrupt is due: what cc_interrupt does, then this block again */
+    hs->pending_exception = 0;
+    dynarec_gen_interrupt();
+    if (*r4300_stop(r4300)) return (void*)drc_interp_stub; /* the stub sees stop */
+    return get_addr_ht(hs->pending_exception ? hs->pcaddr : pc);
+  }
+
+  cp0_update_count(r4300);        /* dynarec style: Count = next_interrupt + cycle_count */
+  struct precomp_instr* saved_pc = *r4300_pc_struct(r4300);
+  r4300->interp_PC.addr = pc;
+  r4300->cp0.last_addr = pc;
+  *r4300_pc_struct(r4300) = &r4300->interp_PC;
+  r4300->drc_interp = 1;
+  int n = 0;
+  for (;;) {
+    u_int at = r4300->interp_PC.addr;
+    if (n >= 256 || !drc_in_rdram(at) || at < r4300->cp0.last_addr) break;
+    uint32_t* opp = fast_mem_access(r4300, at);
+    if (!opp) break;
+    u_int op = *opp;
+    int k = drc_classify(r4300, op);
+    if (k == 0 || (k == 2 && !drc_branch_ok(r4300, at, op))) break;
+    /* the count this adds (up to the delay slot), plus a margin, must stay short of the next interrupt */
+    if ((int64_t)(((at + 8 - r4300->cp0.last_addr) >> 2) + 4) * cpo >= -(int64_t)*cc) break;
+    pure_interp_step(r4300);
+    n++;
+    if (k == 2 || r4300->interp_PC.addr != at + 4 || *cc >= 0) break; /* branched, an exception, or due */
+  }
+  if (r4300->interp_PC.addr != r4300->cp0.last_addr) cp0_update_count(r4300); /* interpreter style */
+  r4300->drc_interp = 0;
+  *r4300_pc_struct(r4300) = saved_pc;
+  hs->pcaddr = r4300->interp_PC.addr;
+  if (n == 0) {                   /* nothing it may run here: compile from this address, as without N64_DRC_HOT */
+    drc_stat_forced++;
+    drc_force = 1;
+    void* r = get_addr(hs->pcaddr);
+    drc_force = 0;
+    return r;
+  }
+  drc_stat_runs++; drc_stat_ins += n;
+  return get_addr_ht(hs->pcaddr);
+}
+#endif
+
 void *dynamic_linker(void * src, u_int vaddr)
 {
   assert((vaddr&1)==0);
@@ -2651,6 +2817,9 @@ void *dynamic_linker(void * src, u_int vaddr)
     return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
   }
 
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  if(drc_cold(vaddr)) { r4300->new_dynarec_hot_state.pcaddr=vaddr; return (void*)drc_interp_stub; } // not linked
+#endif
   int r=new_recompile_block(vaddr);
   if(r==0) return dynamic_linker(src,vaddr);
   // Execute in unmapped page, generate pagefault execption
@@ -2747,6 +2916,9 @@ void *get_addr(u_int vaddr)
     return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
   }
 
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  if(drc_cold(vaddr)) { r4300->new_dynarec_hot_state.pcaddr=vaddr; return (void*)drc_interp_stub; }
+#endif
   int r=new_recompile_block(vaddr);
   if(r==0) return get_addr(vaddr);
   // Execute in unmapped page, generate pagefault execption
@@ -8888,9 +9060,10 @@ int new_recompile_block(int addr)
     if (d > worst_ms) worst_ms = d;
     if (window_start == 0) window_start = t0;
     if (t1 - window_start >= 5000) {
-      DebugMessage(M64MSG_INFO, "dynarec: %u blocks compiled in the last %.0f ms, %.2f ms total, worst %.2f ms; %u blocks invalidated, %u full flushes, %u expiry steps",
-                   blocks, t1 - window_start, total_ms, worst_ms, drc_stat_inv_blocks, drc_stat_inv_all, drc_stat_expire);
+      DebugMessage(M64MSG_INFO, "dynarec: %u blocks compiled in the last %.0f ms, %.2f ms total, worst %.2f ms; %u blocks invalidated, %u full flushes, %u expiry steps; interpreted %u stretches, %u instructions, %u compiled at once",
+                   blocks, t1 - window_start, total_ms, worst_ms, drc_stat_inv_blocks, drc_stat_inv_all, drc_stat_expire, DRC_STAT_RUNS, DRC_STAT_INS, DRC_STAT_FORCED);
       drc_stat_inv_blocks = drc_stat_inv_all = drc_stat_expire = 0;
+      DRC_STAT_RESET;
       window_start = t1; total_ms = worst_ms = 0; blocks = 0;
     }
     return r;

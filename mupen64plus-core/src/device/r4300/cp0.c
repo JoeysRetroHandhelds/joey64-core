@@ -154,10 +154,10 @@ void cp0_update_count(struct r4300_core* r4300)
     uint32_t* cp0_regs = r4300_cp0_regs(cp0);
 
 #ifdef NEW_DYNAREC
-    if (r4300->emumode != EMUMODE_DYNAREC)
+    if (r4300->emumode != EMUMODE_DYNAREC || r4300->drc_interp)
     {
 #endif
-        uint32_t count = ((*r4300_pc(r4300) - cp0->last_addr) >> 2) * cp0->count_per_op;
+        uint32_t count =((*r4300_pc(r4300) - cp0->last_addr) >> 2) * cp0->count_per_op;
         if (r4300->cp0.count_per_op_denom_pot) {
             count += (1 << r4300->cp0.count_per_op_denom_pot) - 1;
             count >>= r4300->cp0.count_per_op_denom_pot;

@@ -242,6 +242,17 @@ GLOBAL_FUNCTION(dyna_linker_ds):
     bl     dynamic_linker_ds
     br     x0
 
+/* Joey64 (N64_DRC_HOT): the lookups return this for a cold block instead of compiling it. pcaddr holds
+ * its address; drc_interp_block runs it in the pure interpreter and returns where to go next. */
+GLOBAL_FUNCTION(drc_interp_stub):
+    str    w20, [x29, #fp_cycle_count]
+    bl     drc_interp_block
+    ldr    w20, [x29, #fp_cycle_count]
+    ldr    w2, [x29, #fp_stop]
+    tst    w2, w2
+    b.ne   new_dyna_stop
+    br     x0
+
 GLOBAL_FUNCTION(new_dyna_start):
     adrp   x16, g_dev
     add    x16, x16, :lo12:g_dev
