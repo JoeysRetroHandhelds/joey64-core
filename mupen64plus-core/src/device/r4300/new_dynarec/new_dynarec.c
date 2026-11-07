@@ -82,6 +82,14 @@ void recomp_dbg_block(int addr);
 #error Unsupported dynarec architecture
 #endif
 
+/* Joey64 N64_DRC_THREAD: a queued compile works from a snapshot that can be stale (other code or data loaded there
+ * since it was queued); a sequence new_dynarec can't compile then drops that compile instead of ending the app. */
+#include <setjmp.h>
+static __thread int drc_bail_armed;
+static __thread jmp_buf drc_bail_jb;
+static __thread int drc_bail_hit;
+#define DRC_EXIT() do { if (drc_bail_armed) longjmp(drc_bail_jb, 1); exit(1); } while (0)
+
 #if ((1u << TARGET_SIZE_2) != NEW_DYNAREC_CACHE_SIZE)
 #error "NEW_DYNAREC_CACHE_SIZE must match TARGET_SIZE_2"
 #endif
@@ -510,7 +518,7 @@ static uint64_t get_const(struct regstat *cur,signed char reg)
     }
   }
   DebugMessage(M64MSG_ERROR, "Unknown constant in r%d",reg);
-  exit(1);
+  DRC_EXIT();
 }
 
 // Least soon needed registers
@@ -2840,6 +2848,7 @@ static u_int drc_queue[4096];
 static int drc_qh, drc_qt;
 static unsigned char drc_queued[65536];
 static unsigned drc_stat_qfull;
+static int drc_job_bailed;           /* set by the worker under drc_mx: the last queued compile bailed */
 
 
 int new_recompile_block_worker(int addr);
@@ -2862,10 +2871,16 @@ static void *drc_worker(void *arg)
     int async = drc_job_async;
     pthread_mutex_unlock(&drc_mx);
     drc_in_worker_async = async;
-    int r = new_recompile_block_worker(a);
+    int r;
+    u_char *out0 = out;
+    if (async && setjmp(drc_bail_jb)) { r = DRC_DROPPED; out = out0; drc_stat_dropped++; drc_bail_hit = 1; } /* see DRC_EXIT */
+    else { drc_bail_armed = async; r = new_recompile_block_worker(a); }
+    drc_bail_armed = 0;
     drc_in_worker_async = 0;
     pthread_mutex_lock(&drc_mx);
     drc_job_result = r;
+    if (async && r == DRC_DROPPED && drc_bail_hit) drc_job_bailed = 1;
+    drc_bail_hit = 0;
     drc_tstate = DRC_T_IDLE;
     pthread_cond_broadcast(&drc_cv_main);
   }
@@ -2915,14 +2930,21 @@ static void drc_finish_locked(int wait_running)
 /* On the emulation thread at a lookup: finish a ready compile, start the next queued one. */
 static void drc_service(void)
 {
-  if (drc_thread <= 0 || drc_tstate == DRC_T_JOB) return;
+  if (drc_thread <= 0) return;
+  int st = __atomic_load_n(&drc_tstate, __ATOMIC_ACQUIRE);
+  if (st == DRC_T_JOB || (st == DRC_T_IDLE && drc_qh == drc_qt && !__atomic_load_n(&drc_job_bailed, __ATOMIC_ACQUIRE))) return; /* nothing to finish or start: no lock */
   struct r4300_core* r4300 = &g_dev.r4300;
   pthread_mutex_lock(&drc_mx);
   drc_finish_locked(0);
+  if (drc_job_bailed && drc_tstate == DRC_T_IDLE) {
+    drc_queued[((drc_job_addr >> 2) ^ (drc_job_addr >> 18)) & 0xFFFF] = 2; /* compile at once from now on */
+    drc_job_bailed = 0;
+  }
   while (drc_tstate == DRC_T_IDLE && drc_qh != drc_qt) {
     u_int a = drc_queue[drc_qh];
     drc_qh = (drc_qh + 1) & 4095;
-    drc_queued[((a >> 2) ^ (a >> 18)) & 0xFFFF] = 0;
+    unsigned char *qm = &drc_queued[((a >> 2) ^ (a >> 18)) & 0xFFFF];
+    if (*qm == 1) *qm = 0;
     if (get_clean(r4300, a, ~0) || get_dirty(r4300, a, ~0)) continue; /* compiled meanwhile */
     u_int off = a & 0x7FFFFF, len = 0x800000 - off;
     if (len > MAXBLOCK * 4) len = MAXBLOCK * 4;
@@ -2943,6 +2965,7 @@ static int drc_thread_cold(u_int vaddr)
 {
   if (drc_force || (vaddr & 3) || !drc_in_rdram(vaddr)) return 0;
   unsigned char *q = &drc_queued[((vaddr >> 2) ^ (vaddr >> 18)) & 0xFFFF];
+  if (*q == 2) return 0;          /* its queued compile bailed: compile it now */
   if (!*q) {
     if (((drc_qt + 1) & 4095) == drc_qh) { drc_stat_qfull++; return 0; } /* queue full */
     drc_queue[drc_qt] = vaddr;
@@ -5203,7 +5226,7 @@ static void do_ccstub(int n)
       }
       emit_writeword(r,(intptr_t)&g_dev.r4300.new_dynarec_hot_state.pcaddr);
     }
-    else {DebugMessage(M64MSG_ERROR, "Unknown branch type in do_ccstub");exit(1);}
+    else {DebugMessage(M64MSG_ERROR, "Unknown branch type in do_ccstub");DRC_EXIT();}
   }
   // Update cycle count
   assert(branch_regs[i].regmap[HOST_CCREG]==CCREG||branch_regs[i].regmap[HOST_CCREG]==-1);
@@ -9367,9 +9390,6 @@ static int new_recompile_block_impl(int addr)
         //DebugMessage(M64MSG_VERBOSE, "start: %x next: %x",map,g_dev.r4300.new_dynarec_hot_state.memory_map[pagelimit>>12]);
         if((map&~WRITE_PROTECT)==(g_dev.r4300.new_dynarec_hot_state.memory_map[pagelimit>>12]&~WRITE_PROTECT)) pagelimit+=4096;
       }
-#if NEW_DYNAREC == NEW_DYNAREC_ARM64
-  if (drc_in_worker_async) source = drc_snap; /* N64_DRC_THREAD: the snapshot taken when it was queued */
-#endif
       assem_debug("pagelimit=%x",pagelimit);
       assem_debug("mapping=%x (%x)",g_dev.r4300.new_dynarec_hot_state.memory_map[start>>12],(uintptr_t)(g_dev.r4300.new_dynarec_hot_state.memory_map[start>>12]<<2)+start);
     }
@@ -9385,6 +9405,9 @@ static int new_recompile_block_impl(int addr)
     DebugMessage(M64MSG_ERROR, "Compile at bogus memory address: %x", (int)addr);
     exit(1);
   }
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  if (drc_in_worker_async) source = drc_snap; /* N64_DRC_THREAD: the snapshot taken when it was queued (RDRAM only) */
+#endif
 
   /* Pass 1: disassemble */
   /* Pass 2: register dependencies, branch targets */
@@ -10139,7 +10162,7 @@ static int new_recompile_block_impl(int addr)
         current.uu&=~((1LL<<us1[i])|(1LL<<us2[i]));
         current.u|=1;
         current.uu|=1;
-      } else { DebugMessage(M64MSG_ERROR, "oops, branch at end of block with no delay slot");exit(1); }
+      } else { DebugMessage(M64MSG_ERROR, "oops, branch at end of block with no delay slot");DRC_EXIT(); }
     }
     is_ds[i]=ds;
     if(ds) {
