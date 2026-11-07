@@ -2976,7 +2976,9 @@ static int drc_thread_cold(u_int vaddr)
   return 1;
 }
 
-/* A compile the emulation thread waits for (on the worker, so the compiler stays single-owner). */
+/* A compile the emulation thread waits for. Once drc_finish_locked(1) returns the worker is idle and starts
+ * nothing until we give it a job under drc_mx, so the compiler is ours: compile here, no hand-off (Conker, whose
+ * code is TLB-mapped and so always compiles this way, spent ~20 us per block on the round trip, -33% on the Duo). */
 static int drc_compile_sync(u_int addr)
 {
   struct r4300_core* r4300 = &g_dev.r4300;
@@ -2985,12 +2987,7 @@ static int drc_compile_sync(u_int addr)
   drc_finish_locked(1);
   int r = 0;
   if (!get_clean(r4300, addr, ~0) && !get_dirty(r4300, addr, ~0)) {
-    drc_job_addr = addr;
-    drc_job_async = 0;
-    drc_tstate = DRC_T_JOB;
-    pthread_cond_broadcast(&drc_cv_worker);
-    while (drc_tstate != DRC_T_IDLE) pthread_cond_wait(&drc_cv_main, &drc_mx);
-    r = drc_job_result;
+    r = new_recompile_block_worker(addr);
   }
   drc_stat_sync++;
   pthread_mutex_unlock(&drc_mx);
