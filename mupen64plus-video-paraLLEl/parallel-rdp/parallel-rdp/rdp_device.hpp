@@ -33,10 +33,6 @@
 #include "worker_thread.hpp"
 #include "rdp_dump_write.hpp"
 
-#ifndef GRANITE_VULKAN_MT
-#error "Granite Vulkan backend must be built with multithreading support."
-#endif
-
 namespace RDP
 {
 struct RGBA
@@ -136,6 +132,12 @@ public:
 	bool timeline_reached(uint64_t index) const { return __atomic_load_n(&thread_timeline_value, __ATOMIC_ACQUIRE) >= index; }
 	void idle();
 	void begin_frame_context();
+
+	// Builds the compute pipelines an earlier run listed, ahead of their first
+	// use, and returns once those a draw cannot do without are built (the rest
+	// keep building in the background). Call before the first command is queued.
+	void build_pipelines_ahead(const Vulkan::PipelineRecord *records, size_t count,
+	                           unsigned &num_urgent, unsigned &num_background);
 
 	// Queues up state and drawing commands.
 	void enqueue_command(unsigned num_words, const uint32_t *words);

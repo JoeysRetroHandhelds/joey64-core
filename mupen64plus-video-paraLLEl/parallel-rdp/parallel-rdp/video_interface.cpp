@@ -20,6 +20,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#define NOMINMAX
 #include "video_interface.hpp"
 #include "rdp_renderer.hpp"
 #include "luts.hpp"
@@ -132,13 +133,14 @@ void VideoInterface::set_shader_bank(const ShaderBank *bank)
 	shader_bank = bank;
 }
 
-static VkPipelineStageFlagBits layout_to_stage(VkImageLayout layout)
+static VkPipelineStageFlagBits2 layout_to_stage(VkImageLayout layout)
 {
 	switch (layout)
 	{
 	case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
 	case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-		return VK_PIPELINE_STAGE_TRANSFER_BIT;
+		// We use BLIT stage internally, but caller expects COPY generally.
+		return VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
 
 	case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
 		return VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
@@ -147,11 +149,11 @@ static VkPipelineStageFlagBits layout_to_stage(VkImageLayout layout)
 		return VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 
 	default:
-		return VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+		return 0;
 	}
 }
 
-static VkAccessFlags layout_to_access(VkImageLayout layout)
+static VkAccessFlags2 layout_to_access(VkImageLayout layout)
 {
 	switch (layout)
 	{
@@ -162,7 +164,7 @@ static VkAccessFlags layout_to_access(VkImageLayout layout)
 		return VK_ACCESS_TRANSFER_WRITE_BIT;
 
 	case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-		return VK_ACCESS_SHADER_READ_BIT;
+		return VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
 
 	case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
 		return VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -400,6 +402,42 @@ bool VideoInterface::need_fetch_bug_emulation(const Registers &regs, unsigned sc
 	return regs.init_y_add < 1024 && scaling_factor == 1;
 }
 
+void VideoInterface::begin_frame_context()
+{
+	frame_serial++;
+	if (device)
+		image_pool.trim(frame_serial, device->get_num_frame_contexts());
+}
+
+const VIImagePool::Entry &VideoInterface::acquire_image(const Vulkan::ImageCreateInfo &info, bool layer_views) const
+{
+	VIImagePool::Entry *e = image_pool.reuse(info, layer_views, frame_serial, device->get_num_frame_contexts());
+	if (e)
+		return *e;
+	return create_pooled_image(info, layer_views);
+}
+
+// Only runs when the size or format changes, or while the pool fills up.
+const VIImagePool::Entry &VideoInterface::create_pooled_image(
+		const Vulkan::ImageCreateInfo &info, bool layer_views) const
+{
+	VIImagePool::Entry *e = image_pool.add(info, frame_serial, device->get_num_frame_contexts());
+	e->image = device->create_image(info);
+	if (layer_views && e->image)
+	{
+		Vulkan::ImageViewCreateInfo view_info = {};
+		view_info.image = e->image.get();
+		view_info.view_type = VK_IMAGE_VIEW_TYPE_2D;
+		view_info.layers = 1;
+		for (unsigned layer = 0; layer < info.layers && layer < 2; layer++)
+		{
+			view_info.base_layer = layer;
+			e->layer_views[layer] = device->create_image_view(view_info);
+		}
+	}
+	return *e;
+}
+
 Vulkan::ImageHandle VideoInterface::vram_fetch_stage(const Registers &regs, unsigned scaling_factor) const
 {
 	auto async_cmd = device->request_command_buffer(Vulkan::CommandBuffer::Type::AsyncCompute);
@@ -413,8 +451,8 @@ Vulkan::ImageHandle VideoInterface::vram_fetch_stage(const Registers &regs, unsi
 		unsigned offset, length;
 		scanout_memory_range(offset, length);
 		renderer->submit_update_upscaled_domain_external(*async_cmd, offset, length, pixel_size_log2);
-		async_cmd->barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-		                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+		async_cmd->barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+		                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 	}
 
 	if (timestamp)
@@ -434,12 +472,11 @@ Vulkan::ImageHandle VideoInterface::vram_fetch_stage(const Registers &regs, unsi
 	rt_info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 	rt_info.misc = Vulkan::IMAGE_MISC_CONCURRENT_QUEUE_GRAPHICS_BIT |
 	               Vulkan::IMAGE_MISC_CONCURRENT_QUEUE_ASYNC_COMPUTE_BIT;
-	vram_image = device->create_image(rt_info);
+	vram_image = acquire_image(rt_info, false).image;
 	vram_image->set_layout(Vulkan::Layout::General);
 
 	async_cmd->image_barrier(*vram_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-	                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-	                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+	                         0, 0, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 
 #ifdef PARALLEL_RDP_SHADER_DIR
 	async_cmd->set_program("rdp://extract_vram.comp");
@@ -483,7 +520,7 @@ Vulkan::ImageHandle VideoInterface::vram_fetch_stage(const Registers &regs, unsi
 	async_cmd->set_specialization_constant_mask(7);
 	async_cmd->set_specialization_constant(0, uint32_t(rdram_size));
 	async_cmd->set_specialization_constant(1, regs.status & (VI_CONTROL_TYPE_MASK | VI_CONTROL_META_AA_BIT));
-	async_cmd->set_specialization_constant(2, trailing_zeroes(scaling_factor));
+	async_cmd->set_specialization_constant(2, Util::trailing_zeroes(scaling_factor));
 
 	async_cmd->push_constants(&push, 0, sizeof(push));
 	async_cmd->dispatch((extract_width + 15) / 16,
@@ -526,30 +563,18 @@ Vulkan::ImageHandle VideoInterface::aa_fetch_stage(Vulkan::CommandBuffer &cmd, V
 	rt_info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 	rt_info.layers = fetch_bug ? 2 : 1;
 	rt_info.misc = Vulkan::IMAGE_MISC_FORCE_ARRAY_BIT;
-	aa_image = device->create_image(rt_info);
-
-	Vulkan::ImageViewCreateInfo view_info = {};
-	view_info.image = aa_image.get();
-	view_info.view_type = VK_IMAGE_VIEW_TYPE_2D;
-	view_info.layers = 1;
-
-	Vulkan::ImageViewHandle aa_primary, aa_secondary;
-	view_info.base_layer = 0;
-	aa_primary = device->create_image_view(view_info);
-
-	if (fetch_bug)
-	{
-		view_info.base_layer = 1;
-		aa_secondary = device->create_image_view(view_info);
-	}
+	const VIImagePool::Entry &aa = acquire_image(rt_info, true);
+	aa_image = aa.image;
+	const Vulkan::ImageView *aa_primary = aa.layer_views[0].get();
+	const Vulkan::ImageView *aa_secondary = aa.layer_views[1].get();
 
 	Vulkan::RenderPassInfo rp;
-	rp.color_attachments[0] = aa_primary.get();
+	rp.color_attachments[0] = aa_primary;
 	rp.clear_attachments = 0;
 
 	if (fetch_bug)
 	{
-		rp.color_attachments[1] = aa_secondary.get();
+		rp.color_attachments[1] = aa_secondary;
 		rp.num_color_attachments = 2;
 		rp.store_attachments = 3;
 	}
@@ -560,8 +585,7 @@ Vulkan::ImageHandle VideoInterface::aa_fetch_stage(Vulkan::CommandBuffer &cmd, V
 	}
 
 	cmd.image_barrier(*aa_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-	                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+	                  0, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 
 	if (timestamp)
 		start_ts = cmd.write_timestamp(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
@@ -607,7 +631,7 @@ Vulkan::ImageHandle VideoInterface::aa_fetch_stage(Vulkan::CommandBuffer &cmd, V
 
 	cmd.image_barrier(*aa_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 	                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+	                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 
 	return aa_image;
 }
@@ -629,30 +653,18 @@ Vulkan::ImageHandle VideoInterface::divot_stage(Vulkan::CommandBuffer &cmd, Vulk
 	rt_info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 	rt_info.layers = fetch_bug ? 2 : 1;
 	rt_info.misc = Vulkan::IMAGE_MISC_FORCE_ARRAY_BIT;
-	divot_image = device->create_image(rt_info);
-
-	Vulkan::ImageViewCreateInfo view_info = {};
-	view_info.image = divot_image.get();
-	view_info.view_type = VK_IMAGE_VIEW_TYPE_2D;
-	view_info.layers = 1;
-
-	Vulkan::ImageViewHandle divot_primary, divot_secondary;
-	view_info.base_layer = 0;
-	divot_primary = device->create_image_view(view_info);
-
-	if (fetch_bug)
-	{
-		view_info.base_layer = 1;
-		divot_secondary = device->create_image_view(view_info);
-	}
+	const VIImagePool::Entry &divot = acquire_image(rt_info, true);
+	divot_image = divot.image;
+	const Vulkan::ImageView *divot_primary = divot.layer_views[0].get();
+	const Vulkan::ImageView *divot_secondary = divot.layer_views[1].get();
 
 	Vulkan::RenderPassInfo rp;
-	rp.color_attachments[0] = divot_primary.get();
+	rp.color_attachments[0] = divot_primary;
 	rp.clear_attachments = 0;
 
 	if (fetch_bug)
 	{
-		rp.color_attachments[1] = divot_secondary.get();
+		rp.color_attachments[1] = divot_secondary;
 		rp.num_color_attachments = 2;
 		rp.store_attachments = 3;
 	}
@@ -663,8 +675,7 @@ Vulkan::ImageHandle VideoInterface::divot_stage(Vulkan::CommandBuffer &cmd, Vulk
 	}
 
 	cmd.image_barrier(*divot_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-	                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+	                  0, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 
 	if (timestamp)
 		start_ts = cmd.write_timestamp(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
@@ -693,7 +704,7 @@ Vulkan::ImageHandle VideoInterface::divot_stage(Vulkan::CommandBuffer &cmd, Vulk
 
 	cmd.image_barrier(*divot_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 	                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+	                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 
 	return divot_image;
 }
@@ -802,22 +813,21 @@ Vulkan::ImageHandle VideoInterface::scale_stage(Vulkan::CommandBuffer &cmd, cons
 	rp.store_attachments = 1;
 
 	cmd.image_barrier(*scale_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-	                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+	                  0, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 
 	if (prev_scanout_image)
 	{
 		if (prev_image_is_external)
 		{
-			cmd.acquire_external_image_barrier(*prev_scanout_image, prev_image_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-											   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+			cmd.acquire_image_barrier(*prev_scanout_image, prev_image_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 		}
 		else if (prev_image_layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
 		{
 			VK_ASSERT(prev_image_layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 			cmd.image_barrier(*prev_scanout_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-			                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-			                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+			                  VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT, 0,
+			                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 		}
 	}
 
@@ -1017,8 +1027,8 @@ Vulkan::ImageHandle VideoInterface::downscale_stage(Vulkan::CommandBuffer &cmd, 
 		{
 			cmd.image_barrier(*input, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-			                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+			                  VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+			                  VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 		}
 
 		unsigned width = input->get_width();
@@ -1051,8 +1061,7 @@ Vulkan::ImageHandle VideoInterface::downscale_stage(Vulkan::CommandBuffer &cmd, 
 		}
 
 		cmd.image_barrier(*downscale_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-		                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+		                  0, 0, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 
 		cmd.blit_image(*downscale_image, *input,
 		               {}, {int(rt_info.width), int(rt_info.height), 1},
@@ -1101,8 +1110,7 @@ Vulkan::ImageHandle VideoInterface::upscale_deinterlace(Vulkan::CommandBuffer &c
 	rp.store_attachments = 1;
 
 	cmd.image_barrier(*deinterlaced_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-	                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+	                  0, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 
 	cmd.begin_render_pass(rp);
 	cmd.set_opaque_state();
@@ -1369,7 +1377,7 @@ Vulkan::ImageHandle VideoInterface::scanout(VkImageLayout target_layout, const S
 	{
 		cmd->image_barrier(*scale_image, src_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 		                   layout_to_stage(src_layout), layout_to_access(src_layout),
-		                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+		                   VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 
 		is_final_pass = !serrate || !options.upscale_deinterlacing;
 
@@ -1383,7 +1391,7 @@ Vulkan::ImageHandle VideoInterface::scanout(VkImageLayout target_layout, const S
 	{
 		cmd->image_barrier(*scale_image, src_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 		                   layout_to_stage(src_layout), layout_to_access(src_layout),
-		                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+		                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 
 		bool field_state = regs.v_current_line == 0;
 		scale_image = upscale_deinterlace(*cmd, *scale_image,
@@ -1400,10 +1408,10 @@ Vulkan::ImageHandle VideoInterface::scanout(VkImageLayout target_layout, const S
 			if (options.export_handle_type != Vulkan::ExternalHandle::get_opaque_memory_handle_type())
 				target_layout = VK_IMAGE_LAYOUT_GENERAL;
 
-			cmd->release_external_image_barrier(*scale_image, src_layout,
-			                                    target_layout,
-			                                    layout_to_stage(src_layout),
-			                                    layout_to_access(src_layout));
+			cmd->release_image_barrier(*scale_image, src_layout,
+			                           target_layout,
+			                           layout_to_stage(src_layout),
+			                           layout_to_access(src_layout));
 		}
 		else
 		{

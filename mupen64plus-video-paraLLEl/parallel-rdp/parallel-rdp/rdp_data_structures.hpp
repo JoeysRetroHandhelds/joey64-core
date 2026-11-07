@@ -70,7 +70,9 @@ enum StaticRasterizationFlagBits
 	RASTERIZATION_CONVERT_ONE_BIT = 1 << 22,
 	RASTERIZATION_BILERP_0_BIT = 1 << 23,
 	RASTERIZATION_BILERP_1_BIT = 1 << 24,
+	RASTERIZATION_NEED_NOISE_DUAL_BIT = 1 << 25,
 	RASTERIZATION_UPSCALING_LOG2_BIT_OFFSET = 26,
+	// Bit 26 and 27 holds upscaling factor in LOG2.
 	RASTERIZATION_NEED_NOISE_BIT = 1 << 28,
 	RASTERIZATION_USE_STATIC_TEXTURE_SIZE_FORMAT_BIT = 1 << 29,
 	RASTERIZATION_USE_SPECIALIZATION_CONSTANT_BIT = 1 << 30
@@ -318,6 +320,13 @@ template <typename T, unsigned N>
 class StreamCache
 {
 public:
+	// The stream is written straight into its upload buffer: storage is that
+	// mapped buffer, room for N elements.
+	void bind(void *storage)
+	{
+		elements = static_cast<T *>(storage);
+	}
+
 	void add(const T &t)
 	{
 		assert(count < N);
@@ -356,7 +365,7 @@ public:
 
 private:
 	unsigned count = 0;
-	T elements[N];
+	T *elements = nullptr;
 };
 
 namespace Limits
@@ -378,8 +387,17 @@ namespace ImplementationConstants
 {
 constexpr unsigned DefaultWorkgroupSize = 64;
 
-constexpr unsigned TileWidth = 8;
-constexpr unsigned TileHeight = 8;
+// Joey64 experiment (master list item 21): the per-tile shaders (rasterizer, depth/blend) take the tile size as
+// their workgroup size, so an 8x8 tile is a 64-thread workgroup: half a 128-wide Adreno wave. Build with
+// N64_XFLAGS="-DJOEY_RDP_TILE_W=16" (and/or _H) to try others; default 8x8.
+#ifndef JOEY_RDP_TILE_W
+#define JOEY_RDP_TILE_W 8
+#endif
+#ifndef JOEY_RDP_TILE_H
+#define JOEY_RDP_TILE_H 8
+#endif
+constexpr unsigned TileWidth = JOEY_RDP_TILE_W;
+constexpr unsigned TileHeight = JOEY_RDP_TILE_H;
 constexpr unsigned MaxTilesX = Limits::MaxWidth / TileWidth;
 constexpr unsigned MaxTilesY = Limits::MaxHeight / TileHeight;
 constexpr unsigned IncoherentPageSize = 1024;

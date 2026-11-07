@@ -27,6 +27,8 @@
 #include "rdp_common.hpp"
 #include "worker_thread.hpp"
 #include <unordered_set>
+#include <thread>
+#include <memory>
 
 namespace RDP
 {
@@ -112,6 +114,15 @@ public:
 
 	bool init_renderer(const RendererOptions &options);
 
+	// Hands the compute pipelines an earlier run listed to the pipeline worker:
+	// first those a draw cannot do without, then the rasterizer variants a draw
+	// can replace with the ubershader meanwhile. Counts both kinds. Call after
+	// init_renderer, before any command is processed.
+	void build_pipelines_ahead(const Vulkan::PipelineRecord *records, size_t count,
+	                           unsigned &num_urgent, unsigned &num_background);
+	// Returns once the worker has built the first kind.
+	void wait_pipelines_ahead();
+
 	// setup may be mutated to apply various fixups to triangle setup.
 	void draw_flat_primitive(TriangleSetup &setup);
 	void draw_shaded_primitive(TriangleSetup &setup, const AttributeSetup &attr);
@@ -180,7 +191,11 @@ private:
 		unsigned num_pages = 0;
 		unsigned staging_readback_pages = 0;
 		unsigned staging_readback_index = 0; // Ringbuffer the readbacks.
+		// RDRAM's GPU copy is mapped in cached, coherent memory: an upload compares
+		// each page with the GPU copy first and skips the pages that are the same.
+		bool compare_before_upload = false;
 	} incoherent;
+	void upload_pages_compared(unsigned index, unsigned count);
 
 	size_t rdram_offset = 0;
 	size_t rdram_size = 0;
@@ -315,6 +330,7 @@ private:
 	InternalSynchronization internal_sync[Limits::NumSyncStates];
 	uint32_t sync_indices_needs_flush = 0;
 	unsigned buffer_instance = 0;
+	void bind_stream_instance();
 	uint32_t base_primitive_index = 0;
 	unsigned pending_render_passes = 0;
 	unsigned pending_render_passes_upscaled = 0;
@@ -397,12 +413,33 @@ private:
 	struct PipelineExecutor
 	{
 		Vulkan::Device *device;
+		std::atomic_uint *done; // work items finished, counted after each one
+		const std::atomic_bool *stop; // set at teardown: queued work is dropped
 		bool is_sentinel(const Vulkan::DeferredPipelineCompile &compile) const;
 		void perform_work(const Vulkan::DeferredPipelineCompile &compile) const;
 		void notify_work_locked(const Vulkan::DeferredPipelineCompile &compile) const;
 	};
 
 	std::unique_ptr<WorkerThread<Vulkan::DeferredPipelineCompile, PipelineExecutor>> pipeline_worker;
+	std::atomic_uint pipelines_pushed{0};
+	std::atomic_uint pipelines_done{0};
+	std::atomic_bool pipeline_worker_stop{false};
+	unsigned pipelines_ahead_target = 0;
+
+	// EXPERIMENT (N64_RDP_PREBUILD_THREADS=<n>, n >= 2): last session's pipeline list is built on n threads of
+	// its own at launch instead of on the single pipeline worker (Dolphin uses more compile threads at start).
+	// Each thread takes the next list entry; the urgent ones are first in the list, and launch waits for them.
+	struct PrebuildJob
+	{
+		std::vector<Vulkan::DeferredPipelineCompile> list;
+		std::atomic_uint next{0};
+		unsigned num_urgent = 0;
+		unsigned urgent_done = 0; // under lock
+		std::mutex lock;
+		std::condition_variable cond;
+	};
+	std::shared_ptr<PrebuildJob> prebuild_job;
+	std::vector<std::thread> prebuild_threads;
 
 	void resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd);
 	void resolve_coherency_gpu_to_host(CoherencyOperation &op, Vulkan::CommandBuffer &cmd);
