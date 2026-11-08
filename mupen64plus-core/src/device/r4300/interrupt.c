@@ -532,6 +532,24 @@ static void call_interrupt_handler(const struct cp0* cp0, size_t index)
     handler->callback(handler->opaque);
 }
 
+/* Joey64: retro_serialize / retro_unserialize ask for a save or load and run the game thread until it's done.
+ * mupen64plus did the job at the next interrupt but went back to the frontend only at the next VI, so each
+ * one emulated a whole extra frame (Thor: a snapshot every frame showed 30 fps; 5-34 ms each). Going back
+ * right after the job makes it cost only the copy; the next retro_run carries on from here to the VI.
+ * N64_STATE_RETURN=0 keeps the old way. */
+extern void retro_return(void);
+static void state_job_done(void)
+{
+    static int mode = -1;
+    if (mode < 0)
+    {
+        const char* e = getenv("N64_STATE_RETURN");
+        mode = !(e && e[0] == '0');
+    }
+    if (mode)
+        retro_return();
+}
+
 void gen_interrupt(struct r4300_core* r4300)
 {
     uint32_t* cp0_regs = r4300_cp0_regs(&r4300->cp0);
@@ -553,6 +571,7 @@ void gen_interrupt(struct r4300_core* r4300)
         if (savestates_get_job() == savestates_job_load)
         {
             savestates_load();
+            state_job_done();
             return;
         }
 
@@ -673,6 +692,7 @@ void gen_interrupt(struct r4300_core* r4300)
         if (savestates_get_job() == savestates_job_save)
         {
             savestates_save();
+            state_job_done();
             return;
         }
     }
