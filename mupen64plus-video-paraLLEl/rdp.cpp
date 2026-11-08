@@ -770,6 +770,7 @@ struct Entry
 	std::atomic<uint32_t> retry_at{0};
 	uint32_t offset = 0, size = 0; // offset: texels into the buffer, or x | y << 14 of the first texel in the image
 	uint32_t span = 0;             // worker only: length in its ring (texels, or the image slot's width)
+	bool mips = false;             // the image holds its mip chain (written before state 1)
 	Key key{};
 };
 struct KeyHash
@@ -938,6 +939,51 @@ static void write2d(const uint32_t *src, uint32_t w, uint32_t h, uint32_t ox, ui
 	frontend->texpack_flush(first, size_t(h + 2) * image.row_pitch);
 }
 
+// Mip levels on the image path (N64_RDP_TEXPACK_MIPS=0 turns them off): level l is max(1, w >> l) x max(1, h >> l),
+// down to 1 x 1, each with its gutter, left to right after the replacement on its shelf (texpack_level in texture.h).
+// Each texel of a level averages the 2 x 2 below it (clamped at an odd edge), colour weighted by alpha so cut-out
+// edges don't darken. Only replacements up to 2048 wide get them (the chain is about twice as wide).
+static bool mips_on = true;
+static uint32_t mip_levels(uint32_t w, uint32_t h)
+{
+	uint32_t n = 1;
+	while ((w >> n) || (h >> n))
+		n++;
+	return n; // findMSB(max(w, h)) + 1
+}
+static uint32_t mip_chain_width(uint32_t w, uint32_t h)
+{
+	uint32_t sw = 0;
+	for (uint32_t l = 0, n = mip_levels(w, h); l < n; l++)
+		sw += std::max(1u, w >> l) + 2;
+	return sw;
+}
+static void mip_down(const std::vector<uint32_t> &src, uint32_t w, uint32_t h, std::vector<uint32_t> &dst, uint32_t &dw, uint32_t &dh)
+{
+	dw = std::max(1u, w >> 1);
+	dh = std::max(1u, h >> 1);
+	dst.resize(size_t(dw) * dh);
+	for (uint32_t y = 0; y < dh; y++)
+		for (uint32_t x = 0; x < dw; x++)
+		{
+			uint32_t r = 0, g = 0, b = 0, a = 0;
+			for (uint32_t j = 0; j < 2; j++)
+				for (uint32_t i = 0; i < 2; i++)
+				{
+					const uint32_t c = src[size_t(std::min(2 * y + j, h - 1)) * w + std::min(2 * x + i, w - 1)];
+					const uint32_t ca = c >> 24;
+					r += (c & 0xff) * ca;
+					g += ((c >> 8) & 0xff) * ca;
+					b += ((c >> 16) & 0xff) * ca;
+					a += ca;
+				}
+			uint32_t o = 0;
+			if (a)
+				o = ((r + a / 2) / a) | (((g + a / 2) / a) << 8) | (((b + a / 2) / a) << 16);
+			dst[size_t(y) * dw + x] = o | (((a + 2) / 4) << 24);
+		}
+}
+
 // what the renderer was last told per tile (present, offset, size, orig)
 static uint32_t sent[8][4];
 static unsigned frames, hits, pending_draws;
@@ -972,14 +1018,32 @@ static void run()
 			{
 				if (image.width)
 				{
+					const bool mips = mips_on && w <= 2048 && h <= 2048 && (w > 1 || h > 1);
+					const uint32_t sw = mips ? mip_chain_width(w, h) : w + 2;
 					uint32_t x = 0;
-					const int s = place2d(w + 2, h + 2, x);
+					const int s = place2d(sw, h + 2, x);
 					if (s >= 0)
 					{
 						const uint32_t ox = x + 1, oy = shelves[s].y + 1;
 						write2d(img.data(), w, h, ox, oy);
+						if (mips)
+						{
+							std::vector<uint32_t> cur = img, next;
+							uint32_t cw = w, ch = h, lx = ox + w + 2;
+							for (uint32_t l = 1, nl = mip_levels(w, h); l < nl; l++)
+							{
+								uint32_t nw, nh;
+								mip_down(cur, cw, ch, next, nw, nh);
+								write2d(next.data(), nw, nh, lx, oy);
+								lx += nw + 2;
+								cur.swap(next);
+								cw = nw;
+								ch = nh;
+							}
+						}
+						job.second->mips = mips;
 						at = ox | (oy << 14);
-						span = w + 2;
+						span = sw;
 						ring = &shelves[s].ring;
 						ring->resident[x] = job.second;
 					}
@@ -1072,6 +1136,10 @@ static void init(const char *romname)
 	size_t mb = 256;
 	if (const char *e = getenv("N64_RDP_TEXPACK_MB"))
 		mb = strtoul(e, nullptr, 0);
+	{
+		const char *m = getenv("N64_RDP_TEXPACK_MIPS");
+		mips_on = !(m && m[0] == '0');
+	}
 	size_t bytes = 0;
 	texels = static_cast<uint32_t *>(frontend->enable_texpack(mb << 20, bytes, &image));
 	if (!texels)
@@ -1080,6 +1148,9 @@ static void init(const char *romname)
 		return;
 	}
 	capacity = std::min(bytes / 4, size_t(1) << 28); // texel offsets are 28 bits in the tile
+	if (image.width)
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture packs: replacement image %ux%u, mip levels %s.\n", image.width,
+		       image.height, mips_on ? "on" : "off");
 	buffer_ring = Ring();
 	buffer_ring.len = capacity;
 	shelves.clear();
@@ -1142,7 +1213,7 @@ static void apply(const uint32_t *tiles, unsigned count, Entry *const *e, const 
 		if (t == 0)
 			hits++;
 		uint32_t *w = want[tiles[t] & 7];
-		w[0] = 1;
+		w[0] = e[t]->mips ? 3 : 1;
 		w[1] = e[t]->offset;
 		w[2] = e[t]->size;
 		w[3] = orig[t][0] | (uint32_t(orig[t][1]) << 16);
@@ -1151,7 +1222,7 @@ static void apply(const uint32_t *tiles, unsigned count, Entry *const *e, const 
 	{
 		if (memcmp(want[i], sent[i], sizeof(want[i])) == 0)
 			continue;
-		frontend->set_tile_replace(i, want[i][0] != 0, want[i][1], want[i][2], want[i][3]);
+		frontend->set_tile_replace(i, want[i][0] != 0, want[i][1], want[i][2], want[i][3], (want[i][0] & 2) != 0);
 		memcpy(sent[i], want[i], sizeof(want[i]));
 	}
 }

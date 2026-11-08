@@ -29,7 +29,8 @@
 //   slo[31:12] texel offset bits 0-19      shi[19:12] texel offset bits 20-27   shi[31:20] width - 1
 //   tlo[23:12] height - 1                  tlo[31:24] original width - 1, bits 0-7
 //   thi[13:12] original width - 1, bits 8-9   thi[23:14] original height - 1      thi[24] present
-// Returns (offset, width | height << 16, original width | original height << 16, present).
+//   thi[25] mips: the image holds the replacement's mip chain to its right (TEXPACK_IMAGE; see sample_replacement)
+// Returns (offset, width | height << 16, original width | original height << 16, present | mips << 1).
 uvec4 load_tile_replace(uint index)
 {
 #if defined(TEXPACK_NOSAMPLE) && TEXPACK_NOSAMPLE
@@ -43,7 +44,7 @@ uvec4 load_tile_replace(uint index)
 	uint h = (raw.z & 0xfffu) + 1u;
 	uint ow = ((raw.z >> 12u) | ((raw.w & 3u) << 8u)) + 1u;
 	uint oh = ((raw.w >> 2u) & 0x3ffu) + 1u;
-	return uvec4(offset, w | (h << 16u), ow | (oh << 16u), (raw.w >> 12u) & 1u);
+	return uvec4(offset, w | (h << 16u), ow | (oh << 16u), (raw.w >> 12u) & 3u);
 }
 #endif
 

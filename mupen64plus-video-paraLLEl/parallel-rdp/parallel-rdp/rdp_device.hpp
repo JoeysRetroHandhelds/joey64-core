@@ -155,7 +155,7 @@ public:
 	void *enable_texpack(size_t max_bytes, size_t &bytes, TexpackImage *image = nullptr);
 	// Any thread: make bytes [offset, offset + size) of the image (from the returned pointer) visible to the GPU.
 	void texpack_flush(size_t offset, size_t size);
-	void set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig);
+	void set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig, bool mips = false);
 
 	// Interact with memory.
 	void *begin_read_rdram();

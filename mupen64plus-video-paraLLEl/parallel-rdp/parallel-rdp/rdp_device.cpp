@@ -324,10 +324,10 @@ void CommandProcessor::texpack_flush(size_t offset, size_t size)
 	device.get_device_table().vkFlushMappedMemoryRanges(device.get_device(), 1, &range);
 }
 
-void CommandProcessor::set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig)
+void CommandProcessor::set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig, bool mips)
 {
 	const uint32_t words[4] = {
-		(uint32_t(Op::MetaTileReplace) << 24u) | (tile & 7u) | (present ? 8u : 0u),
+		(uint32_t(Op::MetaTileReplace) << 24u) | (tile & 7u) | (present ? 8u : 0u) | (mips ? 16u : 0u),
 		offset, size, orig,
 	};
 	enqueue_command_inner(4, words);
@@ -1064,7 +1064,7 @@ void CommandProcessor::enqueue_command_direct(unsigned, const uint32_t *words)
 
 	case Op::MetaTileReplace:
 	{
-		renderer.set_tile_replace(words[0] & 7u, (words[0] & 8u) != 0, words[1], words[2], words[3]);
+		renderer.set_tile_replace(words[0] & 7u, (words[0] & 8u) != 0, words[1], words[2], words[3], (words[0] & 16u) != 0);
 		break;
 	}
 

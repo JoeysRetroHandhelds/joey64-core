@@ -227,7 +227,8 @@ bool shade_pixel(int x, int y, uint primitive_index, out ShadedData shaded)
 #ifdef TEXPACK
 		uvec4 rep0 = load_tile_replace(tile_info_index0);
 		if (rep0.w != 0u && int(tile_info0.fmt) != TEXTURE_FORMAT_YUV)
-			texel0 = sample_replacement(tile_info0, rep0, st, bilerp0 && (sample_quad || tlut), !bilerp0, derived.factors);
+			texel0 = sample_replacement(tile_info0, rep0, st, bilerp0 && (sample_quad || tlut), !bilerp0, derived.factors,
+			                            (rep0.w & 2u) != 0u ? texpack_st_derivs(span_setup.stzw, attr.dstzw_dx, attr.dstzw_dy, dx, perspective) : vec4(0.0));
 		else
 #endif
 		texel0 = sample_texture(tile_info0, tmem_instance_index, st, tlut, tlut_type,
@@ -279,7 +280,8 @@ bool shade_pixel(int x, int y, uint primitive_index, out ShadedData shaded)
 #ifdef TEXPACK
 			uvec4 rep1 = load_tile_replace(tile_info_index1);
 			if (rep1.w != 0u && !convert_one && int(tile_info1.fmt) != TEXTURE_FORMAT_YUV)
-				texel1 = sample_replacement(tile_info1, rep1, st, bilerp1 && (sample_quad || tlut), !bilerp1, derived.factors);
+				texel1 = sample_replacement(tile_info1, rep1, st, bilerp1 && (sample_quad || tlut), !bilerp1, derived.factors,
+				                            (rep1.w & 2u) != 0u ? texpack_st_derivs(span_setup.stzw, attr.dstzw_dx, attr.dstzw_dy, dx, perspective) : vec4(0.0));
 			else
 #endif
 			texel1 = sample_texture(tile_info1, tmem_instance_index, st, tlut, tlut_type, sample_quad, mid_texel,

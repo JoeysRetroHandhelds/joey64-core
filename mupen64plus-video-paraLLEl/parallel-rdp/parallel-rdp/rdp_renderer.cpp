@@ -57,7 +57,7 @@ void Renderer::set_texpack(const TexpackShaderBank *bank, Vulkan::BufferHandle t
 	texpack_image = std::move(image);
 }
 
-void Renderer::set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig)
+void Renderer::set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig, bool mips)
 {
 	// Packed into the upper 20 bits of the tile's slo/shi/tlo/thi; layout in shaders/load_tile_info.h.
 	auto &r = tile_replace[tile & 7];
@@ -71,7 +71,7 @@ void Renderer::set_tile_replace(uint32_t tile, bool present, uint32_t offset, ui
 	r.bits[0] = (offset & 0xfffff) << 12;
 	r.bits[1] = (((offset >> 20) & 0xff) | ((w & 0xfff) << 8)) << 12;
 	r.bits[2] = ((h & 0xfff) | ((ow & 0xff) << 12)) << 12;
-	r.bits[3] = (((ow >> 8) & 3) | ((oh & 0x3ff) << 2) | (1u << 12)) << 12;
+	r.bits[3] = (((ow >> 8) & 3) | ((oh & 0x3ff) << 2) | (1u << 12) | (mips ? 1u << 13 : 0u)) << 12;
 }
 
 void Renderer::set_shader_bank(const ShaderBank *bank)

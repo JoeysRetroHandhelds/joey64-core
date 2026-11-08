@@ -114,7 +114,7 @@ public:
 	// written by the pack loader); with both set, every draw runs the TEXPACK shaders. set_tile_replace: the replacement
 	// the next draws use for this tile (present false = none); it rides in the tile's TileInfo (load_tile_info.h).
 	void set_texpack(const TexpackShaderBank *bank, Vulkan::BufferHandle texels, Vulkan::LinearHostImageHandle image);
-	void set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig);
+	void set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig, bool mips = false);
 
 	bool init_renderer(const RendererOptions &options);
 
