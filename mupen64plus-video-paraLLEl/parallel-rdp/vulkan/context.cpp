@@ -718,6 +718,12 @@ bool Context::create_instance(const char * const *instance_ext, uint32_t instanc
 		// If we have a pre-existing instance, we can only assume Vulkan 1.1 in legacy interface.
 		ext.instance_api_core_version = app_info.apiVersion;
 	}
+	else
+	{
+		// Joey64: the frontend made the instance with the application info we gave it (libretro context negotiation),
+		// so its version is the one we asked for, not the promoted one.
+		ext.instance_api_core_version = std::max<uint32_t>(VK_API_VERSION_1_1, get_application_info().apiVersion);
+	}
 
 	enabled_instance_extensions = std::move(instance_exts);
 	ext.instance_extensions = enabled_instance_extensions.data();

@@ -2657,6 +2657,8 @@ bool parallel_create_device(struct retro_vulkan_context *frontend_context, VkIns
 	}
 
 	::RDP::context->set_system_handles(handles);
+	// The frontend made the instance with our application info: tell Granite which version it asked for.
+	::RDP::context->set_application_info(parallel_get_application_info());
 
 	if (!::RDP::context->init_device_from_instance(
 				instance, gpu, surface, required_device_extensions, num_required_device_extensions,
@@ -2678,18 +2680,23 @@ bool parallel_create_device(struct retro_vulkan_context *frontend_context, VkIns
 	return true;
 }
 
-static const VkApplicationInfo parallel_app_info = {
+// Joey64: ask for a Vulkan 1.2 instance. Some drivers offer the 8-bit storage parallel-RDP needs only as a Vulkan 1.2
+// core feature, without VK_KHR_8bit_storage (PurpleVK on the Adreno 650, Snapdragon 865); a 1.1 instance cannot
+// use it. Granite still uses only what each GPU's own version allows. N64_VK11=1 asks for 1.1 as before.
+static VkApplicationInfo parallel_app_info = {
 	VK_STRUCTURE_TYPE_APPLICATION_INFO,
 	nullptr,
 	"paraLLEl-RDP",
 	0,
 	"Granite",
 	0,
-	VK_API_VERSION_1_1,
+	VK_API_VERSION_1_2,
 };
 
 const VkApplicationInfo *parallel_get_application_info(void)
 {
+	const char *v11 = getenv("N64_VK11");
+	parallel_app_info.apiVersion = (v11 && *v11 == '1') ? VK_API_VERSION_1_1 : VK_API_VERSION_1_2;
 	return &parallel_app_info;
 }
 
