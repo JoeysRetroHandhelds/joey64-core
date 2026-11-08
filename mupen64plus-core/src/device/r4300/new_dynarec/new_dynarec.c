@@ -1923,9 +1923,25 @@ static void add_stub(int type,intptr_t addr,intptr_t retaddr,int a,intptr_t b,in
   stubcount++;
 }
 
+/* Joey64 (order items 13/28): a direct-mapped cache of recent get_addr_ht answers (vaddr -> host rx address) in front of
+ * the 1 MB hash table and its dependent ll_entry load: jump_vaddr (every indirect jump the mini_ht misses) spent 1.2-8.3%
+ * of all time in get_addr_ht (Duo, uncapped, GoldenEye highest). Every entry was a hash table hit when it went in, and
+ * each hash table change that loses or replaces an entry bumps jc_gen, which empties the cache, so it never answers
+ * anything the hash table wouldn't. N64_DRC_JCACHE=0 turns it off. */
+#define JC_BITS 12
+struct jc_entry { u_int vaddr; u_int gen; void *addr; };
+static struct jc_entry jc_tab[1<<JC_BITS];
+static u_int jc_gen = 1;
+static int jc_on = 1;
+static void jc_bump(void)
+{
+  if(++jc_gen==0) { memset(jc_tab,0,sizeof(jc_tab)); jc_gen=1; }
+}
+
 static void remove_hash(u_int vaddr)
 {
   //DebugMessage(M64MSG_VERBOSE, "remove hash: %x",vaddr);
+  jc_bump();
   struct ll_entry **ht_bin=hash_table[(((vaddr)>>16)^vaddr)&0xFFFF];
   if(ht_bin[1]&&ht_bin[1]->vaddr==vaddr) {
     ht_bin[1]=NULL;
@@ -3057,6 +3073,7 @@ void *dynamic_linker(void * src, u_int vaddr)
 #ifdef DISABLE_BLOCK_LINKING
   head=get_clean(r4300,vaddr,~0);
   if(head!=NULL){
+    if(ht_bin[1]) jc_bump();
     ht_bin[1]=ht_bin[0];
     ht_bin[0]=head;
     return (void*)(((intptr_t)head->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
@@ -3066,11 +3083,13 @@ void *dynamic_linker(void * src, u_int vaddr)
   head=get_dirty(r4300,vaddr,~0);
   if(head!=NULL){
     if(ht_bin[0]&&ht_bin[0]->vaddr==vaddr) {
+      jc_bump();
       ht_bin[0]=head; // Replace existing entry
     }
     else
     {
-      ht_bin[1]=ht_bin[0];
+      if(ht_bin[1]) jc_bump();
+    ht_bin[1]=ht_bin[0];
       ht_bin[0]=head;
     }
     return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
@@ -3121,6 +3140,7 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
 #ifdef DISABLE_BLOCK_LINKING
   head=get_clean(r4300,vaddr,~0);
   if(head!=NULL){
+    if(ht_bin[1]) jc_bump();
     ht_bin[1]=ht_bin[0];
     ht_bin[0]=head;
     return (void*)(((intptr_t)head->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
@@ -3130,11 +3150,13 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
   head=get_dirty(r4300,vaddr,~0);
   if(head!=NULL){
     if(ht_bin[0]&&ht_bin[0]->vaddr==vaddr) {
+      jc_bump();
       ht_bin[0]=head; // Replace existing entry
     }
     else
     {
-      ht_bin[1]=ht_bin[0];
+      if(ht_bin[1]) jc_bump();
+    ht_bin[1]=ht_bin[0];
       ht_bin[0]=head;
     }
     return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
@@ -3163,6 +3185,7 @@ void *get_addr(u_int vaddr)
 
   head=get_clean(r4300,vaddr,~0);
   if(head!=NULL){
+    if(ht_bin[1]) jc_bump();
     ht_bin[1]=ht_bin[0];
     ht_bin[0]=head;
     return (void*)(((intptr_t)head->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
@@ -3171,11 +3194,13 @@ void *get_addr(u_int vaddr)
   head=get_dirty(r4300,vaddr,~0);
   if(head!=NULL){
     if(ht_bin[0]&&ht_bin[0]->vaddr==vaddr) {
+      jc_bump();
       ht_bin[0]=head; // Replace existing entry
     }
     else
     {
-      ht_bin[1]=ht_bin[0];
+      if(ht_bin[1]) jc_bump();
+    ht_bin[1]=ht_bin[0];
       ht_bin[0]=head;
     }
     return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
@@ -3197,10 +3222,16 @@ void *get_addr(u_int vaddr)
 // Look up address in hash table first
 void *get_addr_ht(u_int vaddr)
 {
+  struct jc_entry *jc=&jc_tab[((vaddr>>2)^(vaddr>>14))&((1<<JC_BITS)-1)];
+  if(jc->vaddr==vaddr&&jc->gen==jc_gen) return jc->addr;
   struct ll_entry **ht_bin=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
-  if(ht_bin[0]&&ht_bin[0]->vaddr==vaddr) return (void *)(((intptr_t)ht_bin[0]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
-  if(ht_bin[1]&&ht_bin[1]->vaddr==vaddr) return (void *)(((intptr_t)ht_bin[1]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
-  return get_addr(vaddr);
+  struct ll_entry *hit;
+  if(ht_bin[0]&&ht_bin[0]->vaddr==vaddr) hit=ht_bin[0];
+  else if(ht_bin[1]&&ht_bin[1]->vaddr==vaddr) hit=ht_bin[1];
+  else return get_addr(vaddr);
+  void *a=(void *)(((intptr_t)hit->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
+  if(jc_on) { jc->vaddr=vaddr; jc->gen=jc_gen; jc->addr=a; }
+  return a;
 }
 
 void *get_addr_32(u_int vaddr,u_int flags)
@@ -3270,10 +3301,12 @@ static void *check_addr(u_int vaddr)
     if((((uintptr_t)head->addr-(uintptr_t)out)<<(32-TARGET_SIZE_2))>0x60000000+(MAX_OUTPUT_BLOCK_SIZE<<(32-TARGET_SIZE_2))) {
       // Update existing entry with current address
       if(ht_bin[0]&&ht_bin[0]->vaddr==vaddr) {
+        jc_bump();
         ht_bin[0]=head;
         return head->addr;
       }
       if(ht_bin[1]&&ht_bin[1]->vaddr==vaddr) {
+        jc_bump();
         ht_bin[1]=head;
         return head->addr;
       }
@@ -3513,9 +3546,11 @@ void clean_blocks(u_int page)
               struct ll_entry **ht_bin=hash_table[((head->vaddr>>16)^head->vaddr)&0xFFFF];
               if(!head->reg32) {
                 if(ht_bin[0]&&ht_bin[0]->vaddr==head->vaddr) {
+                  jc_bump();
                   ht_bin[0]=clean_head; // Replace existing entry
                 }
                 if(ht_bin[1]&&ht_bin[1]->vaddr==head->vaddr) {
+                  jc_bump();
                   ht_bin[1]=clean_head; // Replace existing entry
                 }
               }
@@ -9250,6 +9285,12 @@ void new_dynarec_init(void)
     g_dev.r4300.cached_interp.invalid_code[n]=1;
   for(n=0;n<65536;n++)
     hash_table[n][0]=hash_table[n][1]=NULL;
+  jc_bump();
+  {
+    const char* e = getenv("N64_DRC_JCACHE");
+    jc_on = !(e && e[0] == '0');
+    DebugMessage(M64MSG_INFO, "dynarec: jump cache %s", jc_on ? "on" : "off (N64_DRC_JCACHE=0)");
+  }
   memset(g_dev.r4300.new_dynarec_hot_state.mini_ht,-1,sizeof(g_dev.r4300.new_dynarec_hot_state.mini_ht));
   memset(restore_candidate,0,sizeof(restore_candidate));
   copy_size=0;
@@ -12396,9 +12437,11 @@ static int new_recompile_block_impl(int addr)
           // ones that actually get used in check_addr().
           struct ll_entry **ht_bin=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
           if(ht_bin[0]&&ht_bin[0]->vaddr==vaddr) {
+            jc_bump();
             ht_bin[0]=head;
           }
           if(ht_bin[1]&&ht_bin[1]->vaddr==vaddr) {
+            jc_bump();
             ht_bin[1]=head;
           }
         }
@@ -12489,11 +12532,13 @@ static int new_recompile_block_impl(int addr)
           if(ht_bin[1]&&((((uintptr_t)ht_bin[1]->addr-(uintptr_t)base_addr)>>shift)==((base-(uintptr_t)base_addr)>>shift) ||
              (((uintptr_t)ht_bin[1]->addr-(uintptr_t)base_addr-MAX_OUTPUT_BLOCK_SIZE)>>shift)==((base-(uintptr_t)base_addr)>>shift))) {
             inv_debug("EXP: Remove hash %x -> %x\n",ht_bin[1]->vaddr,ht_bin[1]->addr);
+            jc_bump();
             ht_bin[1]=NULL;
           }
           if(ht_bin[0]&&((((uintptr_t)ht_bin[0]->addr-(uintptr_t)base_addr)>>shift)==((base-(uintptr_t)base_addr)>>shift) ||
              (((uintptr_t)ht_bin[0]->addr-(uintptr_t)base_addr-MAX_OUTPUT_BLOCK_SIZE)>>shift)==((base-(uintptr_t)base_addr)>>shift))) {
             inv_debug("EXP: Remove hash %x -> %x\n",ht_bin[0]->vaddr,ht_bin[0]->addr);
+            jc_bump();
             ht_bin[0]=ht_bin[1];
             ht_bin[1]=NULL;
           }
