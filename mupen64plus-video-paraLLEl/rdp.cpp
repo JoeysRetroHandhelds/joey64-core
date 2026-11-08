@@ -1439,10 +1439,12 @@ static const unsigned cmd_len_lut[64] = {
 // syncs and drawing into other images such as render-to-texture still are), and its scanout is not made, so the picture
 // before it stays on screen. A frame starts at a SET_COLOR_IMAGE into one of the VI's last four origins (within 64 KB)
 // other than the one being drawn. A speed setting, not exact: a game that reads back or draws on top of last frame's
-// picture sees an old one.
+// picture sees an old one. N64_FRAMESKIP=2 is automatic: a frame is skipped only when it starts while the frontend's
+// audio buffer is at a third of its target or less (it is falling behind), never two in a row.
 namespace FSkip
 {
-static bool enabled;
+static bool enabled, automatic;
+static std::atomic<bool> behind{false};
 static uint32_t shown[4]; // the VI's last origins
 static unsigned shown_next;
 static uint32_t drawing;
@@ -1467,7 +1469,7 @@ static void color_image(uint32_t addr)
 		return; // textures drawn in between don't start a frame
 	drawing = addr;
 	frames++;
-	skipping = (frames & 1) != 0;
+	skipping = automatic ? behind.load(std::memory_order_relaxed) && !skipping : (frames & 1) != 0;
 	int slot = 0;
 	for (int i = 0; i < 4; i++)
 		if (buffer[i] == addr || !buffer[i])
@@ -1523,7 +1525,9 @@ static bool skip_scanout(uint32_t origin)
 static void init()
 {
 	const char *e = getenv("N64_FRAMESKIP");
-	enabled = e && e[0] == '1';
+	enabled = e && (e[0] == '1' || e[0] == '2');
+	automatic = e && e[0] == '2';
+	behind = false;
 	memset(shown, 0, sizeof(shown));
 	memset(buffer, 0, sizeof(buffer));
 	memset(skipped, 0, sizeof(skipped));
@@ -1533,7 +1537,9 @@ static void init()
 	frames = 0;
 	dropped = scanouts_skipped = scanouts = 0;
 	if (enabled)
-		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip on: every other frame into a shown buffer is left undrawn.\n");
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip on: %s.\n", automatic ?
+		       "automatic, a frame into a shown buffer is left undrawn while audio runs low (never two in a row)" :
+		       "every other frame into a shown buffer is left undrawn");
 }
 }
 
@@ -3660,3 +3666,8 @@ extern "C" __attribute__((visibility("default"))) void joey64_vi_trim(int *out)
 	for (int i = 0; i < 4; i++)
 		out[i] = RDP::joey_vi_trim[i].load();
 }
+void parallel_audio_buffer_status(bool active, unsigned occupancy, bool underrun_likely)
+{
+	RDP::FSkip::behind.store(active && (occupancy <= 33 || underrun_likely), std::memory_order_relaxed);
+}
+

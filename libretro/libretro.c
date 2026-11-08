@@ -101,6 +101,12 @@ extern struct rgba prescale[PRESCALE_WIDTH * PRESCALE_HEIGHT];
 
 static struct retro_hw_render_callback hw_render;
 static struct retro_hw_render_context_negotiation_interface_vulkan hw_context_negotiation;
+
+// Joey64: the frontend's audio buffer status goes to parallel-RDP's automatic frame skip (N64_FRAMESKIP=2).
+static void joey_audio_buffer_status(bool active, unsigned occupancy, bool underrun_likely)
+{
+    parallel_audio_buffer_status(active, occupancy, underrun_likely);
+}
 #endif
 
 struct retro_perf_callback perf_cb;
@@ -2001,6 +2007,13 @@ bool retro_load_game(const struct retro_game_info *game)
 {
     char* gamePath;
     char* newPath;
+
+#if defined(HAVE_PARALLEL_RDP)
+    {
+        struct retro_audio_buffer_status_callback abs = { joey_audio_buffer_status };
+        environ_cb(RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK, &abs);
+    }
+#endif
 
     // Workaround for broken subsystem on static platforms
     // Note: game->path can be NULL if loading from a archive
