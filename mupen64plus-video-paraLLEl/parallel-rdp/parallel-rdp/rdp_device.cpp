@@ -160,6 +160,12 @@ CommandProcessor::CommandProcessor(Vulkan::Device &device_, void *rdram_ptr,
 #endif
 				this, 4 * 1024);
 	}
+	// The app turns lazy waking off on non-Adreno GPUs (N64_RDP_RING_LAZY=0); log what this run got.
+	if (const char *env = getenv("N64_RDP_RING_LAZY"))
+		LOGI("Command ring: lazy waking %s (N64_RDP_RING_LAZY=%s)%s.\n", env[0] == '0' ? "off" : "on", env,
+		     single_threaded_processing ? ", unused: single threaded" : "");
+	else
+		LOGI("Command ring: lazy waking on (default)%s.\n", single_threaded_processing ? ", unused: single threaded" : "");
 
 	if (const char *env = getenv("PARALLEL_RDP_BENCH"))
 		timestamp = strtol(env, nullptr, 0) > 0;
