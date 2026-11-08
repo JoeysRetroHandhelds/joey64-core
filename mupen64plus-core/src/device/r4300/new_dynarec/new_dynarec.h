@@ -98,5 +98,7 @@ int new_dynarec_jc_live(void);
 void new_dynarec_init(void);
 void new_dyna_start(void);
 void new_dynarec_cleanup(void);
+/* Joey64: N64_DRC_LIST's block list, once a frame (arm64, with the compile thread) */
+void new_dynarec_blocklist_tick(void);
 
 #endif /* M64P_DEVICE_R4300_NEW_DYNAREC_H */

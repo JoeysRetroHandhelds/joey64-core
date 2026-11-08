@@ -31,6 +31,9 @@
 #include "device/rcp/mi/mi_controller.h"
 #include "main/main.h"
 #include "plugin/plugin.h"
+#if defined(NEW_DYNAREC) && NEW_DYNAREC == 4 /* NEW_DYNAREC_ARM64, defined in this header */
+#include "device/r4300/new_dynarec/new_dynarec.h"
+#endif
 #include <mupen64plus-next_common.h>
 
 unsigned int vi_clock_from_tv_standard(m64p_system_type tv_standard)
@@ -233,6 +236,11 @@ void vi_vertical_interrupt_event(void* opaque)
 
     /* toggle vi field if in interlaced mode */
     vi->field ^= (vi->regs[VI_STATUS_REG] >> 6) & 0x1;
+
+#if defined(NEW_DYNAREC) && NEW_DYNAREC == NEW_DYNAREC_ARM64
+    /* Joey64: the recompiler's block list (N64_DRC_LIST), once a frame */
+    if (vi->mi->r4300->emumode == EMUMODE_DYNAREC) new_dynarec_blocklist_tick();
+#endif
 
     /* schedule next vertical interrupt */
     if(CountPerScanlineOverride) {

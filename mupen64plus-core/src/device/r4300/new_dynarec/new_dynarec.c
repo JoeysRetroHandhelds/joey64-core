@@ -3024,6 +3024,129 @@ static int drc_thread_cold(u_int vaddr)
   return 1;
 }
 
+/* Joey64 (README order item 17 a, 2026-11-08): the game's block list. N64_DRC_LIST=<file> (with the compile thread):
+ * every block compiled in RDRAM is noted as its address, length and a checksum of its code, and the file is written
+ * every 10 s and at the end; at the next start of the game the listed blocks go to the compile thread's queue as soon
+ * as their code is in RAM with the same checksum (after its DMA, so while it loads instead of when it first runs).
+ * Only addresses are kept, never compiled code; a block whose code differs (another overlay there) waits. */
+#define BLK_MAX 32768
+#define BLK_HASH 65536
+struct blk_ent { u_int vaddr, len, sum; u_char done; };
+static struct blk_ent *blk_tab;
+static u_int *blk_hash;
+static int blk_n, blk_on = -1, blk_rr;
+static char blk_path[512];
+static double blk_last_poll, blk_last_save;
+static unsigned blk_loaded, blk_queued, blk_saves;
+
+static u_int blk_sum(const u_int *p, u_int len)
+{
+  u_int h = 2166136261u, i;
+  for (i = 0; i < len / 4; i++) { h ^= p[i]; h *= 16777619u; }
+  return h;
+}
+
+static int blk_find(u_int vaddr, u_int sum, int add, u_int len, u_char done)
+{
+  u_int i = ((vaddr >> 2) * 2654435761u ^ sum) & (BLK_HASH - 1);
+  for (;;) {
+    u_int k = blk_hash[i];
+    if (!k) break;
+    if (blk_tab[k - 1].vaddr == vaddr && blk_tab[k - 1].sum == sum) return k - 1;
+    i = (i + 1) & (BLK_HASH - 1);
+  }
+  if (!add || blk_n >= BLK_MAX) return -1;
+  blk_tab[blk_n].vaddr = vaddr; blk_tab[blk_n].len = len; blk_tab[blk_n].sum = sum; blk_tab[blk_n].done = done;
+  blk_hash[i] = (u_int)++blk_n;
+  return blk_n - 1;
+}
+
+static void blk_init(void)
+{
+  const char *e = getenv("N64_DRC_LIST");
+  blk_on = 0;
+  if (!e || !*e || drc_thread_on() <= 0) return;
+  blk_tab = (struct blk_ent *)calloc(BLK_MAX, sizeof(*blk_tab));
+  blk_hash = (u_int *)calloc(BLK_HASH, sizeof(*blk_hash));
+  if (!blk_tab || !blk_hash) { free(blk_tab); free(blk_hash); blk_tab = NULL; blk_hash = NULL; return; }
+  snprintf(blk_path, sizeof(blk_path), "%s", e);
+  blk_n = blk_rr = 0; blk_loaded = blk_queued = blk_saves = 0;
+  FILE *f = fopen(blk_path, "r");
+  if (f) {
+    u_int a, l, s;
+    while (fscanf(f, "%x %x %x", &a, &l, &s) == 3)
+      if (drc_in_rdram(a) && l >= 4 && l <= MAXBLOCK * 4 && blk_find(a, s, 1, l, 0) >= 0) blk_loaded++;
+    fclose(f);
+  }
+  blk_last_poll = blk_last_save = drc_ms();
+  blk_on = 1;
+  DebugMessage(M64MSG_INFO, "dynarec: block list %s: %u blocks to compile early when their code is in RAM", blk_path, blk_loaded);
+}
+
+/* Notes every block now compiled in RDRAM (its start entry) that the list doesn't have yet. */
+static void blk_collect(void)
+{
+  int page;
+  for (page = 0; page < 4096; page++) {
+    struct ll_entry *h;
+    for (h = jump_in[page]; h; h = h->next) {
+      if (h->vaddr != h->start || !drc_in_rdram(h->vaddr) || !h->copy || h->length < 4 || h->length > MAXBLOCK * 4) continue;
+      blk_find(h->vaddr, blk_sum((const u_int *)h->copy, h->length), 1, h->length, 1);
+    }
+  }
+}
+
+static void blk_save(void)
+{
+  char tmp[520];
+  int i;
+  snprintf(tmp, sizeof(tmp), "%s.part", blk_path);
+  FILE *f = fopen(tmp, "w");
+  if (!f) return;
+  for (i = 0; i < blk_n; i++) fprintf(f, "%x %x %x\n", blk_tab[i].vaddr, blk_tab[i].len, blk_tab[i].sum);
+  if (fclose(f) == 0 && rename(tmp, blk_path) == 0) blk_saves++;
+}
+
+/* Once a frame (VI interrupt, between blocks): up to 512 listed blocks checked against RAM, the matching ones queued. */
+void new_dynarec_blocklist_tick(void)
+{
+  if (blk_on < 0) blk_init();
+  if (blk_on <= 0) return;
+  double now = drc_ms();
+  if (now - blk_last_save > 10000) {
+    blk_collect(); blk_save(); blk_last_save = now;
+    DebugMessage(M64MSG_INFO, "dynarec: block list: %d blocks known (%u from the file), %u queued early so far", blk_n, blk_loaded, blk_queued);
+  }
+  int checked, queued = 0;
+  for (checked = 0; checked < 512 && blk_n > 0 && queued < 64; checked++) {
+    struct blk_ent *b = &blk_tab[blk_rr];
+    blk_rr = (blk_rr + 1) % blk_n;
+    if (b->done) continue;
+    u_int off = b->vaddr & 0x7FFFFF;
+    if (off + b->len > 0x800000) { b->done = 1; continue; }
+    if (blk_sum((const u_int *)((uintptr_t)g_dev.rdram.dram + off), b->len) != b->sum) continue;
+    unsigned char *q = &drc_queued[((b->vaddr >> 2) ^ (b->vaddr >> 18)) & 0xFFFF];
+    if (*q) continue;
+    if (((drc_qt + 1) & 4095) == drc_qh) break; /* queue full: next frame */
+    drc_queue[drc_qt] = b->vaddr;
+    drc_qt = (drc_qt + 1) & 4095;
+    *q = 1;
+    b->done = 1;
+    queued++; blk_queued++;
+  }
+  if (queued) drc_service();
+}
+
+static void blk_end(void)
+{
+  if (blk_on > 0) {
+    blk_collect(); blk_save();
+    DebugMessage(M64MSG_INFO, "dynarec: block list: %d blocks saved to %s, %u were queued early", blk_n, blk_path, blk_queued);
+  }
+  free(blk_tab); free(blk_hash); blk_tab = NULL; blk_hash = NULL; blk_n = 0;
+  blk_on = -1;
+}
+
 /* A compile the emulation thread waits for. Once drc_finish_locked(1) returns the worker is idle and starts
  * nothing until we give it a job under drc_mx, so the compiler is ours: compile here, no hand-off (Conker, whose
  * code is TLB-mapped and so always compiles this way, spent ~20 us per block on the round trip, -33% on the Duo). */
@@ -9338,6 +9461,7 @@ void new_dynarec_cleanup(void)
 {
 #if NEW_DYNAREC == NEW_DYNAREC_ARM64
   drc_drain();
+  blk_end(); /* Joey64: the block list, before the blocks go */
 #endif
 #if defined(RECOMPILER_DEBUG) && !defined(RECOMP_DBG)
   recomp_dbg_cleanup();
