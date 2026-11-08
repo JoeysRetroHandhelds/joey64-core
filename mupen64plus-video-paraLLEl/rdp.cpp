@@ -65,6 +65,12 @@ static QueryPoolHandle begin_ts, end_ts;
 static string pipeline_cache_path;
 static std::atomic<size_t> pipeline_cache_saved_size;
 static unsigned frames_since_cache_check;
+// Save only when the game created pipelines since the last save, and space saves out (10 s, doubling to 80 s at
+// 60 fps) as a game keeps adding a few (Goemon adds ~10 per 10 s standing still); shutdown always saves. Each save
+// reads the whole driver cache (~230 ms of a core on the Flip at 19-22 MB). N64_RDP_CACHE_EVERY=1 checks every
+// 600 frames as before.
+static unsigned cache_check_interval = 600;
+static size_t pipelines_at_last_save;
 // The periodic save runs on its own thread (Joey64, 2026-11-08): on the Flip's Mali the cache is 18-20 MB in Goemon
 // and grows ~160 KB every 10 s, and reading it out of the driver and writing it stalled the emulation thread
 // ~120 ms each time (one dropped burst every 600 frames). Vulkan pipeline caches are internally synchronized
@@ -266,13 +272,15 @@ static void load_pipeline_cache()
 	device->init_pipeline_cache(data.empty() ? nullptr : data.data(), data.size());
 	pipeline_cache_saved_size = data.size();
 	frames_since_cache_check = 0;
+	cache_check_interval = 600;
+	pipelines_at_last_save = 0;
 	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: pipeline cache %u bytes from %s.\n",
 	       unsigned(data.size()), pipeline_cache_path.c_str());
 	load_pipeline_list();
 }
 
 // Reads the driver's cache and writes it when it changed; on the saver thread or, at shutdown, the caller's.
-static void write_pipeline_cache(Device *dev, const string &path)
+static void write_pipeline_cache(Device *dev, const string &path, size_t built)
 {
 	auto start = std::chrono::steady_clock::now();
 	size_t size = dev->get_pipeline_cache_size();
@@ -292,7 +300,8 @@ static void write_pipeline_cache(Device *dev, const string &path)
 	{
 		pipeline_cache_saved_size = size;
 		double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: saved pipeline cache, %u bytes, %.0f ms.\n", unsigned(size), ms);
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: saved pipeline cache, %u bytes, %.0f ms (%u pipelines compiled this run).\n",
+		       unsigned(size), ms, unsigned(built));
 	}
 	else
 		remove(tmp.c_str());
@@ -305,28 +314,31 @@ static void wait_pipeline_cache_saver()
 }
 
 // background: the periodic save (skipped while the last one still runs); else at shutdown, on this thread.
-static void save_pipeline_cache(bool background = false)
+// Returns false when a background save was skipped.
+static bool save_pipeline_cache(bool background = false)
 {
 	save_pipeline_list();
 	if (pipeline_cache_path.empty() || !device)
-		return;
+		return true;
 	static const bool sync = getenv("N64_RDP_CACHE_SYNC") && *getenv("N64_RDP_CACHE_SYNC") == '1';
 	if (!background || sync)
 	{
 		wait_pipeline_cache_saver();
-		write_pipeline_cache(device.get(), pipeline_cache_path);
-		return;
+		write_pipeline_cache(device.get(), pipeline_cache_path, device->get_pipeline_records().size());
+		return true;
 	}
 	if (pipeline_cache_saving)
-		return;
+		return false;
 	wait_pipeline_cache_saver();
 	pipeline_cache_saving = true;
 	Device *dev = device.get();
 	string path = pipeline_cache_path;
-	pipeline_cache_saver = std::thread([dev, path]() {
-		write_pipeline_cache(dev, path);
+	size_t built = device->get_pipeline_records().size();
+	pipeline_cache_saver = std::thread([dev, path, built]() {
+		write_pipeline_cache(dev, path, built);
 		pipeline_cache_saving = false;
 	});
+	return true;
 }
 
 static vector<retro_vulkan_image> retro_images;
@@ -2471,11 +2483,18 @@ void complete_frame()
 	if (TexKeys::enabled)
 		TexKeys::on_frame();
 
-	// New pipelines show up as the game reaches new effects; check every ~10 s.
-	if (++frames_since_cache_check >= 600)
+	// New pipelines show up as the game reaches new effects; check every ~10 s, save only when there are new ones.
+	if (++frames_since_cache_check >= cache_check_interval)
 	{
 		frames_since_cache_check = 0;
-		save_pipeline_cache(true);
+		static const bool every = getenv("N64_RDP_CACHE_EVERY") && *getenv("N64_RDP_CACHE_EVERY") == '1';
+		size_t built = device->get_pipelines_built();
+		if ((every || built != pipelines_at_last_save) && save_pipeline_cache(true))
+		{
+			pipelines_at_last_save = built;
+			if (!every && cache_check_interval < 4800)
+				cache_check_interval *= 2;
+		}
 	}
 
 	// PARALLEL_RDP_BENCH=1|2: GPU/CPU time per frame for each timestamp tag, every 300 frames

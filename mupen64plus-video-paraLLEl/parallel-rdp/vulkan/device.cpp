@@ -830,9 +830,22 @@ void Device::record_pipeline(const DeferredPipelineCompile &compile)
 	               (uint32_t(compile.potential_static_state.internal_spec_constant_mask) << 8);
 	r.subgroup_size_tag = compile.subgroup_size_tag;
 
+	pipelines_built.fetch_add(1, std::memory_order_relaxed);
 	std::lock_guard<std::mutex> holder{pipeline_records_lock};
 	if (pipeline_records.size() < 4096)
 		pipeline_records.push_back(r);
+
+	// Joey64 dev: N64_RDP_PIPE_LOG=1 logs each new pipeline (what makes it new: program, spec constants)
+	static const bool pipe_log = getenv("N64_RDP_PIPE_LOG") && *getenv("N64_RDP_PIPE_LOG") == '1';
+	if (pipe_log)
+	{
+		char buf[512];
+		int n = snprintf(buf, sizeof(buf), "new pipeline %zu: program %016llx masks %08x spec", pipeline_records.size(),
+		                 (unsigned long long)r.program_hash, r.spec_masks);
+		for (unsigned i = 0; i < VULKAN_NUM_TOTAL_SPEC_CONSTANTS && n > 0 && n < int(sizeof(buf)) - 12; i++)
+			n += snprintf(buf + n, sizeof(buf) - n, " %08x", r.spec_constants[i]);
+		LOGE("%s\n", buf);
+	}
 }
 
 std::vector<PipelineRecord> Device::get_pipeline_records()

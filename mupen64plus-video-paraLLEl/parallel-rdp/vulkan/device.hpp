@@ -263,6 +263,8 @@ public:
 	// no longer hash the same.
 	void record_pipeline(const DeferredPipelineCompile &compile);
 	std::vector<PipelineRecord> get_pipeline_records();
+	// Joey64: pipelines created this run (keeps counting past the record list's cap).
+	size_t get_pipelines_built() const { return pipelines_built.load(std::memory_order_relaxed); }
 	bool resolve_pipeline_record(const PipelineRecord &record, DeferredPipelineCompile &compile);
 
 	// Frame-pushing interface.
@@ -762,6 +764,7 @@ private:
 	VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
 	std::mutex pipeline_records_lock;
 	std::vector<PipelineRecord> pipeline_records;
+	std::atomic<size_t> pipelines_built{0};
 
 	void init_pipeline_cache();
 	void flush_pipeline_cache();
