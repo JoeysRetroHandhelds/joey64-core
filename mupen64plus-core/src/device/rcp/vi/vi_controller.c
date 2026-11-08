@@ -242,8 +242,13 @@ void vi_vertical_interrupt_event(void* opaque)
             vi->delay = (vi->regs[VI_V_SYNC_REG] + 1) * vi->count_per_scanline;
     }
 
+    /* Remove this VI event by its type, not as the queue head: the scanout event added above sorts in front of it when
+     * its delay is 0 (V_START <= V_INTR, as the 64DD IPL leaves the VI), and removing the head then dropped the scanout,
+     * kept this VI and added a second one, for good: the game took one VI interrupt in four ("two events of type 0x1";
+     * 64DD games at a quarter speed with a quarter of their audio). add_interrupt_event_count resets the next-interrupt
+     * count from the head. */
     uint32_t next_vi = *get_event(&vi->mi->r4300->cp0.q, VI_INT) + vi->delay;
-    remove_interrupt_event(&vi->mi->r4300->cp0);
+    remove_event(&vi->mi->r4300->cp0.q, VI_INT);
     add_interrupt_event_count(&vi->mi->r4300->cp0, VI_INT, next_vi);
 
     /* trigger interrupt */
