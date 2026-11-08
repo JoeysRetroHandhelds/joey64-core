@@ -1,6 +1,10 @@
 #include "rdp.hpp"
 #include <chrono>
 #include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include "joey/texpack_ghq.h"
 #include "timeline_trace_file.hpp"
 #include "Gfx #1.3.h"
 #include "parallel.h"
@@ -10,11 +14,14 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string>
+#include <unordered_map>
+#include <map>
 #include <string.h>
 #include <signal.h>
 #include <dlfcn.h>
 #include <ucontext.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <semaphore.h>
 #include <pthread.h>
@@ -845,6 +852,1218 @@ static bool same_as_last()
 }
 }
 
+// Texture pack keys, measurement only (env N64_RDP_TEXKEYS=<file>; master list item 35, step A). Off: nothing runs.
+// Computes, for every textured draw, the key GLideN64 would look a texture pack up with (TextureCache::update ->
+// _calcTileSizes -> _loadHiresTexture, GLideN64/src/Textures.cpp; state from gDPSetTextureImage, gDPSetTile,
+// gDPSetTileSize, gDPLoadTile, gDPLoadBlock, gDPLoadTLUT in gDP.cpp, decoded as RDP.cpp does), hashed with GLideNHQ's
+// Rice CRC (TxUtil::checksum64, copied). Nothing is rendered differently. Every 60 frames the key counts go to the
+// file; the pack lookup happens on the PC (tools/htsindex.py), so the pack never has to be on the device.
+// GLideN64 code: GPLv2-or-later (Joey64 is GPL-3.0-or-later).
+// Texture packs (env N64_RDP_TEXPACK=<folder>; master list item 35, step B). The folder holds a GLideN64 pack for this
+// ROM (<ROM name>_HIRESTEXTURES.hts, or a PNG pack folder named after the ROM); GLideNHQ reads it (joey/texpack_ghq).
+// TexKeys computes GLideN64's key at each textured draw; the first time a key is seen, a worker thread looks it up,
+// decodes it to RGBA8 and writes it into the renderer's replacement buffer (N64_RDP_TEXPACK_MB, default 256, capped at
+// the GPU's storage buffer range). Until it is there the draw keeps the N64 texture (as Dolphin, PCSX2, PPSSPP and Azahar
+// do with async loading), so loading never stalls a frame. Draws whose texture has a replacement get it through
+// CommandProcessor::set_tile_replace, queued just before the draw; the TEXPACK shaders sample it in place of TMEM.
+// The buffer is a ring: when it is full, the worker evicts the replacements in its way that no draw has used for a
+// while (first 10 s, then down to 8 frames, past what the GPU can still have in flight) and skips the ones in use; an
+// evicted replacement loads again the next time a draw wants it. Where the driver allows it the replacements go into a
+// 2D image instead (CommandProcessor::enable_texpack), sampled with one hardware bilinear read: placed on shelves (rows
+// of one height class, 2^k + 2 for the 1-texel wrap gutter around each), each shelf its own eviction ring. Without this a whole pack (Mario Kart 64 Reloaded:
+// 217 MB in 40 s) fills the buffer and new textures stop being replaced; 256 MB is also the Mali-G52's limit.
+// Off: nothing runs and the stock shaders are used.
+namespace TexPack
+{
+static bool enabled;
+static uint32_t *texels;
+static size_t capacity; // texels
+static RDP::CommandProcessor::TexpackImage image; // width 0: the buffer path
+static std::string dir, rom;
+
+struct Key
+{
+	uint64_t crc;
+	uint16_t fmt, siz;
+	bool operator==(const Key &o) const { return crc == o.crc && fmt == o.fmt && siz == o.siz; }
+};
+// state: 0 queued, 1 ready, 2 none (not in the pack, or too big), 3 being evicted (worker), 4 evicted or found no room
+// (a draw from frame retry_at on queues it again). last_used: the frame of the last draw that wanted it. Eviction and
+// use meet as in Dekker's algorithm (both sequentially consistent): a draw stores last_used, then reads state; the
+// worker moves state 1 -> 3, then reads last_used and backs out if it is recent. So either the draw sees 3 and keeps
+// the N64 texture, or the worker sees the draw and leaves the replacement alone.
+struct Entry
+{
+	std::atomic<int> state{0};
+	std::atomic<uint32_t> last_used{0};
+	std::atomic<uint32_t> retry_at{0};
+	uint32_t offset = 0, size = 0; // offset: texels into the buffer, or x | y << 14 of the first texel in the image
+	uint32_t span = 0;             // worker only: length in its ring (texels, or the image slot's width)
+	bool mips = false;             // the image holds its mip chain (written before state 1)
+	Key key{};
+};
+struct KeyHash
+{
+	size_t operator()(const Key &k) const { return size_t(k.crc * 0x9E3779B97F4A7C15ull) ^ (size_t(k.fmt) << 3) ^ k.siz; }
+};
+static std::unordered_map<Key, Entry, KeyHash> entries; // render thread only (pointers stay valid)
+
+static std::thread worker;
+static std::mutex lock;
+static std::condition_variable wake;
+static std::vector<std::pair<Key, Entry *>> queue;
+static bool stopping;
+static std::atomic<unsigned> loaded_count, loaded_kb, failed_count, evicted_count;
+static bool full_logged;
+static std::atomic<uint32_t> frame_no{1}; // render thread counts frames, the worker reads them
+// Worker only. A ring of positions [0, len): the buffer, or one image shelf (x positions).
+struct Ring
+{
+	size_t len = 0, cursor = 0;
+	std::map<uint32_t, Entry *> resident; // ready replacements by position
+};
+struct Shelf
+{
+	uint32_t y, height;
+	Ring ring;
+};
+static Ring buffer_ring;
+static std::vector<Shelf> shelves; // image path
+static uint32_t shelves_end;       // image rows below this belong to a shelf
+static const uint32_t NEVER = UINT32_MAX;
+
+static size_t texels_of(const Entry *e) { return size_t(e->size & 0xffffu) * (e->size >> 16); }
+
+// Worker: take e out of the buffer unless a draw used it in the last `hot` frames (NEVER: leave everything).
+static bool try_evict(Entry *e, uint32_t hot)
+{
+	if (frame_no.load() - e->last_used.load() < hot)
+		return false; // recent: not even the brief state 3, which would make a draw skip it
+	int one = 1;
+	if (!e->state.compare_exchange_strong(one, 3))
+		return false;
+	if (frame_no.load() - e->last_used.load() < hot)
+	{
+		e->state.store(1);
+		return false;
+	}
+	loaded_kb -= unsigned(texels_of(e) * 4 / 1024);
+	evicted_count++;
+	e->state.store(4);
+	return true;
+}
+
+// Worker: room for n in ring r from its cursor on, evicting what is in the way and was not used in the last `hot`
+// frames. Returns the position or SIZE_MAX after a full lap.
+static size_t ring_place(Ring &r, size_t n, uint32_t hot)
+{
+	if (n > r.len)
+		return SIZE_MAX;
+	size_t travelled = 0;
+	while (travelled <= r.len + n)
+	{
+		if (r.cursor + n > r.len)
+		{
+			travelled += r.len - r.cursor;
+			r.cursor = 0;
+		}
+		const size_t end = r.cursor + n;
+		// replacements overlapping [cursor, end): the one starting before cursor, then those starting inside
+		auto it = r.resident.upper_bound(uint32_t(r.cursor));
+		if (it != r.resident.begin())
+		{
+			auto prev = std::prev(it);
+			if (prev->first + prev->second->span > r.cursor)
+				it = prev;
+		}
+		bool blocked = false;
+		while (it != r.resident.end() && it->first < end)
+		{
+			Entry *e = it->second;
+			if (!try_evict(e, hot))
+			{
+				const size_t past = it->first + e->span;
+				travelled += past - r.cursor;
+				r.cursor = past;
+				blocked = true;
+				break;
+			}
+			it = r.resident.erase(it);
+		}
+		if (blocked)
+			continue;
+		const size_t at = r.cursor;
+		r.cursor = end;
+		return at;
+	}
+	return SIZE_MAX;
+}
+
+// Worker, buffer path: n texels. Returns the offset or SIZE_MAX.
+static size_t place(size_t n)
+{
+	for (uint32_t hot : { 600u, 120u, 8u })
+	{
+		const size_t at = ring_place(buffer_ring, n, hot);
+		if (at != SIZE_MAX)
+			return at;
+	}
+	return SIZE_MAX;
+}
+
+// Worker, image path: a slot of sw x sh texels (replacement plus gutter). Free room on a shelf of its height class
+// first, then a new shelf, then eviction on shelves of its class and then taller ones. Returns the shelf or -1.
+static int place2d(uint32_t sw, uint32_t sh, uint32_t &x)
+{
+	uint32_t cls = 18;
+	while (cls < sh)
+		cls = (cls - 2) * 2 + 2;
+	if (cls > image.height || sw > image.width)
+		return -1;
+	for (size_t i = 0; i < shelves.size(); i++)
+		if (shelves[i].height == cls)
+		{
+			const size_t at = ring_place(shelves[i].ring, sw, NEVER);
+			if (at != SIZE_MAX)
+				return x = uint32_t(at), int(i);
+		}
+	if (shelves_end + cls <= image.height)
+	{
+		Shelf sh_new;
+		sh_new.y = shelves_end;
+		sh_new.height = cls;
+		sh_new.ring.len = image.width;
+		shelves.push_back(std::move(sh_new));
+		shelves_end += cls;
+		const size_t at = ring_place(shelves.back().ring, sw, NEVER);
+		if (at != SIZE_MAX)
+			return x = uint32_t(at), int(shelves.size() - 1);
+	}
+	for (uint32_t hot : { 600u, 120u, 8u })
+		for (uint32_t c = cls; c <= 4098; c = (c - 2) * 2 + 2)
+			for (size_t i = 0; i < shelves.size(); i++)
+				if (shelves[i].height == c)
+				{
+					const size_t at = ring_place(shelves[i].ring, sw, hot);
+					if (at != SIZE_MAX)
+						return x = uint32_t(at), int(i);
+				}
+	return -1;
+}
+
+// Worker, image path: writes the w x h replacement with its first texel at (ox, oy) and the 1-texel gutter around it
+// (the texels a repeating texture has there), then flushes those rows.
+static void write2d(const uint32_t *src, uint32_t w, uint32_t h, uint32_t ox, uint32_t oy)
+{
+	uint8_t *base = reinterpret_cast<uint8_t *>(texels);
+	for (int y = -1; y <= int(h); y++)
+	{
+		const uint32_t *srow = src + size_t((y + int(h)) % int(h)) * w;
+		uint32_t *row = reinterpret_cast<uint32_t *>(base + size_t(int(oy) + y) * image.row_pitch) + ox;
+		row[-1] = srow[w - 1];
+		memcpy(row, srow, size_t(w) * 4);
+		row[w] = srow[0];
+	}
+	const size_t first = size_t(oy - 1) * image.row_pitch;
+	frontend->texpack_flush(first, size_t(h + 2) * image.row_pitch);
+}
+
+// Mip levels on the image path (N64_RDP_TEXPACK_MIPS=0 turns them off): level l is max(1, w >> l) x max(1, h >> l),
+// down to 1 x 1, each with its gutter, left to right after the replacement on its shelf (texpack_level in texture.h).
+// Each texel of a level averages the 2 x 2 below it (clamped at an odd edge), colour weighted by alpha so cut-out
+// edges don't darken. Only replacements up to 2048 wide get them (the chain is about twice as wide).
+static bool mips_on = true;
+static uint32_t mip_levels(uint32_t w, uint32_t h)
+{
+	uint32_t n = 1;
+	while ((w >> n) || (h >> n))
+		n++;
+	return n; // findMSB(max(w, h)) + 1
+}
+static uint32_t mip_chain_width(uint32_t w, uint32_t h)
+{
+	uint32_t sw = 0;
+	for (uint32_t l = 0, n = mip_levels(w, h); l < n; l++)
+		sw += std::max(1u, w >> l) + 2;
+	return sw;
+}
+static void mip_down(const std::vector<uint32_t> &src, uint32_t w, uint32_t h, std::vector<uint32_t> &dst, uint32_t &dw, uint32_t &dh)
+{
+	dw = std::max(1u, w >> 1);
+	dh = std::max(1u, h >> 1);
+	dst.resize(size_t(dw) * dh);
+	for (uint32_t y = 0; y < dh; y++)
+		for (uint32_t x = 0; x < dw; x++)
+		{
+			uint32_t r = 0, g = 0, b = 0, a = 0;
+			for (uint32_t j = 0; j < 2; j++)
+				for (uint32_t i = 0; i < 2; i++)
+				{
+					const uint32_t c = src[size_t(std::min(2 * y + j, h - 1)) * w + std::min(2 * x + i, w - 1)];
+					const uint32_t ca = c >> 24;
+					r += (c & 0xff) * ca;
+					g += ((c >> 8) & 0xff) * ca;
+					b += ((c >> 16) & 0xff) * ca;
+					a += ca;
+				}
+			uint32_t o = 0;
+			if (a)
+				o = ((r + a / 2) / a) | (((g + a / 2) / a) << 8) | (((b + a / 2) / a) << 16);
+			dst[size_t(y) * dw + x] = o | (((a + 2) / 4) << 24);
+		}
+}
+
+// what the renderer was last told per tile (present, offset, size, orig)
+static uint32_t sent[8][4];
+static unsigned frames, hits, pending_draws;
+
+static void run()
+{
+	if (!texpack_ghq_init(dir.c_str(), rom.c_str()))
+		log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture packs: no pack for '%s' in %s.\n", rom.c_str(), dir.c_str());
+	else
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture packs: '%s' from %s.\n", rom.c_str(), dir.c_str());
+	std::vector<uint32_t> img;
+	for (;;)
+	{
+		std::pair<Key, Entry *> job;
+		{
+			std::unique_lock<std::mutex> l(lock);
+			wake.wait(l, [] { return stopping || !queue.empty(); });
+			if (stopping)
+				return;
+			job = queue.back(); // newest first: what is on screen now
+			queue.pop_back();
+		}
+		unsigned w = 0, h = 0;
+		int state = 2;
+		if (texpack_ghq_lookup(job.first.crc, job.first.fmt, job.first.siz, nullptr, img, w, h))
+		{
+			const size_t n = size_t(w) * h;
+			size_t at = SIZE_MAX;
+			uint32_t span = 0;
+			Ring *ring = nullptr;
+			if (w <= 4096 && h <= 4096)
+			{
+				if (image.width)
+				{
+					const bool mips = mips_on && w <= 2048 && h <= 2048 && (w > 1 || h > 1);
+					const uint32_t sw = mips ? mip_chain_width(w, h) : w + 2;
+					uint32_t x = 0;
+					const int s = place2d(sw, h + 2, x);
+					if (s >= 0)
+					{
+						const uint32_t ox = x + 1, oy = shelves[s].y + 1;
+						write2d(img.data(), w, h, ox, oy);
+						if (mips)
+						{
+							std::vector<uint32_t> cur = img, next;
+							uint32_t cw = w, ch = h, lx = ox + w + 2;
+							for (uint32_t l = 1, nl = mip_levels(w, h); l < nl; l++)
+							{
+								uint32_t nw, nh;
+								mip_down(cur, cw, ch, next, nw, nh);
+								write2d(next.data(), nw, nh, lx, oy);
+								lx += nw + 2;
+								cur.swap(next);
+								cw = nw;
+								ch = nh;
+							}
+						}
+						job.second->mips = mips;
+						at = ox | (oy << 14);
+						span = sw;
+						ring = &shelves[s].ring;
+						ring->resident[x] = job.second;
+					}
+				}
+				else if ((at = place(n)) != SIZE_MAX)
+				{
+					memcpy(texels + at, img.data(), n * 4);
+					span = uint32_t(n);
+					ring = &buffer_ring;
+					ring->resident[uint32_t(at)] = job.second;
+				}
+			}
+			if (at == SIZE_MAX)
+			{
+				if (w <= 4096 && h <= 4096 && !full_logged)
+					log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture packs: no room in the replacement buffer (%u MB) "
+					       "for a %ux%u replacement: what is in use fills it; set N64_RDP_TEXPACK_MB higher.\n",
+					       unsigned((capacity * 4) >> 20), w, h);
+				if (w <= 4096 && h <= 4096)
+				{
+					// everything in the buffer is in use: try again in 2 s, when the scene may have moved on
+					full_logged = true;
+					job.second->retry_at.store(frame_no.load() + 120);
+					state = 4;
+				}
+				failed_count++;
+			}
+			else
+			{
+				job.second->offset = uint32_t(at);
+				job.second->size = w | (h << 16);
+				job.second->span = span;
+				state = 1;
+				loaded_count++;
+				loaded_kb += unsigned(n * 4 / 1024);
+			}
+		}
+		// The texels are in the (coherent) buffer before a draw can see state 1, and that draw is submitted after.
+		job.second->state.store(state, std::memory_order_release);
+	}
+}
+
+static void stop()
+{
+	if (worker.joinable())
+	{
+		{
+			std::lock_guard<std::mutex> l(lock);
+			stopping = true;
+		}
+		wake.notify_all();
+		worker.join();
+	}
+	stopping = false;
+	queue.clear();
+	buffer_ring = Ring();
+	shelves.clear();
+	shelves_end = 0;
+	entries.clear(); // offsets are into the renderer's buffer, which goes with it
+	enabled = false;
+	texels = nullptr;
+}
+
+// Whether dir holds a pack for this ROM, named as GLideNHQ looks for it (':' and '/' in the name become '-'): the
+// <name>_HIRESTEXTURES.hts cache or a <name> PNG folder. Without one the switch stays off for this game, so it keeps the
+// stock shaders and skips the key hashing (both cost speed, master list 35).
+static bool pack_exists(const char *d, const char *romname)
+{
+	std::string base = std::string(d) + "/" + romname;
+	for (size_t i = strlen(d) + 1; i < base.size(); i++)
+		if (base[i] == ':' || base[i] == '/')
+			base[i] = '-';
+	struct stat st;
+	if (stat((base + "_HIRESTEXTURES.hts").c_str(), &st) == 0 && S_ISREG(st.st_mode))
+		return true;
+	return stat(base.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void init(const char *romname)
+{
+	stop();
+	const char *d = getenv("N64_RDP_TEXPACK");
+	if (!d || !*d || !frontend)
+		return;
+	if (!pack_exists(d, romname))
+	{
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture packs: no pack for '%s' in %s; off for this game.\n", romname, d);
+		return;
+	}
+	size_t mb = 256;
+	if (const char *e = getenv("N64_RDP_TEXPACK_MB"))
+		mb = strtoul(e, nullptr, 0);
+	{
+		const char *m = getenv("N64_RDP_TEXPACK_MIPS");
+		mips_on = !(m && m[0] == '0');
+		const char *f = getenv("N64_RDP_TEXPACK_FMTSTATS");
+		texpack_ghq_fmtstats(f && f[0] == '1');
+	}
+	size_t bytes = 0;
+	texels = static_cast<uint32_t *>(frontend->enable_texpack(mb << 20, bytes, &image));
+	if (!texels)
+	{
+		log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture packs: could not make the replacement buffer.\n");
+		return;
+	}
+	capacity = std::min(bytes / 4, size_t(1) << 28); // texel offsets are 28 bits in the tile
+	if (image.width)
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture packs: replacement image %ux%u, mip levels %s.\n", image.width,
+		       image.height, mips_on ? "on" : "off");
+	buffer_ring = Ring();
+	buffer_ring.len = capacity;
+	shelves.clear();
+	shelves_end = 0;
+	loaded_count = 0;
+	loaded_kb = 0;
+	failed_count = 0;
+	evicted_count = 0;
+	full_logged = false;
+	memset(sent, 0, sizeof(sent));
+	dir = d;
+	rom = romname;
+	worker = std::thread(run);
+	enabled = true;
+}
+
+// The entry for a key; the first time, queued for the worker.
+static Entry *find(uint64_t crc, uint16_t fmt, uint16_t siz)
+{
+	Key k = { crc, fmt, siz };
+	auto it = entries.find(k);
+	if (it != entries.end())
+		return &it->second;
+	Entry *e = &entries[k];
+	e->key = k;
+	e->last_used.store(frame_no.load(std::memory_order_relaxed), std::memory_order_relaxed);
+	{
+		std::lock_guard<std::mutex> l(lock);
+		queue.emplace_back(k, e);
+	}
+	wake.notify_one();
+	return e;
+}
+
+// Before a textured draw: the draw's tiles get their replacement (when loaded), every other tile none.
+static void apply(const uint32_t *tiles, unsigned count, Entry *const *e, const uint16_t (*orig)[2])
+{
+	uint32_t want[8][4] = {};
+	for (unsigned t = 0; t < count; t++)
+	{
+		if (!e[t])
+			continue;
+		e[t]->last_used.store(frame_no.load(std::memory_order_relaxed)); // before reading state: see Entry
+		int s = e[t]->state.load();
+		if (s == 4 && int32_t(frame_no.load(std::memory_order_relaxed) - e[t]->retry_at.load(std::memory_order_relaxed)) >= 0 &&
+		    e[t]->state.compare_exchange_strong(s, 0))
+		{
+			// evicted earlier: load it again
+			{
+				std::lock_guard<std::mutex> l(lock);
+				queue.emplace_back(e[t]->key, e[t]);
+			}
+			wake.notify_one();
+			s = 0;
+		}
+		if (s == 0)
+			pending_draws++;
+		if (s != 1 || orig[t][0] == 0 || orig[t][1] == 0 || orig[t][0] > 1024 || orig[t][1] > 1024)
+			continue;
+		if (t == 0)
+			hits++;
+		uint32_t *w = want[tiles[t] & 7];
+		w[0] = e[t]->mips ? 3 : 1;
+		w[1] = e[t]->offset;
+		w[2] = e[t]->size;
+		w[3] = orig[t][0] | (uint32_t(orig[t][1]) << 16);
+	}
+	for (unsigned i = 0; i < 8; i++)
+	{
+		if (memcmp(want[i], sent[i], sizeof(want[i])) == 0)
+			continue;
+		frontend->set_tile_replace(i, want[i][0] != 0, want[i][1], want[i][2], want[i][3], (want[i][0] & 2) != 0);
+		memcpy(sent[i], want[i], sizeof(want[i]));
+	}
+}
+
+static void on_frame(unsigned textured)
+{
+	frame_no.fetch_add(1, std::memory_order_relaxed);
+	if (++frames < 600)
+		return;
+	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture packs: %u loaded (%u MB of %u in use), %u failed, %u evicted; last "
+	       "600 frames: %u of %u textured draws replaced, %u waiting.\n", loaded_count.load(), loaded_kb.load() >> 10,
+	       unsigned((capacity * 4) >> 20), failed_count.load(), evicted_count.load(), hits, textured, pending_draws);
+	frames = hits = pending_draws = 0;
+	if (const char *f = getenv("N64_RDP_TEXPACK_FMTSTATS"))
+		if (f[0] == '1')
+		{
+			char line[400];
+			texpack_ghq_fmtstats_line(line, sizeof(line));
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture packs: formats: %s.\n", line);
+		}
+}
+}
+
+namespace TexKeys
+{
+static bool enabled;
+static FILE *out;
+
+// G_IM_SIZ_*, G_IM_FMT_*, LOADTYPE_*
+enum { SIZ_4b = 0, SIZ_8b = 1, SIZ_16b = 2, SIZ_32b = 3 };
+enum { FMT_CI = 2 };
+enum { LOADTYPE_BLOCK = 0, LOADTYPE_TILE = 1 };
+
+struct Tile
+{
+	uint32_t format, size, line, tmem, palette, cmt, cms, maskt, masks, originalMaskT, originalMaskS;
+	uint32_t uls, ult, lrs, lrt, loadType, imageAddress;
+	uint16_t loadWidth, loadHeight;
+	uint32_t clamps() const { return (cms >> 1) & 1; }
+	uint32_t clampt() const { return (cmt >> 1) & 1; }
+};
+struct LoadInfo
+{
+	uint8_t size, loadType;
+	uint16_t uls, ult, lrs, lrt, width, height, texWidth;
+	uint32_t texAddress, dxt, bytes;
+};
+static Tile tiles[8];
+static LoadInfo loadInfo[512];
+static uint16_t palette[512]; // gDP.TexFilterPalette
+static uint32_t timg_format, timg_size, timg_width, timg_address, timg_bpl;
+static uint32_t loadTileIdx;
+static uint32_t textureLUT, cycleType, scissorLry;
+static uint32_t gspTextureTile; // gSP.texture.tile: set by LLE triangles only
+static uint32_t combine_w0, combine_w1;
+static bool hackMK64;
+static uint8_t const *mem;
+static uint32_t memSize;
+
+// colour images drawn this frame and last (framebuffer textures)
+static uint32_t color_addr, color_width, color_size;
+static vector<pair<uint32_t, uint32_t>> drawn_now, drawn_prev;
+
+// Key record: what the PC needs to look it up and to sort the misses.
+struct Rec
+{
+	uint64_t crc;
+	uint16_t fmt, siz, w, h;
+	uint8_t kind, fb;
+	bool operator==(const Rec &o) const
+	{
+		return crc == o.crc && fmt == o.fmt && siz == o.siz && w == o.w && h == o.h && kind == o.kind && fb == o.fb;
+	}
+};
+struct RecHash
+{
+	size_t operator()(const Rec &r) const
+	{
+		return size_t(r.crc * 0x9E3779B97F4A7C15ull) ^ (size_t(r.fmt) << 1) ^ (size_t(r.siz) << 5) ^ (size_t(r.w) << 9) ^
+		       (size_t(r.h) << 20) ^ (size_t(r.kind) << 40) ^ (size_t(r.fb) << 48);
+	}
+};
+static std::unordered_map<Rec, uint32_t, RecHash> counts;
+// key log only: how each key's texture was found (L lines) and why draws got no key (F lines), to compare with GLideN64
+static std::unordered_map<Rec, std::string, RecHash> detail; // kind 0, fb 0
+static std::unordered_map<std::string, uint32_t> fails;
+static unsigned frames, draws_tex, draws_nokey, lookups;
+static uint64_t frame_total;
+
+// cached keys per texture slot until the tile/TMEM state changes (GLideN64 only re-runs update() on CHANGED_TILE /
+// CHANGED_TMEM; _calcTileSizes has side effects on loadInfo, so it must not run more often than GLideN64 runs it)
+static bool dirty = true;
+static bool have[2];
+static Rec cached[2];
+static uint32_t cached_tile[2];
+static TexPack::Entry *cached_entry[2]; // texture packs: the pack entry for cached[t]
+
+// ---- GLideNHQ TxUtil.cpp (C paths) ----
+static uint32_t RiceCRC32(const uint8_t *src, int width, int height, int size, int rowStride)
+{
+	uint32_t crc32Ret = 0;
+	const uint32_t bytesPerLine = width << size >> 1;
+	int y = height - 1;
+	do
+	{
+		uint32_t esi = 0;
+		int x = int(bytesPerLine) - 4;
+		do
+		{
+			memcpy(&esi, src + x, 4);
+			esi ^= uint32_t(x);
+			crc32Ret = (crc32Ret << 4) + ((crc32Ret >> 28) & 15);
+			crc32Ret += esi;
+			x -= 4;
+		} while (x >= 0);
+		esi ^= uint32_t(y);
+		crc32Ret += esi;
+		src += rowStride;
+		--y;
+	} while (y >= 0);
+	return crc32Ret;
+}
+
+static uint8_t CalculateMaxCI8b(const uint8_t *src, uint32_t width, uint32_t height, uint32_t rowStride)
+{
+	uint8_t val = 0;
+	for (uint32_t y = 0; y < height; ++y)
+	{
+		const uint8_t *buf = src + rowStride * y;
+		for (uint32_t x = 0; x < width; ++x)
+		{
+			if (buf[x] > val)
+				val = buf[x];
+			if (val == 0xFF)
+				return 0xFF;
+		}
+	}
+	return val;
+}
+
+static uint8_t CalculateMaxCI4b(const uint8_t *src, uint32_t width, uint32_t height, uint32_t rowStride)
+{
+	uint8_t val = 0;
+	width >>= 1;
+	for (uint32_t y = 0; y < height; ++y)
+	{
+		const uint8_t *buf = src + rowStride * y;
+		for (uint32_t x = 0; x < width; ++x)
+		{
+			uint8_t v1 = buf[x] >> 4, v2 = buf[x] & 0xF;
+			if (v1 > val) val = v1;
+			if (v2 > val) val = v2;
+			if (val == 0xF)
+				return 0xF;
+		}
+	}
+	return val;
+}
+
+static uint64_t checksum64(const uint8_t *src, int width, int height, int size, int rowStride, const uint8_t *pal)
+{
+	uint64_t crc64Ret = 0;
+	if (pal)
+	{
+		uint32_t crc32 = 0, cimax = 0;
+		switch (size & 0xff)
+		{
+		case 1:
+			crc32 = RiceCRC32(src, width, height, 1, rowStride);
+			cimax = CalculateMaxCI8b(src, width, height, rowStride);
+			crc64Ret = uint64_t(RiceCRC32(pal, cimax + 1, 1, 2, 512)) << 32 | crc32;
+			break;
+		case 0:
+			crc32 = RiceCRC32(src, width, height, 0, rowStride);
+			cimax = CalculateMaxCI4b(src, width, height, rowStride);
+			crc64Ret = uint64_t(RiceCRC32(pal, cimax + 1, 1, 2, 32)) << 32 | crc32;
+			break;
+		}
+	}
+	if (!crc64Ret)
+		crc64Ret = RiceCRC32(src, width, height, size, rowStride);
+	return crc64Ret;
+}
+
+// ---- GLideN64 Textures.cpp ----
+static const uint32_t sizeBytes[4] = { 0, 1, 2, 4 };
+static uint32_t CalculateDXT(uint32_t txl2words) { return txl2words == 0 ? 1 : (2048 + txl2words - 1) / txl2words; }
+static uint32_t Txl2Words(uint32_t width, uint32_t size)
+{
+	return size == 0 ? max(1u, width / 16) : max(1u, width * sizeBytes[size] / 8);
+}
+static uint32_t ReverseDXT(uint32_t val, uint32_t lrs, uint32_t width, uint32_t size)
+{
+	(void)lrs;
+	if (val == 0x800) return 1;
+	int low = 2047 / int(val);
+	if (CalculateDXT(uint32_t(low)) > val) low++;
+	int high = 2047 / int(val - 1);
+	if (low == high) return uint32_t(low);
+	for (int i = low; i <= high; i++)
+		if (Txl2Words(width, size) == uint32_t(i))
+			return uint32_t(i);
+	return uint32_t((low + high) / 2);
+}
+// ImageFormat::tlp[textureLUT][size][format].maxTexels
+static uint32_t maxTexels(uint32_t lut, uint32_t size, uint32_t format)
+{
+	if (size >= SIZ_32b) return 1024;
+	if (size == SIZ_16b) return 2048;
+	if (lut == 0) return size == SIZ_4b ? 8192 : 4096;
+	if (format == 1) return size == SIZ_4b ? 8192 : 4096; // YUV
+	return size == SIZ_4b ? 4096 : 2048;
+}
+
+struct TileSizes { uint32_t width, height, clampWidth, clampHeight, bytes; };
+
+static void calcTileSizes(uint32_t ti, TileSizes &s, const uint32_t *rect_words)
+{
+	Tile &t = tiles[ti];
+	Tile &lt = tiles[loadTileIdx];
+	t.masks = t.originalMaskS;
+	t.maskt = t.originalMaskT;
+	uint32_t tileWidth = ((t.lrs - t.uls) & 0x03FF) + 1;
+	uint32_t tileHeight = ((t.lrt - t.ult) & 0x03FF) + 1;
+	const uint32_t tMemMask = textureLUT == 0 ? 0x1FF : 0xFF;
+	LoadInfo &info = loadInfo[t.tmem & tMemMask];
+	if (t.tmem == lt.tmem)
+	{
+		if (lt.loadWidth != 0 && lt.masks == 0)
+			info.width = lt.loadWidth;
+		if (lt.loadHeight != 0 && lt.maskt == 0)
+		{
+			info.height = lt.loadHeight;
+			info.bytes = info.height * (lt.line << 3);
+			if (lt.size == SIZ_32b)
+				info.bytes *= 2;
+		}
+	}
+	lt.loadWidth = lt.loadHeight = 0;
+	s.bytes = info.bytes;
+	if (tileWidth == 1 && tileHeight == 1 && cycleType == 2 && rect_words)
+	{
+		// RDP.w1 / RDP.w0 of the texrect: GLideN64's w0 is the command word, w1 the second word
+		const uint32_t w0 = rect_words[0], w1 = rect_words[1];
+		const uint32_t ulx = (w1 >> 14) & 0x3FF, uly = (w1 >> 2) & 0x3FF;
+		const uint32_t lrx = (w0 >> 14) & 0x3FF, lry = (w0 >> 2) & 0x3FF;
+		tileWidth = lrx - ulx + 1;
+		tileHeight = lry - uly + 1;
+	}
+	uint32_t width = 0, height = 0;
+	if (info.loadType == LOADTYPE_TILE)
+	{
+		width = min<uint32_t>(info.width, info.texWidth);
+		if (width == 0) width = tileWidth;
+		if (info.size > t.size) width <<= info.size - t.size;
+		height = info.height;
+		if (height == 0) height = tileHeight;
+		if (hackMK64 && (height % 2) != 0) height--;
+	}
+	else
+	{
+		const uint32_t mt = maxTexels(textureLUT, t.size, t.format);
+		int tile_width = int(t.lrs - t.uls + 1);
+		int tile_height = int(t.lrt - t.ult + 1);
+		int mask_width = t.masks == 0 ? tile_width : (1 << t.masks);
+		int mask_height = t.maskt == 0 ? tile_height : (1 << t.maskt);
+		if (t.clamps())
+			width = uint32_t(min(mask_width, tile_width));
+		else if (uint32_t(mask_width * mask_height) <= mt)
+			width = uint32_t(mask_width);
+		else
+			width = tileWidth;
+		if (t.clampt())
+			height = uint32_t(min(mask_height, tile_height));
+		else if (uint32_t(mask_width * mask_height) <= mt)
+			height = uint32_t(mask_height);
+		else
+			height = tileHeight;
+	}
+	s.clampWidth = (t.clamps() && cycleType != 2) ? tileWidth : width;
+	s.clampHeight = (t.clampt() && cycleType != 2) ? tileHeight : height;
+	s.width = (info.loadType == LOADTYPE_TILE && t.clamps() != 0 && t.masks == 0) ? s.clampWidth : width;
+	s.height = (info.loadType == LOADTYPE_TILE && t.clampt() != 0 && t.maskt == 0) ? s.clampHeight : height;
+}
+
+static bool in_framebuffer(uint32_t addr)
+{
+	for (auto &r : drawn_now)
+		if (addr >= r.first && addr < r.second) return true;
+	for (auto &r : drawn_prev)
+		if (addr >= r.first && addr < r.second) return true;
+	return false;
+}
+
+// _loadHiresTexture's key for texture slot t (tile index ti), or false where GLideN64 computes none.
+static bool hiresKey(uint32_t t, uint32_t ti, const uint32_t *rect_words, Rec &rec)
+{
+	const Tile &tile = tiles[ti];
+	TileSizes sz;
+	calcTileSizes(ti, sz, rect_words);
+	LoadInfo &info = loadInfo[tile.tmem & 511];
+	char why[200];
+	if (info.texAddress == 0)
+	{
+		if (out)
+		{
+			snprintf(why, sizeof(why), "noaddr t%u tile %u tmem %u fmt %u siz %u", t, ti, tile.tmem, tile.format, tile.size);
+			fails[why]++;
+		}
+		return false;
+	}
+	int bpl, width, height;
+	uint32_t addr = info.texAddress;
+	if (info.loadType == LOADTYPE_TILE)
+	{
+		bpl = info.texWidth << info.size >> 1;
+		addr += info.ult * bpl + (((info.uls << info.size) + 1) >> 1);
+		width = min<int>(info.width, info.texWidth);
+		if (info.size > tile.size) width <<= info.size - tile.size;
+		height = info.height;
+		if (hackMK64 && (height % 2) != 0) height--;
+	}
+	else
+	{
+		int tile_width = int(((tile.lrs - tile.uls) & 0x03FF) + 1);
+		int tile_height = int(((tile.lrt - tile.ult) & 0x03FF) + 1);
+		int mask_width = tile.masks == 0 ? tile_width : (1 << tile.masks);
+		int mask_height = tile.maskt == 0 ? tile_height : (1 << tile.maskt);
+		width = (tile.clamps() && tile_width <= 256) ? min(mask_width, tile_width) : mask_width;
+		height = ((tile.clampt() && tile_height <= 256) || mask_height > 256) ? min(mask_height, tile_height) : mask_height;
+		if (tile.size == SIZ_32b)
+			bpl = int(tile.line << 4);
+		else if (info.dxt == 0)
+			bpl = int(tile.line << 3);
+		else
+		{
+			uint32_t dxt = info.dxt;
+			if (dxt > 1)
+				dxt = ReverseDXT(dxt, info.width, sz.width, tile.size);
+			bpl = int(dxt << 3);
+		}
+	}
+	const uint8_t *pal = nullptr;
+	if (tile.size < SIZ_16b && (textureLUT != 0 || tile.format == FMT_CI))
+		pal = reinterpret_cast<const uint8_t *>(tile.size == SIZ_8b ? palette : palette + (tile.palette << 4));
+	// GLideN64 reads RDRAM unchecked; skip what would run past it (and degenerate sizes the CRC can't take)
+	// (a line under 4 bytes still reads 4 bytes from bytesPerLine - 4, before the line, as GLideNHQ does)
+	const int bytesPerLine = width << tile.size >> 1;
+	const int64_t first = int64_t(addr) + min(0, bytesPerLine - 4);
+	if (width <= 0 || height <= 0 || bpl < 0 || first < 0 ||
+	    uint64_t(addr) + uint64_t(bpl) * uint64_t(height - 1) + uint64_t(max(bytesPerLine, 4)) > memSize)
+	{
+		if (out)
+		{
+			snprintf(why, sizeof(why), "range t%u tile %u tmem %u fmt %u siz %u addr %06x w %d h %d bpl %d lt %u", t, ti,
+			         tile.tmem, tile.format, tile.size, addr, width, height, bpl, unsigned(info.loadType));
+			fails[why]++;
+		}
+		return false;
+	}
+	lookups++;
+	rec.crc = checksum64(mem + addr, width, height, int(tile.size), bpl, pal);
+	rec.fmt = uint16_t(tile.format);
+	rec.siz = uint16_t(tile.size);
+	rec.w = uint16_t(sz.width);
+	rec.h = uint16_t(sz.height);
+	rec.kind = 0;
+	rec.fb = in_framebuffer(info.texAddress) ? 1 : 0;
+	if (out)
+	{
+		Rec k = rec;
+		k.fb = 0;
+		if (detail.find(k) == detail.end())
+		{
+			snprintf(why, sizeof(why), "addr %06x w %d h %d bpl %d lt %u tile %u tmem %u pal %u uls %u ult %u lw %u lh %u tw %u lsz %u dxt %u",
+			         addr, width, height, bpl, unsigned(info.loadType), ti, tile.tmem, tile.palette, info.uls, info.ult,
+			         info.width, info.height, info.texWidth, unsigned(info.size), info.dxt);
+			detail.emplace(k, why);
+		}
+	}
+	(void)t;
+	return true;
+}
+
+static bool uses_texel1(bool one_cycle)
+{
+	// color a/b/d = 2, c = 2 or 9 (TEXEL1_ALPHA); alpha a/b/c/d = 2. As GLideN64's Combiner_GetStages: 1-cycle mode
+	// uses only the second cycle's equations, so TEXEL1 left in the first cycle does not make it update slot 1.
+	const uint32_t w0 = combine_w0, w1 = combine_w1;
+	const bool second = ((w0 >> 5) & 15) == 2 || ((w0 >> 0) & 31) == 2 || ((w0 >> 0) & 31) == 9 ||
+	                    ((w1 >> 24) & 15) == 2 || ((w1 >> 21) & 7) == 2 || ((w1 >> 18) & 7) == 2 ||
+	                    ((w1 >> 6) & 7) == 2 || ((w1 >> 3) & 7) == 2 || ((w1 >> 0) & 7) == 2;
+	if (one_cycle || second)
+		return second;
+	return ((w0 >> 20) & 15) == 2 || ((w0 >> 15) & 31) == 2 || ((w0 >> 15) & 31) == 9 || ((w0 >> 12) & 7) == 2 ||
+	       ((w0 >> 9) & 7) == 2 || ((w1 >> 28) & 15) == 2 || ((w1 >> 15) & 7) == 2 || ((w1 >> 12) & 7) == 2 ||
+	       ((w1 >> 9) & 7) == 2;
+}
+
+static void count(const Rec &r) { counts[r]++; }
+
+static void draw(uint32_t tile, uint8_t kind, const uint32_t *rect_words)
+{
+	draws_tex++;
+	const bool two = cycleType <= 1 && uses_texel1(cycleType == 0); // combiner reads TEXEL1: GLideN64 updates slot 1
+	const uint32_t ti[2] = { tile, (tile + 1) & 7 };
+	for (uint32_t t = 0; t < (two ? 2u : 1u); t++)
+	{
+		if (dirty || !have[t] || cached_tile[t] != ti[t])
+		{
+			uint32_t use = ti[t];
+			// update(): gSP.texture.tile == 7 && LoadBlock && same tmem -> slot 0 uses slot 1's tile
+			if (t == 0 && gspTextureTile == 7 && use == loadTileIdx && tiles[loadTileIdx].loadType == LOADTYPE_BLOCK &&
+			    tiles[ti[0]].tmem == tiles[ti[1]].tmem)
+				use = ti[1];
+			have[t] = hiresKey(t, use, rect_words, cached[t]);
+			cached_tile[t] = ti[t];
+			cached_entry[t] = (have[t] && TexPack::enabled && !cached[t].fb) ?
+			                  TexPack::find(cached[t].crc, cached[t].fmt, cached[t].siz) : nullptr;
+		}
+		if (have[t] && out)
+		{
+			Rec r = cached[t];
+			r.kind = uint8_t(kind | (t ? 8 : 0));
+			count(r);
+		}
+		else if (t == 0 && !have[t])
+			draws_nokey++;
+	}
+	dirty = false;
+	if (TexPack::enabled)
+	{
+		TexPack::Entry *e[2] = { have[0] ? cached_entry[0] : nullptr, (two && have[1]) ? cached_entry[1] : nullptr };
+		const uint16_t orig[2][2] = { { cached[0].w, cached[0].h }, { cached[1].w, cached[1].h } };
+		TexPack::apply(ti, two ? 2u : 1u, e, orig);
+	}
+}
+
+static void add_drawn()
+{
+	uint32_t stride = color_size ? (color_width << (color_size - 1)) : (color_width >> 1);
+	uint32_t rows = scissorLry + 1;
+	pair<uint32_t, uint32_t> r(color_addr, color_addr + rows * stride);
+	for (auto &d : drawn_now)
+		if (d == r) return;
+	if (drawn_now.size() < 16)
+		drawn_now.push_back(r);
+}
+
+static void track(RDP::Op op, const uint32_t *w)
+{
+	const uint32_t w0 = w[0], w1 = w[1];
+	switch (op)
+	{
+	case RDP::Op::SetTextureImage:
+		timg_format = (w0 >> 21) & 7;
+		timg_size = (w0 >> 19) & 3;
+		timg_width = (w0 & 0xFFF) + 1;
+		timg_address = w1 & 0x00FFFFFF;
+		timg_bpl = timg_width << timg_size >> 1;
+		break;
+	case RDP::Op::SetTile:
+	{
+		Tile &t = tiles[(w1 >> 24) & 7];
+		t.format = (w0 >> 21) & 7;
+		t.size = (w0 >> 19) & 3;
+		t.line = (w0 >> 9) & 0x1FF;
+		t.tmem = w0 & 0x1FF;
+		t.palette = (w1 >> 20) & 15;
+		t.cmt = (w1 >> 18) & 3;
+		t.cms = (w1 >> 8) & 3;
+		t.maskt = t.originalMaskT = (w1 >> 14) & 15;
+		t.masks = t.originalMaskS = (w1 >> 4) & 15;
+		if (!t.masks) t.cms |= 2;
+		if (!t.maskt) t.cmt |= 2;
+		dirty = true;
+		break;
+	}
+	case RDP::Op::SetTileSize:
+	{
+		Tile &t = tiles[(w1 >> 24) & 7];
+		t.uls = (w0 >> 14) & 0x3FF;
+		t.ult = (w0 >> 2) & 0x3FF;
+		t.lrs = (w1 >> 14) & 0x3FF;
+		t.lrt = (w1 >> 2) & 0x3FF;
+		dirty = true;
+		break;
+	}
+	case RDP::Op::LoadTile:
+	{
+		const uint32_t ti = (w1 >> 24) & 7;
+		Tile &t = tiles[ti];
+		t.uls = (w0 >> 14) & 0x3FF;
+		t.ult = (w0 >> 2) & 0x3FF;
+		t.lrs = (w1 >> 14) & 0x3FF;
+		t.lrt = (w1 >> 2) & 0x3FF;
+		loadTileIdx = ti;
+		t.loadType = LOADTYPE_TILE;
+		t.imageAddress = timg_address;
+		dirty = true;
+		if (t.lrs < t.uls || t.lrt < t.ult)
+			break;
+		const uint32_t width = (t.lrs - t.uls + 1) & 0x03FF;
+		const uint32_t height = (t.lrt - t.ult + 1) & 0x03FF;
+		const uint32_t bpl = t.line << 3;
+		LoadInfo &info = loadInfo[t.tmem];
+		info.texAddress = t.imageAddress;
+		info.uls = uint16_t(t.uls);
+		info.ult = uint16_t(t.ult);
+		info.lrs = uint16_t(t.lrs);
+		info.lrt = uint16_t(t.lrt);
+		info.width = uint16_t(t.masks != 0 ? min(width, 1u << t.masks) : width);
+		info.height = uint16_t(t.maskt != 0 ? min(height, 1u << t.maskt) : height);
+		info.texWidth = uint16_t(timg_width);
+		info.size = uint8_t(timg_size);
+		info.loadType = LOADTYPE_TILE;
+		info.bytes = bpl * height;
+		if (t.size == SIZ_32b)
+			info.bytes *= 2;
+		if (t.line == 0)
+			break;
+		if (t.masks == 0)
+			t.loadWidth = max<uint16_t>(t.loadWidth, info.width);
+		if (t.maskt == 0)
+		{
+			if (cycleType != 1 && t.tmem % t.line == 0)
+				t.loadHeight = max<uint16_t>(t.loadHeight, uint16_t(info.height + t.tmem / t.line));
+			else
+				t.loadHeight = max<uint16_t>(t.loadHeight, info.height);
+		}
+		break;
+	}
+	case RDP::Op::LoadBlock:
+	{
+		const uint32_t ti = (w1 >> 24) & 7;
+		const uint32_t uls = (w0 >> 12) & 0xFFF, ult = w0 & 0xFFF, lrs = (w1 >> 12) & 0xFFF, dxt = w1 & 0xFFF;
+		Tile &t = tiles[ti];
+		t.uls = (uls >> 2) & 0x3FF;
+		t.ult = (ult >> 2) & 0x3FF;
+		t.lrs = (lrs >> 2) & 0x3FF;
+		t.lrt = (dxt >> 2) & 0x3FF;
+		loadTileIdx = ti;
+		t.loadType = LOADTYPE_BLOCK;
+		t.imageAddress = timg_address;
+		dirty = true;
+		LoadInfo &info = loadInfo[t.tmem];
+		info.texAddress = t.imageAddress;
+		info.uls = uint16_t(t.uls);
+		info.ult = uint16_t(t.ult);
+		info.lrs = uint16_t(t.lrs);
+		info.lrt = uint16_t(t.lrt);
+		info.width = uint16_t(t.lrs);
+		info.dxt = dxt;
+		info.size = uint8_t(timg_size);
+		info.loadType = LOADTYPE_BLOCK;
+		const uint32_t width = (lrs - uls + 1) & 0x0FFF;
+		uint32_t bytes = width << t.size >> 1;
+		if ((bytes & 7) != 0)
+			bytes = (bytes & ~7u) + 8;
+		info.bytes = bytes;
+		const uint32_t address = timg_address + ult * timg_bpl + (uls << timg_size >> 1);
+		if (bytes == 0 || address + bytes > memSize)
+			break;
+		const uint32_t lo = t.tmem, hi = t.tmem + (bytes >> 3);
+		for (uint32_t i = 0; i < ti; ++i)
+			if (tiles[i].tmem >= lo && tiles[i].tmem < hi)
+				loadInfo[tiles[i].tmem].loadType = LOADTYPE_BLOCK;
+		break;
+	}
+	case RDP::Op::LoadTLut:
+	{
+		Tile &t = tiles[(w1 >> 24) & 7];
+		t.uls = (w0 >> 14) & 0x3FF;
+		t.ult = (w0 >> 2) & 0x3FF;
+		t.lrs = (w1 >> 14) & 0x3FF;
+		t.lrt = (w1 >> 2) & 0x3FF;
+		dirty = true;
+		if (t.tmem < 256)
+			break;
+		uint32_t count = uint16_t((t.lrs - t.uls + 1) * (t.lrt - t.ult + 1));
+		const uint32_t start = t.tmem - 256;
+		if (start + count > 512) count = 512 - start;
+		if (uint64_t(timg_address) + count * 2 <= memSize)
+			memcpy(palette + start, mem + timg_address, count * 2);
+		break;
+	}
+	case RDP::Op::SetOtherModes:
+		cycleType = (w0 >> 20) & 3;
+		textureLUT = (w0 >> 14) & 3;
+		break;
+	case RDP::Op::SetCombine:
+		combine_w0 = w0 & 0x00FFFFFF;
+		combine_w1 = w1;
+		break;
+	case RDP::Op::SetScissor:
+		scissorLry = (w1 & 0xFFF) >> 2;
+		break;
+	case RDP::Op::SetColorImage:
+		color_addr = w1 & 0x00FFFFFF;
+		color_size = (w0 >> 19) & 3;
+		color_width = (w0 & 0x3FF) + 1;
+		break;
+	case RDP::Op::FillTriangle:
+	case RDP::Op::ShadeTriangle:
+	case RDP::Op::FillZBufferTriangle:
+	case RDP::Op::ShadeZBufferTriangle:
+	case RDP::Op::FillRectangle:
+		add_drawn();
+		break;
+	case RDP::Op::TextureTriangle:
+	case RDP::Op::ShadeTextureTriangle:
+	case RDP::Op::TextureZBufferTriangle:
+	case RDP::Op::ShadeTextureZBufferTriangle:
+		add_drawn();
+		gspTextureTile = (w0 >> 16) & 7;
+		draw((w0 >> 16) & 7, 1, nullptr);
+		break;
+	case RDP::Op::TextureRectangle:
+	case RDP::Op::TextureRectangleFlip:
+		add_drawn();
+		draw((w1 >> 24) & 7, uint8_t(cycleType == 2 ? 6 : 2), w);
+		break;
+	default:
+		break;
+	}
+}
+
+static void on_frame()
+{
+	frames++;
+	frame_total++;
+	drawn_prev.swap(drawn_now);
+	drawn_now.clear();
+	if (TexPack::enabled)
+		TexPack::on_frame(draws_tex);
+	if (!out)
+	{
+		if (frames >= 600)
+			frames = draws_tex = draws_nokey = lookups = 0;
+		return;
+	}
+	if (frames < 60)
+		return;
+	// window line, then one line per key record: K crc fmt siz w h kind fb count
+	// kind bits: 1 triangle, 2 texrect, 4 copy mode, 8 second texture (TEXEL1)
+	fprintf(out, "W %llu frames %u textured %u nokey %u keys %u lookups %u\n", (unsigned long long)frame_total, frames,
+	        draws_tex, draws_nokey, unsigned(counts.size()), lookups);
+	for (auto &kv : counts)
+		fprintf(out, "K %016llx %u %u %u %u %u %u %u\n", (unsigned long long)kv.first.crc, kv.first.fmt, kv.first.siz,
+		        kv.first.w, kv.first.h, kv.first.kind, kv.first.fb, kv.second);
+	// L crc fmt siz w h : <how its texture was found>; F count <why a draw got no key>
+	std::unordered_map<Rec, bool, RecHash> said;
+	for (auto &kv : counts)
+	{
+		Rec k = kv.first;
+		k.kind = 0;
+		k.fb = 0;
+		auto d = detail.find(k);
+		if (d == detail.end() || !said.emplace(k, true).second)
+			continue;
+		fprintf(out, "L %016llx %u %u %u %u : %s\n", (unsigned long long)k.crc, k.fmt, k.siz, k.w, k.h, d->second.c_str());
+	}
+	for (auto &kv : fails)
+		fprintf(out, "F %u %s\n", kv.second, kv.first.c_str());
+	fails.clear();
+	fflush(out);
+	counts.clear();
+	frames = draws_tex = draws_nokey = lookups = 0;
+}
+
+static void init(const uint8_t *rdram, uint32_t size)
+{
+	enabled = false;
+	dirty = true;
+	have[0] = have[1] = false;
+	cached_entry[0] = cached_entry[1] = nullptr;
+	const char *path = getenv("N64_RDP_TEXKEYS");
+	if (path && *path && !out)
+	{
+		out = fopen(path, "w");
+		if (!out)
+			log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: texture keys: can't open %s.\n", path);
+	}
+	mem = g_rdram_alias ? static_cast<const uint8_t *>(g_rdram_alias) : rdram;
+	memSize = size;
+	// GLideN64's hack_MK64 (RSP.cpp: ROM name "MARIOKART64"); header bytes may be word-swapped
+	char a[21] = {}, b[21] = {};
+	const uint8_t *hdr = GET_GFX_INFO(HEADER);
+	for (int i = 0; i < 20 && hdr; i++)
+	{
+		a[i] = char(hdr[0x20 + i]);
+		b[i] = char(hdr[(0x20 + i) ^ 3]);
+	}
+	hackMK64 = strstr(a, "MARIOKART64") || strstr(b, "MARIOKART64");
+	// GLideN64's RSP.romname: the header name (b, byte order as RSP.cpp reads it) without trailing spaces
+	char romname[21];
+	memcpy(romname, b, sizeof(romname));
+	for (int i = int(strlen(romname)) - 1; i >= 0 && romname[i] == ' '; i--)
+		romname[i] = 0;
+	TexPack::init(romname);
+	if (out)
+	{
+		fprintf(out, "# texkeys v1 rom '%s' mk64hack %d\n", b, hackMK64 ? 1 : 0);
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture pack keys logged to %s.\n", path);
+	}
+	enabled = out != nullptr || TexPack::enabled;
+}
+}
+
+
 void process_commands()
 {
 	const uint32_t DP_CURRENT = *GET_GFX_INFO(DPC_CURRENT_REG) & 0x00FFFFF8;
@@ -904,6 +2123,9 @@ void process_commands()
 			return;
 		}
 
+		// before the command is queued: texture packs queue the draw's replacements ahead of it
+		if (TexKeys::enabled)
+			TexKeys::track(RDP::Op(command), &cmd_data[2 * cmd_cur]);
 		if (command >= 8 && frontend)
 			frontend->enqueue_command(cmd_length * 2, &cmd_data[2 * cmd_cur]);
 		if (Smart::enabled && synchronous)
@@ -1082,10 +2304,12 @@ static bool create_frontend()
 	frontend.reset(new CommandProcessor(*device, reinterpret_cast<void *>(frontend_rdram),
 				frontend_offset, frontend_rdram_size, frontend_rdram_size / 2, flags));
 	active_upscaling = upscaling;
+	TexKeys::init(DRAM, frontend_rdram_size);
 
 	if (!frontend->device_is_supported())
 	{
 		log_cb(RETRO_LOG_ERROR, "This device probably does not support 8/16-bit storage. Make sure you're using up-to-date drivers!\n");
+		TexPack::stop();
 		frontend.reset();
 		return false;
 	}
@@ -1107,6 +2331,7 @@ static void apply_upscaling_change()
 	frontend->wait_for_timeline(frontend->signal_timeline());
 	Smart::reset_after_drain();
 	unsigned from = active_upscaling;
+	TexPack::stop();
 	frontend.reset();
 	if (!create_frontend())
 	{
@@ -1126,6 +2351,8 @@ void deinit()
 	end_ts.reset();
 	retro_image_handles.clear();
 	retro_images.clear();
+	TexPack::stop();
+	texpack_ghq_shutdown(); // the worker is gone; the next ROM opens its own pack
 	frontend.reset();
 	device.reset();
 	context.reset();
@@ -1203,6 +2430,8 @@ void complete_frame()
 	}
 
 	timeline_value = frontend->signal_timeline();
+	if (TexKeys::enabled)
+		TexKeys::on_frame();
 
 	// New pipelines show up as the game reaches new effects; check every ~10 s.
 	if (++frames_since_cache_check >= 600)

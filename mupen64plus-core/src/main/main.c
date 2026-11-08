@@ -1730,7 +1730,9 @@ m64p_error main_run(void)
                 g_start_address,
                 &g_dev.ai, &audio_out_backend_libretro, ((float)ROM_SETTINGS.aidmamodifier / 100.0),
                 si_dma_duration,
-                ROM_SETTINGS.forcealignmentofpidma,
+                /* dev (Joey64 master list item 26): N64_PI_DMA_ALIGN=0|1 overrides the database / unknown-ROM rule */
+                (getenv("N64_PI_DMA_ALIGN") && *getenv("N64_PI_DMA_ALIGN")) ? (atoi(getenv("N64_PI_DMA_ALIGN")) != 0)
+                                                                          : ROM_SETTINGS.forcealignmentofpidma,
                 rdram_size,
                 joybus_devices, ijoybus_devices,
                 vi_clock_from_tv_standard(ROM_PARAMS.systemtype), vi_expected_refresh_rate_from_tv_standard(ROM_PARAMS.systemtype),

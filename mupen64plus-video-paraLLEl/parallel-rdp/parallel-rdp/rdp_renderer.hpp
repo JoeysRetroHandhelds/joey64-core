@@ -112,6 +112,12 @@ public:
 	void set_tmem(Vulkan::Buffer *buffer);
 	void set_shader_bank(const ShaderBank *bank);
 
+	// Joey64 texture packs. set_texpack: the TEXPACK shaders and the replacement texel buffer (RGBA8, host-visible,
+	// written by the pack loader); with both set, every draw runs the TEXPACK shaders. set_tile_replace: the replacement
+	// the next draws use for this tile (present false = none); it rides in the tile's TileInfo (load_tile_info.h).
+	void set_texpack(const TexpackShaderBank *bank, Vulkan::BufferHandle texels, Vulkan::LinearHostImageHandle image);
+	void set_tile_replace(uint32_t tile, bool present, uint32_t offset, uint32_t size, uint32_t orig, bool mips = false);
+
 	bool init_renderer(const RendererOptions &options);
 
 	// Hands the compute pipelines an earlier run listed to the pipeline worker:
@@ -203,6 +209,13 @@ private:
 	Vulkan::Buffer *hidden_rdram = nullptr;
 	Vulkan::Buffer *tmem = nullptr;
 	const ShaderBank *shader_bank = nullptr;
+	const TexpackShaderBank *texpack_bank = nullptr;
+	Vulkan::BufferHandle texpack_texels;
+	Vulkan::LinearHostImageHandle texpack_image; // set: the _img shaders sample it at binding 13 instead
+	struct TileReplace
+	{
+		uint32_t bits[4]; // upper 20 bits of slo, shi, tlo, thi (0 = no replacement)
+	} tile_replace[Limits::MaxNumTiles] = {};
 
 	bool init_caps();
 	void init_blender_lut();

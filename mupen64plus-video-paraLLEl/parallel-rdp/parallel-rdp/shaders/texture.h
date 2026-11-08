@@ -922,6 +922,195 @@ i16x4 sample_texture(TileInfo tile, uint tmem_instance, ivec2 st, bool tlut, boo
 	return accum;
 }
 
+#ifdef TEXPACK
+// Joey64 texture packs. rep comes from load_tile_replace(): x = texel offset into texpack.texels, y = replacement
+// width | height << 16, z = width | height << 16 of the texture the pack key describes. The replacement spans that
+// texture exactly (as GLideN64 draws it), so a tile-relative N64 texel position u maps to u * (width / original width).
+// Wrap: repeat (mirrored with the mirror bit) when the tile has a mask, otherwise clamp; the N64 clamp to the tile
+// bounds has already happened in clamp_and_shift_coord.
+#if !(defined(TEXPACK_IMAGE) && TEXPACK_IMAGE)
+vec4 texpack_st_derivs(ivec4 stzw, ivec4 dstzw_dx, ivec4 dstzw_dy, int dx, bool perspective)
+{
+	return vec4(0.0); // the buffer path has no mip levels
+}
+
+i16x4 texpack_texel(uint base, int w, ivec2 p)
+{
+	uint c = texpack.texels[base + uint(p.y * w + p.x)];
+	return i16x4((uvec4(c) >> uvec4(0, 8, 16, 24)) & 0xffu);
+}
+#else
+// Image path: rep.x = x | y << 14 of the replacement's first texel in the image. Filtered coordinates are in replacement
+// texels, centres on half ones. Repeat wraps into [0, n): the gutter holds the wrapped neighbours, so the hardware
+// filter blends across the seam as the four-read path does. Clamp and mirror clamp to the outer texel centres, where
+// the neighbour a mirror would read is the texel itself, so the gutter is never read for them.
+float texpack_wrapf(float p, float n, bool repeat, bool mirror)
+{
+	if (!repeat)
+		return clamp(p, 0.5, n - 0.5);
+	if (mirror)
+	{
+		float m = mod(p, 2.0 * n);
+		m = m < n ? m : 2.0 * n - m;
+		return clamp(m, 0.5, n - 0.5);
+	}
+	return mod(p, n);
+}
+
+// Mip levels (rep.w bit 1): level l is max(1, w >> l) x max(1, h >> l), each with its own 1-texel gutter, placed left
+// to right on the replacement's row from its origin: level l starts sum over i < l of (w_i + 2) texels to the right.
+// The chain runs down to 1 x 1 (the loader uses the same rule).
+int texpack_levels(ivec2 size)
+{
+	return findMSB(max(size.x, size.y)) + 1;
+}
+
+// st per output pixel along x and y (st units: 1/32 N64 texel, before the tile shift), from the primitive's
+// gradients at this pixel, perspective-correct: (ds/dx, dt/dx, ds/dy, dt/dy). Zero where w has no valid value.
+vec4 texpack_st_derivs(ivec4 stzw, ivec4 dstzw_dx, ivec4 dstzw_dy, int dx, bool perspective)
+{
+	ivec3 sx = (dstzw_dx.xyw & ~0x1f) >> SCALING_LOG2;
+	ivec3 sy = (dstzw_dy.xyw & ~0x7fff) >> SCALING_LOG2;
+	ivec3 stw = stzw.xyw + sx * dx;
+	vec3 v = vec3(stw), gx = vec3(sx), gy = vec3(sy);
+	if (!perspective)
+		return vec4(gx.xy, gy.xy) * (1.0 / 65536.0);
+	if ((stw.z >> 16) <= 0)
+		return vec4(0.0);
+	// st = 32768 * s / w (perspective_divide: s16 by s1.15), so d(st) = 32768 * (ds * w - s * dw) / w^2.
+	float k = 32768.0 / (v.z * v.z);
+	return k * vec4(gx.xy * v.z - v.xy * gx.z, gy.xy * v.z - v.xy * gy.z);
+}
+
+float texpack_shift_factor(int shift)
+{
+	return shift < 11 ? 1.0 / float(1 << shift) : float(1 << (16 - shift));
+}
+
+vec4 texpack_bilinear(ivec2 origin, ivec2 size, vec2 p, bvec2 repeat, bvec2 mirror)
+{
+	p.x = texpack_wrapf(p.x, float(size.x), repeat.x, mirror.x);
+	p.y = texpack_wrapf(p.y, float(size.y), repeat.y, mirror.y);
+	return textureLod(texpack_image, (vec2(origin) + p) / vec2(textureSize(texpack_image, 0)), 0.0);
+}
+
+// Level l's origin and size.
+void texpack_level(ivec2 origin, ivec2 size, int l, out ivec2 lo, out ivec2 ls)
+{
+	int x = origin.x;
+	for (int i = 0; i < l; i++)
+		x += max(1, size.x >> i) + 2;
+	lo = ivec2(x, origin.y);
+	ls = max(ivec2(1), size >> l);
+}
+#endif
+
+int texpack_wrap(int i, int n, bool repeat, bool mirror)
+{
+	if (!repeat)
+		return clamp(i, 0, n - 1);
+	if (mirror)
+	{
+		int m = i % (2 * n);
+		if (m < 0)
+			m += 2 * n;
+		return m < n ? m : 2 * n - 1 - m;
+	}
+	int m = i % n;
+	return m < 0 ? m + n : m;
+}
+
+i16x4 sample_replacement(TileInfo tile, uvec4 rep, ivec2 st, bool bilinear, bool convert, i16x4 conversion_factors,
+                         vec4 st_derivs)
+{
+#if defined(TEXPACK_NEAREST) && TEXPACK_NEAREST
+	bilinear = false; // dev measurement: what the bilinear path costs
+#endif
+	st.x = clamp_and_shift_coord((tile.flags & TILE_INFO_CLAMP_S_BIT) != 0, st.x, int(tile.slo), int(tile.shi), int(tile.shift_s));
+	st.y = clamp_and_shift_coord((tile.flags & TILE_INFO_CLAMP_T_BIT) != 0, st.y, int(tile.tlo), int(tile.thi), int(tile.shift_t));
+
+	ivec2 size = ivec2(rep.y & 0xffffu, rep.y >> 16u);
+	vec2 scale = vec2(size) / vec2(uvec2(rep.z & 0xffffu, rep.z >> 16u));
+	bvec2 repeat = bvec2(tile.mask_s != 0, tile.mask_t != 0);
+	bvec2 mirror = bvec2((tile.flags & TILE_INFO_MIRROR_S_BIT) != 0, (tile.flags & TILE_INFO_MIRROR_T_BIT) != 0);
+	vec2 u = vec2(st) * (1.0 / 32.0);
+
+	i16x4 accum;
+#if defined(TEXPACK_IMAGE) && TEXPACK_IMAGE
+	ivec2 origin = ivec2(int(rep.x & 0x3fffu), int(rep.x >> 14u));
+	if (bilinear)
+	{
+		vec2 p = (u + 0.5) * scale;
+		vec4 c;
+		float lod = 0.0;
+#if !(defined(TEXPACK_NOMIPS) && TEXPACK_NOMIPS)
+		if ((rep.w & 2u) != 0u)
+		{
+			// replacement texels per output pixel: st units / 32, times the tile shift, times the replacement's scale
+			vec2 k = scale * (1.0 / 32.0) * vec2(texpack_shift_factor(int(tile.shift_s)), texpack_shift_factor(int(tile.shift_t)));
+			float rho = max(length(st_derivs.xy * k), length(st_derivs.zw * k));
+			lod = clamp(log2(max(rho, 1e-6)), 0.0, float(texpack_levels(size) - 1));
+		}
+#endif
+		if (lod <= 0.0)
+			c = texpack_bilinear(origin, size, p, repeat, mirror);
+		else
+		{
+			// trilinear: the two levels around lod, each bilinear at its own size
+			int l0 = int(lod);
+			float f = lod - float(l0);
+			ivec2 o0, s0, o1, s1;
+			texpack_level(origin, size, l0, o0, s0);
+			c = texpack_bilinear(o0, s0, p * vec2(s0) / vec2(size), repeat, mirror);
+			if (f > 0.0)
+			{
+				texpack_level(origin, size, l0 + 1, o1, s1);
+				c = mix(c, texpack_bilinear(o1, s1, p * vec2(s1) / vec2(size), repeat, mirror), f);
+			}
+		}
+		accum = i16x4(round(c * 255.0));
+	}
+	else
+	{
+		ivec2 p = ivec2(floor(u * scale));
+		p.x = texpack_wrap(p.x, size.x, repeat.x, mirror.x);
+		p.y = texpack_wrap(p.y, size.y, repeat.y, mirror.y);
+		accum = i16x4(round(texelFetch(texpack_image, origin + p, 0) * 255.0));
+	}
+#else
+	if (bilinear)
+	{
+		// N64 texel centres sit on whole coordinates; the replacement's texel centres on half ones.
+		vec2 p = (u + 0.5) * scale - 0.5;
+		vec2 pf = floor(p);
+		vec2 f = p - pf;
+		ivec2 p0 = ivec2(pf);
+		int x0 = texpack_wrap(p0.x, size.x, repeat.x, mirror.x);
+		int x1 = texpack_wrap(p0.x + 1, size.x, repeat.x, mirror.x);
+		int y0 = texpack_wrap(p0.y, size.y, repeat.y, mirror.y);
+		int y1 = texpack_wrap(p0.y + 1, size.y, repeat.y, mirror.y);
+		vec4 t00 = vec4(texpack_texel(rep.x, size.x, ivec2(x0, y0)));
+		vec4 t10 = vec4(texpack_texel(rep.x, size.x, ivec2(x1, y0)));
+		vec4 t01 = vec4(texpack_texel(rep.x, size.x, ivec2(x0, y1)));
+		vec4 t11 = vec4(texpack_texel(rep.x, size.x, ivec2(x1, y1)));
+		accum = i16x4(round(mix(mix(t00, t10, f.x), mix(t01, t11, f.x), f.y)));
+	}
+	else
+	{
+		ivec2 p = ivec2(floor(u * scale));
+		p.x = texpack_wrap(p.x, size.x, repeat.x, mirror.x);
+		p.y = texpack_wrap(p.y, size.y, repeat.y, mirror.y);
+		accum = texpack_texel(rep.x, size.x, p);
+	}
+#endif
+
+	// As sample_texture: a cycle that spends no math on bilerp gets the conversion instead.
+	if (convert)
+		accum = texture_convert_factors(accum, conversion_factors);
+	return accum;
+}
+#endif
+
 void compute_lod_2cycle(inout uint tile0, inout uint tile1, out i16 lod_frac, uint max_level, int min_lod,
                         ivec2 st, ivec2 st_dx, ivec2 st_dy,
                         bool perspective_overflow, bool tex_lod_en, bool sharpen_tex_en, bool detail_tex_en)

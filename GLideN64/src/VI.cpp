@@ -242,8 +242,11 @@ static void checkHotkeys()
 	*/
 }
 
+void texkeys_gln_frame(); // Textures.cpp, N64_GLN_TEXKEYS
+
 void VI_UpdateScreen()
 {
+	texkeys_gln_frame();
 	if (VI.lastOrigin == -1) // Workaround for Mupen64Plus issue with initialization
 		gfxContext.isError();
 
