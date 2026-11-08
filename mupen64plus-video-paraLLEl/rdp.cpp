@@ -1453,6 +1453,7 @@ static uint64_t frames;
 static uint32_t buffer[4];
 static bool skipped[4];
 static unsigned dropped, scanouts_skipped, scanouts;
+static unsigned d_ci_shown, d_ci_same, d_ci_other, d_starts, d_starts_behind; // N64_FRAMESKIP_DEBUG counts
 
 static int shown_index(uint32_t addr)
 {
@@ -1465,10 +1466,13 @@ static int shown_index(uint32_t addr)
 static void color_image(uint32_t addr)
 {
 	into_shown = shown_index(addr) >= 0;
+	if (!into_shown) d_ci_other++; else if (addr == drawing) d_ci_same++; else d_ci_shown++;
 	if (!into_shown || addr == drawing)
 		return; // textures drawn in between don't start a frame
 	drawing = addr;
 	frames++;
+	d_starts++;
+	if (behind.load(std::memory_order_relaxed)) d_starts_behind++;
 	skipping = automatic ? behind.load(std::memory_order_relaxed) && !skipping : (frames & 1) != 0;
 	int slot = 0;
 	for (int i = 0; i < 4; i++)
@@ -1517,7 +1521,11 @@ static bool skip_scanout(uint32_t origin)
 	{
 		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip: %u of the last %u scanouts skipped, %u draws left out.\n",
 		       scanouts_skipped, scanouts + scanouts_skipped, dropped);
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip debug: colour images %u into a new shown buffer, %u into the one drawn, %u elsewhere; "
+		       "%u frame starts, %u while behind; shown %06x %06x %06x %06x, drawing %06x.\n",
+		       d_ci_shown, d_ci_same, d_ci_other, d_starts, d_starts_behind, shown[0], shown[1], shown[2], shown[3], drawing);
 		scanouts = scanouts_skipped = dropped = 0;
+		d_ci_shown = d_ci_same = d_ci_other = d_starts = d_starts_behind = 0;
 	}
 	return skip;
 }
