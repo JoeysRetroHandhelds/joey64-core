@@ -1454,6 +1454,7 @@ static uint32_t buffer[4];
 static bool skipped[4];
 static unsigned dropped, scanouts_skipped, scanouts;
 static unsigned d_ci_shown, d_ci_same, d_ci_other, d_starts, d_starts_behind; // N64_FRAMESKIP_DEBUG counts
+static std::atomic<unsigned> d_cb_calls{0}, d_cb_active{0}, d_cb_low{0}, d_cb_dry{0}, d_cb_min{100};
 
 static int shown_index(uint32_t addr)
 {
@@ -1525,6 +1526,8 @@ static bool skip_scanout(uint32_t origin)
 		       "%u frame starts, %u while behind; shown %06x %06x %06x %06x, drawing %06x.\n",
 		       d_ci_shown, d_ci_same, d_ci_other, d_starts, d_starts_behind, shown[0], shown[1], shown[2], shown[3], drawing);
 		scanouts = scanouts_skipped = dropped = 0;
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip debug: audio status %u calls, %u active, %u at 33%% or less, %u ran dry, lowest %u%%.\n",
+		       d_cb_calls.exchange(0), d_cb_active.exchange(0), d_cb_low.exchange(0), d_cb_dry.exchange(0), d_cb_min.exchange(100));
 		d_ci_shown = d_ci_same = d_ci_other = d_starts = d_starts_behind = 0;
 	}
 	return skip;
@@ -3677,5 +3680,10 @@ extern "C" __attribute__((visibility("default"))) void joey64_vi_trim(int *out)
 void parallel_audio_buffer_status(bool active, unsigned occupancy, bool underrun_likely)
 {
 	RDP::FSkip::behind.store(active && (occupancy <= 33 || underrun_likely), std::memory_order_relaxed);
+	RDP::FSkip::d_cb_calls++;
+	if (active) RDP::FSkip::d_cb_active++;
+	if (occupancy <= 33) RDP::FSkip::d_cb_low++;
+	if (underrun_likely) RDP::FSkip::d_cb_dry++;
+	if (occupancy < RDP::FSkip::d_cb_min.load()) RDP::FSkip::d_cb_min = occupancy;
 }
 
