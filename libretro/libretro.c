@@ -407,7 +407,17 @@ static bool emu_step_load_data()
 {
     log_cb(RETRO_LOG_DEBUG, CORE_NAME ": [EmuThread] M64CMD_ROM_OPEN\n");
 
-    if(CoreDoCommand(M64CMD_ROM_OPEN, game_size, (void*)game_data))
+    if (game_size == 0 && retro_dd_path_img)
+    {
+        /* Joey64: 64DD disk with no cartridge */
+        if (CoreDoCommand(M64CMD_DISK_OPEN, 0, NULL))
+        {
+            if (log_cb)
+                log_cb(RETRO_LOG_ERROR, CORE_NAME ": failed to open the 64DD disk %s\n", retro_dd_path_img);
+            goto load_fail;
+        }
+    }
+    else if(CoreDoCommand(M64CMD_ROM_OPEN, game_size, (void*)game_data))
     {
         if (log_cb)
             log_cb(RETRO_LOG_ERROR, CORE_NAME ": failed to load ROM\n");
@@ -484,12 +494,23 @@ static void* EmuThreadFunction(void* param)
     log_cb(RETRO_LOG_DEBUG, CORE_NAME ": [EmuThread] M64CMD_EXECUTE\n");
 
     // Runs until CMD_STOP
-    CoreDoCommand(M64CMD_EXECUTE, 0, NULL);
+    m64p_error run = CoreDoCommand(M64CMD_EXECUTE, 0, NULL);
 
     if(current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer)
     {
         // Unset
         emuThreadRunning = false;
+    }
+    else
+    {
+        /* Joey64: as a coroutine this only returns when the emulator could not start (a 64DD disk whose region has no
+         * IPL, a cartridge the core turned down); returning from a coroutine crashed retro_run. Ask the frontend to
+         * shut down and hand control back for good: retro_run then returns without a frame. */
+        if (log_cb)
+            log_cb(RETRO_LOG_ERROR, CORE_NAME ": the emulator stopped (%d): the game could not start\n", (int)run);
+        environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+        for (;;)
+            retro_return();
     }
 
     return NULL;
@@ -563,6 +584,16 @@ bool retro_load_game_special(unsigned game_type, const struct retro_game_info *i
             
             log_cb(RETRO_LOG_INFO, "Loading %s...\n", info[0].path);
             
+            if (num_info == 1)
+            {
+               /* Joey64: a disk on its own boots the 64DD IPL with no cartridge (emu_step_load_data opens it with
+                * M64CMD_DISK_OPEN). Upstream read info[1] here, past the end of the list. */
+               struct retro_game_info none;
+               memset(&none, 0, sizeof(none));
+               result = retro_load_game(&none);
+               break;
+            }
+
             result = load_file(info[1].path, &gameBuffer, &outSize) == file_ok;
             if(result)
             {
@@ -1985,9 +2016,20 @@ bool retro_load_game(const struct retro_game_info *game)
     }
 #endif
 
-    game_data = malloc(game->size);
-    memcpy(game_data, game->data, game->size);
-    game_size = game->size;
+    game_data = NULL;
+    game_size = 0;
+    if (game->data && game->size)
+    {
+       game_data = malloc(game->size);
+       memcpy(game_data, game->data, game->size);
+       game_size = game->size;
+    }
+    else if (!retro_dd_path_img)
+    {
+       if (log_cb)
+          log_cb(RETRO_LOG_ERROR, CORE_NAME ": no ROM data and no 64DD disk\n");
+       return false;
+    }
 
     if (!emu_step_load_data())
         return false;

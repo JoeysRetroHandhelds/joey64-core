@@ -221,7 +221,22 @@ const char *get_savesrampath(void)
 const char *get_dd_disk_save_path(const char* diskname, int save_format)
 {
     char* newPath = (char*)malloc(PATH_MAX);
-    strcpy(newPath, diskname);
+    /* Joey64: in the frontend's save folder when it gives one (a disk may sit in a read-only or unpacked copy) */
+    const char* save_dir = NULL;
+    const char* base = diskname;
+    for (const char* q = diskname; *q; ++q)
+        if (*q == '/' || *q == '\\') base = q + 1;
+    if (environ_cb && environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir) && save_dir && *save_dir
+        && strlen(save_dir) + strlen(base) + 16 < PATH_MAX)
+    {
+        strcpy(newPath, save_dir);
+        size_t n = strlen(newPath);
+        if (newPath[n - 1] != '/' && newPath[n - 1] != '\\')
+            strcat(newPath, PATH_DEFAULT_SLASH());
+        strcat(newPath, base);
+    }
+    else
+        strcpy(newPath, diskname);
     
     if(save_format == 0)
         strcat(newPath, ".disk_save");
@@ -958,7 +973,26 @@ static void load_dd_rom(uint8_t* rom, size_t* rom_size, uint8_t* disk_region)
         strcat(pathname, PATH_DEFAULT_SLASH());
     strcat(pathname, "Mupen64plus");
     strcat(pathname, PATH_DEFAULT_SLASH());
-    strcat(pathname, "IPL.n64");
+    {
+        /* Joey64: a region's own IPL first, then the one upstream reads */
+        const char* by_region = *disk_region == DDREGION_JAPAN ? "IPL_JPN.n64"
+                              : *disk_region == DDREGION_US    ? "IPL_USA.n64"
+                              : *disk_region == DDREGION_DEV   ? "IPL_DEV.n64" : NULL;
+        size_t dir_len = strlen(pathname);
+        FILE* f = NULL;
+        if (by_region && dir_len + strlen(by_region) < 2048)
+        {
+            strcat(pathname, by_region);
+            f = fopen(pathname, "rb");
+        }
+        if (f)
+            fclose(f);
+        else
+        {
+            pathname[dir_len] = '\0';
+            strcat(pathname, "IPL.n64");
+        }
+    }
 
     if(retro_dd_path_img)
     {
