@@ -1439,8 +1439,8 @@ static const unsigned cmd_len_lut[64] = {
 // syncs and drawing into other images such as render-to-texture still are), and its scanout is not made, so the picture
 // before it stays on screen. A frame starts at a SET_COLOR_IMAGE into one of the VI's last four origins (within 64 KB)
 // other than the one being drawn. A speed setting, not exact: a game that reads back or draws on top of last frame's
-// picture sees an old one. N64_FRAMESKIP=2 is automatic: a frame is skipped only when it starts while the frontend's
-// audio buffer is at a third of its target or less (it is falling behind), never two in a row.
+// picture sees an old one. N64_FRAMESKIP=2 is automatic: a frame is skipped only when the frontend's audio buffer was at
+// a third of its target or less, or ran dry, since the last frame start (it is falling behind), never two in a row.
 namespace FSkip
 {
 static bool enabled, automatic;
@@ -1473,8 +1473,9 @@ static void color_image(uint32_t addr)
 	drawing = addr;
 	frames++;
 	d_starts++;
-	if (behind.load(std::memory_order_relaxed)) d_starts_behind++;
-	skipping = automatic ? behind.load(std::memory_order_relaxed) && !skipping : (frames & 1) != 0;
+	const bool was_behind = behind.exchange(false, std::memory_order_relaxed); // any low or dry report since the last start
+	if (was_behind) d_starts_behind++;
+	skipping = automatic ? was_behind && !skipping : (frames & 1) != 0;
 	int slot = 0;
 	for (int i = 0; i < 4; i++)
 		if (buffer[i] == addr || !buffer[i])
@@ -3679,7 +3680,10 @@ extern "C" __attribute__((visibility("default"))) void joey64_vi_trim(int *out)
 }
 void parallel_audio_buffer_status(bool active, unsigned occupancy, bool underrun_likely)
 {
-	RDP::FSkip::behind.store(active && (occupancy <= 33 || underrun_likely), std::memory_order_relaxed);
+	// Held until the next frame start takes it: a game that draws every second refresh can have its audio run dry
+	// only in the refresh before the one its frames start in (MK64).
+	if (active && (occupancy <= 33 || underrun_likely))
+		RDP::FSkip::behind.store(true, std::memory_order_relaxed);
 	RDP::FSkip::d_cb_calls++;
 	if (active) RDP::FSkip::d_cb_active++;
 	if (occupancy <= 33) RDP::FSkip::d_cb_low++;
