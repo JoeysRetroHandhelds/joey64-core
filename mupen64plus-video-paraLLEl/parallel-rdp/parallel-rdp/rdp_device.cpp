@@ -1064,6 +1064,8 @@ void CommandProcessor::flush()
 		uint32_t(Op::MetaFlush) << 24,
 	};
 	enqueue_command_inner(1, words);
+	if (!single_threaded_processing)
+		ring.kick();
 }
 
 uint64_t CommandProcessor::signal_timeline()
@@ -1076,6 +1078,8 @@ uint64_t CommandProcessor::signal_timeline()
 		uint32_t(timeline_value >> 32),
 	};
 	enqueue_command_inner(3, words);
+	if (!single_threaded_processing)
+		ring.kick();
 
 	return timeline_value;
 }
@@ -1100,6 +1104,12 @@ void CommandProcessor::wait_for_timeline(uint64_t index)
 	Vulkan::QueryPoolHandle start_ts, end_ts;
 	if (measure_stall_time)
 		start_ts = device.write_calibrated_timestamp();
+	if (!single_threaded_processing)
+	{
+		if (!timeline_reached(index))
+			ring.note_wait();
+		ring.kick();
+	}
 	const uint64_t joey_t0 = joey_waitstats_on() ? joey_now_ns() : 0;
 	timeline_worker.wait([this, index]() -> bool {
 		return thread_timeline_value >= index;

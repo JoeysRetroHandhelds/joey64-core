@@ -47,6 +47,10 @@ public:
 	void drain();
 
 	void enqueue_command(unsigned num_words, const uint32_t *words);
+	// Wakes the worker if it sleeps: at the points where the queued commands must run soon.
+	void kick();
+	// The emulation thread is about to wait for the worker: wake eagerly for a while (see eager_until).
+	void note_wait();
 
 private:
 	CommandProcessor *processor = nullptr;
@@ -66,6 +70,21 @@ private:
 	std::atomic<bool> reader_waiting{false};
 	std::atomic<bool> writer_waiting{false};
 	std::atomic<bool> drain_waiting{false};
+
+	// Lazy waking (default; env N64_RDP_RING_LAZY=0 turns it off): the worker empties the ring faster than
+	// the emulation thread fills it, so it slept after almost every command and each one woke it again
+	// (Duo, SM64: ~20,000 wakeups a second, the emulation thread's 12-20% kernel time). Now a sleeping
+	// worker is woken once lazy_words are queued or at a kick; its 0.5 ms timed wait covers the rest.
+	bool lazy = true;
+	static constexpr uint64_t lazy_words = 1024;
+	// Adaptive (default; env N64_RDP_RING_ADAPT=0 turns it off): a game that waits on the worker (CPU reads of
+	// RDP output: Pokemon Snap, OoT's lens flare check) pays for every command the worker has not started yet,
+	// so lazy waking cost those games 3-15% on the Portal. After a wait the writer wakes eagerly until another
+	// eager_words have been written (about two frames of a busy game), so only games that keep waiting stay eager.
+	// Written and read on the emulation thread only.
+	bool adapt = true;
+	uint64_t eager_until = 0;
+	static constexpr uint64_t eager_words = 1 << 16;
 
 	void wake();
 	void thread_loop();
