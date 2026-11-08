@@ -82,6 +82,14 @@ void recomp_dbg_block(int addr);
 #error Unsupported dynarec architecture
 #endif
 
+/* Joey64 N64_DRC_THREAD: a queued compile works from a snapshot that can be stale (other code or data loaded there
+ * since it was queued); a sequence new_dynarec can't compile then drops that compile instead of ending the app. */
+#include <setjmp.h>
+static __thread int drc_bail_armed;
+static __thread jmp_buf drc_bail_jb;
+static __thread int drc_bail_hit;
+#define DRC_EXIT() do { if (drc_bail_armed) longjmp(drc_bail_jb, 1); exit(1); } while (0)
+
 #if ((1u << TARGET_SIZE_2) != NEW_DYNAREC_CACHE_SIZE)
 #error "NEW_DYNAREC_CACHE_SIZE must match TARGET_SIZE_2"
 #endif
@@ -359,6 +367,29 @@ static char *copy;
 static int expirep;
 // N64_DRC_STATS: blocks thrown away (invalidation), whole-cache flushes and expiry steps per window
 static unsigned drc_stat_inv_blocks, drc_stat_inv_all, drc_stat_expire;
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+#define DRC_STAT_RUNS drc_stat_runs
+#define DRC_STAT_INS drc_stat_ins
+#define DRC_STAT_FORCED drc_stat_forced
+#define DRC_STAT_TASYNC drc_stat_async
+#define DRC_STAT_TSYNC drc_stat_sync
+#define DRC_STAT_TWAIT drc_stat_wait_ms
+#define DRC_STAT_TDROP drc_stat_dropped
+#define DRC_STAT_RESET (drc_stat_runs = drc_stat_ins = drc_stat_forced = drc_stat_async = drc_stat_sync = drc_stat_dropped = 0, drc_stat_wait_ms = 0)
+static unsigned drc_stat_async, drc_stat_sync, drc_stat_dropped;
+static double drc_stat_wait_ms;
+static unsigned drc_stat_runs, drc_stat_ins, drc_stat_forced;
+#else
+#define DRC_STAT_RUNS 0u
+#define DRC_STAT_INS 0u
+#define DRC_STAT_FORCED 0u
+#define DRC_STAT_RESET ((void)0)
+#define DRC_STAT_TASYNC 0u
+#define DRC_STAT_TSYNC 0u
+#define DRC_STAT_TWAIT 0.0
+#define DRC_STAT_TDROP 0u
+#endif
+
 static u_int dirty_entry_count;
 static u_int copy_size;
 static struct ll_entry* hash_table[65536][2];
@@ -487,7 +518,7 @@ static uint64_t get_const(struct regstat *cur,signed char reg)
     }
   }
   DebugMessage(M64MSG_ERROR, "Unknown constant in r%d",reg);
-  exit(1);
+  DRC_EXIT();
 }
 
 // Least soon needed registers
@@ -2602,8 +2633,385 @@ static struct ll_entry *get_dirty(struct r4300_core* r4300,u_int vaddr,u_int fla
   return NULL;
 }
 
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+/* Joey64 (2026-11-07, README order item 7, step 1): compile only warm blocks. N64_DRC_HOT=<n> (2-255; unset, 0
+ * or 1 = off): a block nobody compiled yet runs in the pure interpreter until its n-th lookup, so code that runs
+ * once or twice (boot, loading, a new area's setup) is never compiled and a burst of new code (Mario Kart 64's
+ * 2122 blocks in 4 frames on the Flip) is spread out. The lookups return drc_interp_stub, which calls
+ * drc_interp_block. It runs one stretch of RDRAM code up to and including the first branch, with the state the
+ * dynarec keeps in memory (regs, pcaddr, cycle_count), and stops before anything that would need the dynarec's
+ * own handling: COP0, CACHE, SYSCALL/BREAK, traps, LL/SC, FPU arithmetic (rounding mode), memory outside RDRAM
+ * (MMIO, TLB-mapped data, the cartridge), self-branches (idle loops), a delay slot that isn't plain arithmetic,
+ * and getting within a few instructions of the next interrupt. If it can't run even the first instruction it
+ * compiles from there, as before. */
+extern void drc_interp_stub(void);
+void pure_interp_step(struct r4300_core* r4300);
+void dynarec_gen_interrupt(void);
+void *get_addr(u_int vaddr);
+void *get_addr_ht(u_int vaddr);
+static int drc_hot = -1, drc_force;
+static unsigned char drc_heat[65536];
+
+static int drc_in_rdram(u_int a)
+{
+  return (a >= 0x80000000u && a < 0x80800000u) || (a >= 0xA0000000u && a < 0xA0800000u);
+}
+
+static int drc_thread_on(void);
+static int drc_thread_cold(u_int vaddr);
+static void drc_service(void);
+
+/* 1: run vaddr in the interpreter this time; 0: compile it. */
+static int drc_cold(u_int vaddr)
+{
+  if (drc_thread_on() > 0) return drc_thread_cold(vaddr);
+  if (drc_hot < 0) {
+    const char* e = getenv("N64_DRC_HOT");
+    drc_hot = e && *e ? atoi(e) : 0;
+    if (drc_hot > 255) drc_hot = 255;
+    if (drc_hot > 1) DebugMessage(M64MSG_INFO, "dynarec: blocks compile on their %dth lookup, the pure interpreter runs them before", drc_hot);
+  }
+  if (drc_hot <= 1 || drc_force || (vaddr & 3) || !drc_in_rdram(vaddr)) return 0;
+  unsigned char* h = &drc_heat[((vaddr >> 2) ^ (vaddr >> 18)) & 0xFFFF];
+  if (*h + 1 >= drc_hot) { *h = 0; return 0; }
+  (*h)++;
+  return 1;
+}
+
+static int drc_mem_ok(struct r4300_core* r4300, u_int op)
+{
+  u_int a = (u_int)r4300_regs(r4300)[(op >> 21) & 31] + (u_int)(int)(short)op;
+  return drc_in_rdram(a) && drc_in_rdram(a + 7);
+}
+
+static int drc_cu1(struct r4300_core* r4300)
+{
+  return (r4300_cp0_regs(&r4300->cp0)[CP0_STATUS_REG] & CP0_STATUS_CU1) != 0;
+}
+
+/* 0: stop before it; 1: an ordinary instruction; 2: a branch or jump (the interpreter runs its delay slot);
+ * 3: like 1, but a load or store (not allowed in a linking branch's delay slot). */
+static int drc_classify(struct r4300_core* r4300, u_int op)
+{
+  u_int p = op >> 26, f = op & 63, rt = (op >> 16) & 31;
+  switch (p) {
+  case 0x00:
+    if (f == 0x08 || f == 0x09) return 2;                         /* JR, JALR */
+    if (f <= 0x07) return f == 0x01 || f == 0x05 ? 0 : 1;         /* shifts */
+    if (f == 0x0F) return 1;                                      /* SYNC */
+    if (f >= 0x10 && f <= 0x17) return f == 0x15 ? 0 : 1;         /* HI/LO moves, DSLLV.. */
+    if (f >= 0x18 && f <= 0x27) return 1;                         /* MULT..DDIVU, ADD..NOR */
+    if (f == 0x2A || f == 0x2B || (f >= 0x2C && f <= 0x2F)) return 1;
+    if (f == 0x38 || f == 0x3A || f == 0x3B || f == 0x3C || f == 0x3E || f == 0x3F) return 1;
+    return 0;                                                     /* SYSCALL, BREAK, traps, reserved */
+  case 0x01:
+    return (rt <= 0x03 || (rt >= 0x10 && rt <= 0x13)) ? 2 : 0;    /* BLTZ.., BLTZAL..; traps */
+  case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07:
+  case 0x14: case 0x15: case 0x16: case 0x17:
+    return 2;
+  case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D: case 0x0E: case 0x0F:
+  case 0x18: case 0x19:
+    return 1;
+  case 0x11: {                                                    /* COP1 */
+    u_int fmt = (op >> 21) & 31;
+    if (!drc_cu1(r4300)) return 0;
+    if (fmt == 8) return 2;                                       /* BC1x */
+    if (fmt == 0 || fmt == 1 || fmt == 2 || fmt == 4 || fmt == 5) return 1; /* MFC1 DMFC1 CFC1 MTC1 DMTC1 */
+    if (fmt == 16 || fmt == 17 || fmt == 20 || fmt == 21) return 1; /* S D W L arithmetic and conversions */
+    return 0;                                                     /* CTC1 (rounding mode), reserved */
+  }
+  case 0x1A: case 0x1B: case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
+  case 0x28: case 0x29: case 0x2A: case 0x2B: case 0x2C: case 0x2D: case 0x2E: case 0x37: case 0x3F:
+    return drc_mem_ok(r4300, op) ? 3 : 0;
+  case 0x31: case 0x35: case 0x39: case 0x3D:
+    return drc_cu1(r4300) && drc_mem_ok(r4300, op) ? 3 : 0;
+  default:
+    return 0;                                                     /* COP0, COP2, CACHE, LL/SC, reserved */
+  }
+}
+
+/* A branch the interpreter may run: not to itself (idle loops get the dynarec's handling) and its delay slot an
+ * ordinary instruction or an RDRAM load/store whose base isn't the register the branch links into. */
+static int drc_branch_ok(struct r4300_core* r4300, u_int pc, u_int op)
+{
+  u_int p = op >> 26, target = 0, link = 0;
+  if (p == 0x02 || p == 0x03) { target = ((pc + 4) & 0xF0000000u) | ((op & 0x3FFFFFF) << 2); link = p == 0x03; }
+  else if (p == 0x00) link = (op & 63) == 0x09;
+  else { target = pc + 4 + ((u_int)(int)(short)op << 2); link = p == 0x01 && ((op >> 16) & 31) >= 0x10; }
+  if (target == pc) return 0;
+  uint32_t* ds = fast_mem_access(r4300, pc + 4);
+  if (!ds) return 0;
+  int k = drc_classify(r4300, *ds);
+  u_int link_reg = p == 0x00 ? (op >> 11) & 31 : 31;
+  return k == 1 || (k == 3 && !(link && ((*ds >> 21) & 31) == link_reg));
+}
+
+/* N64_DRC_STATS: why drc_interp_block could not start a block (it then compiles it at once). */
+static unsigned drc_stat_why[10];
+static const char *const drc_why_name[10] = {"other", "pc not in RDRAM", "COP0", "FPU", "memory outside RDRAM",
+                                             "CACHE/LL/SC", "SYSCALL/BREAK/trap", "reserved", "branch", "interrupt due"};
+static int drc_why(struct r4300_core* r4300, u_int op)
+{
+  u_int p = op >> 26;
+  if (p == 0x10) return 2;
+  if (p == 0x11) return 3;
+  if (p == 0x31 || p == 0x35 || p == 0x39 || p == 0x3D) return drc_cu1(r4300) ? 4 : 3;
+  if (p == 0x2F || p == 0x30 || p == 0x34 || p == 0x38 || p == 0x3C) return 5;
+  if (p == 0x00 || p == 0x01) return 6;
+  if ((p >= 0x1A && p <= 0x2E) || p == 0x37 || p == 0x3F) return 4;
+  return 7;
+}
+
+void *drc_interp_block(void)
+{
+  struct r4300_core* r4300 = &g_dev.r4300;
+  struct new_dynarec_hot_state* hs = &r4300->new_dynarec_hot_state;
+  int* cc = r4300_cp0_cycle_count(&r4300->cp0);
+  const int64_t cpo = r4300->cp0.count_per_op ? r4300->cp0.count_per_op : 2;
+  drc_service();
+  u_int pc = hs->pcaddr;
+
+  if (*cc >= 0) {                 /* an interrupt is due: what cc_interrupt does, then this block again */
+    hs->pending_exception = 0;
+    dynarec_gen_interrupt();
+    if (*r4300_stop(r4300)) return (void*)drc_interp_stub; /* the stub sees stop */
+    return get_addr_ht(hs->pending_exception ? hs->pcaddr : pc);
+  }
+
+  cp0_update_count(r4300);        /* dynarec style: Count = next_interrupt + cycle_count */
+  struct precomp_instr* saved_pc = *r4300_pc_struct(r4300);
+  r4300->interp_PC.addr = pc;
+  r4300->cp0.last_addr = pc;
+  *r4300_pc_struct(r4300) = &r4300->interp_PC;
+  r4300->drc_interp = 1;
+  uint64_t fpcr;
+  __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+  int n = 0, why = 0;
+  for (;;) {
+    u_int at = r4300->interp_PC.addr;
+    if (n >= 256 || !drc_in_rdram(at) || at < r4300->cp0.last_addr) { why = 1; break; }
+    uint32_t* opp = fast_mem_access(r4300, at);
+    if (!opp) { why = 1; break; }
+    u_int op = *opp;
+    int k = drc_classify(r4300, op);
+    if (k == 0) { why = drc_why(r4300, op); break; }
+    if (k == 2 && !drc_branch_ok(r4300, at, op)) { why = 8; break; }
+    /* the count this adds (up to the delay slot), plus a margin, must stay short of the next interrupt */
+    if ((int64_t)(((at + 8 - r4300->cp0.last_addr) >> 2) + 4) * cpo >= -(int64_t)*cc) { why = 9; break; }
+    pure_interp_step(r4300);
+    n++;
+    if (k == 2 || r4300->interp_PC.addr != at + 4 || *cc >= 0) break; /* branched, an exception, or due */
+  }
+  if (r4300->interp_PC.addr != r4300->cp0.last_addr) cp0_update_count(r4300); /* interpreter style */
+  __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+  r4300->drc_interp = 0;
+  *r4300_pc_struct(r4300) = saved_pc;
+  hs->pcaddr = r4300->interp_PC.addr;
+  if (n == 0) {                   /* nothing it may run here: compile from this address, as without N64_DRC_HOT */
+    drc_stat_forced++;
+    drc_stat_why[why]++;
+    drc_force = 1;
+    void* r = get_addr(hs->pcaddr);
+    drc_force = 0;
+    return r;
+  }
+  drc_stat_runs++; drc_stat_ins += n;
+  return get_addr_ht(hs->pcaddr);
+}
+
+/* Joey64 (2026-11-07, README order item 7 step 3, Joey: "Try the thread anyway"): compile thread,
+ * N64_DRC_THREAD=1 (off by default). Every compile runs on one worker thread, so the compiler's globals have a
+ * single owner. A new block in RDRAM is queued: the emulation thread snapshots its code (16 KB) and keeps going
+ * in the interpreter (drc_interp_block); the worker compiles from the snapshot through pass 8 (assembly into the
+ * cache region the last compile's expiry freed), then waits until the emulation thread reaches a lookup (get_addr,
+ * the linkers, drc_interp_block: the points where a compile happens without the thread, where it is jumping
+ * away) and finishes there, pass 9 on (links, lists, hash table, expiry) while the emulation thread waits. The
+ * finish is dropped if the code changed since the snapshot or using_tlb did. Everything else (TLB-mapped code,
+ * the SP memory, boot, a block the interpreter can't start) compiles at once on the worker while the emulation
+ * thread waits, as it did on its own. */
+#include <pthread.h>
+#include <time.h>
+enum { DRC_T_IDLE, DRC_T_JOB, DRC_T_FRONT_DONE, DRC_T_GRANT };
+#define DRC_DROPPED 0x7777
+static int drc_thread = -1;
+static pthread_t drc_th;
+static pthread_mutex_t drc_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t drc_cv_worker = PTHREAD_COND_INITIALIZER, drc_cv_main = PTHREAD_COND_INITIALIZER;
+static volatile int drc_tstate = DRC_T_IDLE;
+static u_int drc_job_addr;
+static int drc_job_async, drc_job_result;
+static unsigned int drc_job_using_tlb;
+static int drc_in_worker_async;          /* the compile on the worker: from drc_snap, no check_addr */
+static __thread int drc_on_worker;
+static u_int drc_snap[MAXBLOCK + 4];
+static u_int drc_queue[4096];
+static int drc_qh, drc_qt;
+static unsigned char drc_queued[65536];
+static unsigned drc_stat_qfull;
+static int drc_job_bailed;           /* set by the worker under drc_mx: the last queued compile bailed */
+
+
+int new_recompile_block_worker(int addr);
+
+static double drc_ms(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static void *drc_worker(void *arg)
+{
+  (void)arg;
+  drc_on_worker = 1;
+  pthread_mutex_lock(&drc_mx);
+  for (;;) {
+    while (drc_tstate != DRC_T_JOB) pthread_cond_wait(&drc_cv_worker, &drc_mx);
+    u_int a = drc_job_addr;
+    int async = drc_job_async;
+    pthread_mutex_unlock(&drc_mx);
+    drc_in_worker_async = async;
+    int r;
+    u_char *out0 = out;
+    if (async && setjmp(drc_bail_jb)) { r = DRC_DROPPED; out = out0; drc_stat_dropped++; drc_bail_hit = 1; } /* see DRC_EXIT */
+    else { drc_bail_armed = async; r = new_recompile_block_worker(a); }
+    drc_bail_armed = 0;
+    drc_in_worker_async = 0;
+    pthread_mutex_lock(&drc_mx);
+    drc_job_result = r;
+    if (async && r == DRC_DROPPED && drc_bail_hit) drc_job_bailed = 1;
+    drc_bail_hit = 0;
+    drc_tstate = DRC_T_IDLE;
+    pthread_cond_broadcast(&drc_cv_main);
+  }
+  return NULL;
+}
+
+static int drc_thread_on(void)
+{
+  if (drc_thread < 0) {
+    const char* e = getenv("N64_DRC_THREAD");
+    drc_thread = e && *e == '1';
+    if (drc_thread && pthread_create(&drc_th, NULL, drc_worker, NULL) != 0) drc_thread = 0;
+    if (drc_thread) DebugMessage(M64MSG_INFO, "dynarec: compiling on its own thread; new RDRAM code runs in the interpreter until it is ready");
+  }
+  return drc_thread;
+}
+
+/* On the worker, at pass 9 of a queued compile: wait for the emulation thread, then check the code is unchanged.
+ * 1: drop this compile. */
+static int drc_front_done(void)
+{
+  pthread_mutex_lock(&drc_mx);
+  drc_tstate = DRC_T_FRONT_DONE;
+  pthread_cond_broadcast(&drc_cv_main);
+  while (drc_tstate != DRC_T_GRANT) pthread_cond_wait(&drc_cv_worker, &drc_mx);
+  pthread_mutex_unlock(&drc_mx);
+  /* the emulation thread waits in drc_finish now, so RDRAM holds still */
+  const u_int *live = (const u_int *)((uintptr_t)g_dev.rdram.dram + (start & 0x7FFFFF));
+  return using_tlb != drc_job_using_tlb || memcmp(live, drc_snap, (size_t)slen * 4) != 0;
+}
+
+/* With drc_mx held: let a queued compile that reached pass 9 finish, or wait for the one in flight to. */
+static void drc_finish_locked(int wait_running)
+{
+  for (;;) {
+    if (drc_tstate == DRC_T_FRONT_DONE) {
+      drc_tstate = DRC_T_GRANT;
+      pthread_cond_broadcast(&drc_cv_worker);
+      while (drc_tstate != DRC_T_IDLE) pthread_cond_wait(&drc_cv_main, &drc_mx);
+      if (drc_job_async && drc_job_result == DRC_DROPPED) drc_stat_dropped++;
+    }
+    else if (drc_tstate != DRC_T_IDLE && wait_running) pthread_cond_wait(&drc_cv_main, &drc_mx);
+    else return;
+  }
+}
+
+/* On the emulation thread at a lookup: finish a ready compile, start the next queued one. */
+static void drc_service(void)
+{
+  if (drc_thread <= 0) return;
+  int st = __atomic_load_n(&drc_tstate, __ATOMIC_ACQUIRE);
+  if (st == DRC_T_JOB || (st == DRC_T_IDLE && drc_qh == drc_qt && !__atomic_load_n(&drc_job_bailed, __ATOMIC_ACQUIRE))) return; /* nothing to finish or start: no lock */
+  struct r4300_core* r4300 = &g_dev.r4300;
+  pthread_mutex_lock(&drc_mx);
+  drc_finish_locked(0);
+  if (drc_job_bailed && drc_tstate == DRC_T_IDLE) {
+    drc_queued[((drc_job_addr >> 2) ^ (drc_job_addr >> 18)) & 0xFFFF] = 2; /* compile at once from now on */
+    drc_job_bailed = 0;
+  }
+  while (drc_tstate == DRC_T_IDLE && drc_qh != drc_qt) {
+    u_int a = drc_queue[drc_qh];
+    drc_qh = (drc_qh + 1) & 4095;
+    unsigned char *qm = &drc_queued[((a >> 2) ^ (a >> 18)) & 0xFFFF];
+    if (*qm == 1) *qm = 0;
+    if (get_clean(r4300, a, ~0) || get_dirty(r4300, a, ~0)) continue; /* compiled meanwhile */
+    u_int off = a & 0x7FFFFF, len = 0x800000 - off;
+    if (len > MAXBLOCK * 4) len = MAXBLOCK * 4;
+    memcpy(drc_snap, (char *)g_dev.rdram.dram + off, len);
+    memset((char *)drc_snap + len, 0, sizeof(drc_snap) - len);
+    drc_job_addr = a;
+    drc_job_async = 1;
+    drc_job_using_tlb = using_tlb;
+    drc_tstate = DRC_T_JOB;
+    drc_stat_async++;
+    pthread_cond_broadcast(&drc_cv_worker);
+  }
+  pthread_mutex_unlock(&drc_mx);
+}
+
+/* 1: the block is queued (or already is): run it in the interpreter meanwhile. 0: compile it now. */
+static int drc_thread_cold(u_int vaddr)
+{
+  if (drc_force || (vaddr & 3) || !drc_in_rdram(vaddr)) return 0;
+  unsigned char *q = &drc_queued[((vaddr >> 2) ^ (vaddr >> 18)) & 0xFFFF];
+  if (*q == 2) return 0;          /* its queued compile bailed: compile it now */
+  if (!*q) {
+    if (((drc_qt + 1) & 4095) == drc_qh) { drc_stat_qfull++; return 0; } /* queue full */
+    drc_queue[drc_qt] = vaddr;
+    drc_qt = (drc_qt + 1) & 4095;
+    *q = 1;
+  }
+  drc_service();
+  return 1;
+}
+
+/* A compile the emulation thread waits for. Once drc_finish_locked(1) returns the worker is idle and starts
+ * nothing until we give it a job under drc_mx, so the compiler is ours: compile here, no hand-off (Conker, whose
+ * code is TLB-mapped and so always compiles this way, spent ~20 us per block on the round trip, -33% on the Duo). */
+static int drc_compile_sync(u_int addr)
+{
+  struct r4300_core* r4300 = &g_dev.r4300;
+  double t0 = drc_ms();
+  pthread_mutex_lock(&drc_mx);
+  drc_finish_locked(1);
+  int r = 0;
+  if (!get_clean(r4300, addr, ~0) && !get_dirty(r4300, addr, ~0)) {
+    r = new_recompile_block_worker(addr);
+  }
+  drc_stat_sync++;
+  pthread_mutex_unlock(&drc_mx);
+  drc_stat_wait_ms += drc_ms() - t0;
+  return r;
+}
+
+/* Before the cache is flushed or freed: nothing in flight, nothing queued. */
+static void drc_drain(void)
+{
+  if (drc_thread <= 0) return;
+  pthread_mutex_lock(&drc_mx);
+  drc_finish_locked(1);
+  drc_qh = drc_qt = 0;
+  memset(drc_queued, 0, sizeof(drc_queued));
+  pthread_mutex_unlock(&drc_mx);
+}
+#endif
+
 void *dynamic_linker(void * src, u_int vaddr)
 {
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  drc_service(); /* Joey64: N64_DRC_THREAD */
+#endif
   assert((vaddr&1)==0);
   struct r4300_core* r4300 = &g_dev.r4300;
   struct ll_entry *head;
@@ -2651,6 +3059,9 @@ void *dynamic_linker(void * src, u_int vaddr)
     return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
   }
 
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  if(drc_cold(vaddr)) { r4300->new_dynarec_hot_state.pcaddr=vaddr; return (void*)drc_interp_stub; } // not linked
+#endif
   int r=new_recompile_block(vaddr);
   if(r==0) return dynamic_linker(src,vaddr);
   // Execute in unmapped page, generate pagefault execption
@@ -2663,6 +3074,9 @@ void *dynamic_linker(void * src, u_int vaddr)
 
 void *dynamic_linker_ds(void * src, u_int vaddr)
 {
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  drc_service(); /* Joey64: N64_DRC_THREAD */
+#endif
   struct r4300_core* r4300 = &g_dev.r4300;
   struct ll_entry *head;
 
@@ -2723,6 +3137,9 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
 // This is called from the recompiled JR/JALR instructions
 void *get_addr(u_int vaddr)
 {
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  drc_service(); /* Joey64: N64_DRC_THREAD */
+#endif
   struct r4300_core* r4300 = &g_dev.r4300;
   struct ll_entry *head;
   struct ll_entry **ht_bin=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
@@ -2747,6 +3164,9 @@ void *get_addr(u_int vaddr)
     return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
   }
 
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  if(drc_cold(vaddr)) { r4300->new_dynarec_hot_state.pcaddr=vaddr; return (void*)drc_interp_stub; }
+#endif
   int r=new_recompile_block(vaddr);
   if(r==0) return get_addr(vaddr);
   // Execute in unmapped page, generate pagefault execption
@@ -2768,6 +3188,9 @@ void *get_addr_ht(u_int vaddr)
 
 void *get_addr_32(u_int vaddr,u_int flags)
 {
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  drc_service(); /* Joey64: N64_DRC_THREAD */
+#endif
   struct ll_entry **ht_bin=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
   if(ht_bin[0]&&ht_bin[0]->vaddr==vaddr) return (void *)(((intptr_t)ht_bin[0]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
   if(ht_bin[1]&&ht_bin[1]->vaddr==vaddr) return (void *)(((intptr_t)ht_bin[1]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
@@ -2964,6 +3387,9 @@ void invalidate_block(u_int block)
 // Anything could have changed, so invalidate everything.
 static void invalidate_all_pages(void)
 {
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  drc_drain();
+#endif
   u_int page;
   drc_stat_inv_all++;
   for(page=0;page<4096;page++)
@@ -4797,7 +5223,7 @@ static void do_ccstub(int n)
       }
       emit_writeword(r,(intptr_t)&g_dev.r4300.new_dynarec_hot_state.pcaddr);
     }
-    else {DebugMessage(M64MSG_ERROR, "Unknown branch type in do_ccstub");exit(1);}
+    else {DebugMessage(M64MSG_ERROR, "Unknown branch type in do_ccstub");DRC_EXIT();}
   }
   // Update cycle count
   assert(branch_regs[i].regmap[HOST_CCREG]==CCREG||branch_regs[i].regmap[HOST_CCREG]==-1);
@@ -8712,6 +9138,9 @@ ALIGN(4096, char jit_memory[33554432]) __attribute__((section(".text")));
 #endif
 void new_dynarec_init(void)
 {
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  drc_drain();
+#endif
   DebugMessage(M64MSG_INFO, "Init new dynarec");
   ensure_dynarec_cache_alignment();
 
@@ -8834,6 +9263,9 @@ void new_dynarec_init(void)
 
 void new_dynarec_cleanup(void)
 {
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  drc_drain();
+#endif
 #if defined(RECOMPILER_DEBUG) && !defined(RECOMP_DBG)
   recomp_dbg_cleanup();
 #endif
@@ -8872,6 +9304,14 @@ static double drc_now_ms(void)
 
 int new_recompile_block(int addr)
 {
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  if (!drc_on_worker && drc_thread_on() > 0) return drc_compile_sync((u_int)addr); /* N64_DRC_THREAD */
+#endif
+  return new_recompile_block_worker(addr);
+}
+
+int new_recompile_block_worker(int addr)
+{
 #ifndef _WIN32
   static int enabled = -1;
   static double window_start, total_ms, worst_ms;
@@ -8888,9 +9328,19 @@ int new_recompile_block(int addr)
     if (d > worst_ms) worst_ms = d;
     if (window_start == 0) window_start = t0;
     if (t1 - window_start >= 5000) {
-      DebugMessage(M64MSG_INFO, "dynarec: %u blocks compiled in the last %.0f ms, %.2f ms total, worst %.2f ms; %u blocks invalidated, %u full flushes, %u expiry steps",
-                   blocks, t1 - window_start, total_ms, worst_ms, drc_stat_inv_blocks, drc_stat_inv_all, drc_stat_expire);
+      DebugMessage(M64MSG_INFO, "dynarec: %u blocks compiled in the last %.0f ms, %.2f ms total, worst %.2f ms; %u blocks invalidated, %u full flushes, %u expiry steps; interpreted %u stretches, %u instructions, %u compiled at once; thread %u queued, %u waited for (%.1f ms), %u dropped",
+                   blocks, t1 - window_start, total_ms, worst_ms, drc_stat_inv_blocks, drc_stat_inv_all, drc_stat_expire, DRC_STAT_RUNS, DRC_STAT_INS, DRC_STAT_FORCED, DRC_STAT_TASYNC, DRC_STAT_TSYNC, DRC_STAT_TWAIT, DRC_STAT_TDROP);
       drc_stat_inv_blocks = drc_stat_inv_all = drc_stat_expire = 0;
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+      if (DRC_STAT_FORCED) {
+        char wb[256]; int wl = 0;
+        for (int w = 0; w < 10; w++) if (drc_stat_why[w]) wl += snprintf(wb + wl, sizeof(wb) - wl, "%s%s %u", wl ? ", " : "", drc_why_name[w], drc_stat_why[w]);
+        DebugMessage(M64MSG_INFO, "dynarec: compiled at once because the interpreter stopped at: %s; queue full %u times", wb, drc_stat_qfull);
+        drc_stat_qfull = 0;
+        memset(drc_stat_why, 0, sizeof(drc_stat_why));
+      }
+#endif
+      DRC_STAT_RESET;
       window_start = t1; total_ms = worst_ms = 0; blocks = 0;
     }
     return r;
@@ -8952,6 +9402,9 @@ static int new_recompile_block_impl(int addr)
     DebugMessage(M64MSG_ERROR, "Compile at bogus memory address: %x", (int)addr);
     exit(1);
   }
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  if (drc_in_worker_async) source = drc_snap; /* N64_DRC_THREAD: the snapshot taken when it was queued (RDRAM only) */
+#endif
 
   /* Pass 1: disassemble */
   /* Pass 2: register dependencies, branch targets */
@@ -9486,7 +9939,7 @@ static int new_recompile_block_impl(int addr)
         if((source[i+1]&0xfc00003f)==0x0d) done=1;
       }
       // Don't recompile stuff that's already compiled
-      if(check_addr(start+i*4+4)) done=1;
+      if(!drc_in_worker_async && check_addr(start+i*4+4)) done=1; /* Joey64: no list reads off the emulation thread */
       // Don't get too close to the limit
       if(i>MAXBLOCK/2) done=1;
     }
@@ -9706,7 +10159,7 @@ static int new_recompile_block_impl(int addr)
         current.uu&=~((1LL<<us1[i])|(1LL<<us2[i]));
         current.u|=1;
         current.uu|=1;
-      } else { DebugMessage(M64MSG_ERROR, "oops, branch at end of block with no delay slot");exit(1); }
+      } else { DebugMessage(M64MSG_ERROR, "oops, branch at end of block with no delay slot");DRC_EXIT(); }
     }
     is_ds[i]=ds;
     if(ds) {
@@ -11845,6 +12298,10 @@ static int new_recompile_block_impl(int addr)
     }
   }
 
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  /* N64_DRC_THREAD: a queued compile finishes only while the emulation thread waits at a lookup */
+  if (drc_in_worker_async && drc_front_done()) { out=(u_char *)beginning; return DRC_DROPPED; }
+#endif
   /* Pass 9 - Linker */
   for(i=0;i<linkcount;i++)
   {

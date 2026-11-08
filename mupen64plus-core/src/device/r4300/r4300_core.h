@@ -201,6 +201,10 @@ struct r4300_core
     uint32_t randomize_interrupt;
 
     uint32_t start_address;
+
+    /* Joey64 (N64_DRC_HOT): 1 while new_dynarec hands a cold block to the pure interpreter
+     * (drc_interp_block): the PC is interp_PC and the count advances as the interpreter's. */
+    uint32_t drc_interp;
 };
 
 #define R4300_KSEG0 UINT32_C(0x80000000)

@@ -250,7 +250,7 @@ unsigned int* r4300_llbit(struct r4300_core* r4300)
 uint32_t* r4300_pc(struct r4300_core* r4300)
 {
 #ifdef NEW_DYNAREC
-    return (r4300->emumode == EMUMODE_DYNAREC)
+    return (r4300->emumode == EMUMODE_DYNAREC && !r4300->drc_interp)
         ? (uint32_t*)&r4300->new_dynarec_hot_state.pcaddr
         : &(*r4300_pc_struct(r4300))->addr;
 #else
@@ -438,6 +438,10 @@ void generic_jump_to(struct r4300_core* r4300, uint32_t address)
 #ifndef NO_ASM
     case EMUMODE_DYNAREC:
 #ifdef NEW_DYNAREC
+        if (r4300->drc_interp) { /* an interpreted cold block: the interpreter's PC moves */
+            r4300->interp_PC.addr = address;
+            break;
+        }
         r4300->new_dynarec_hot_state.pcaddr = address;
         r4300->new_dynarec_hot_state.pending_exception = 1;
 #else

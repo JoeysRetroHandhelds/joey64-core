@@ -537,7 +537,7 @@ static void alloc_reg(struct regstat *cur,int i,signed char tr)
       }
     }
   }
-  DebugMessage(M64MSG_ERROR, "This shouldn't happen (alloc_reg)");exit(1);
+  DebugMessage(M64MSG_ERROR, "This shouldn't happen (alloc_reg)");DRC_EXIT();
 }
 
 static void alloc_reg64(struct regstat *cur,int i,signed char tr)
@@ -701,7 +701,7 @@ static void alloc_reg64(struct regstat *cur,int i,signed char tr)
       }
     }
   }
-  DebugMessage(M64MSG_ERROR, "This shouldn't happen");exit(1);
+  DebugMessage(M64MSG_ERROR, "This shouldn't happen");DRC_EXIT();
 }
 
 // Allocate a temporary register.  This is done without regard to
@@ -823,7 +823,7 @@ static void alloc_reg_temp(struct regstat *cur,int i,signed char tr)
       }
     }
   }
-  DebugMessage(M64MSG_ERROR, "This shouldn't happen");exit(1);
+  DebugMessage(M64MSG_ERROR, "This shouldn't happen");DRC_EXIT();
 }
 // Allocate a specific ARM64 register.
 static void alloc_arm64_reg(struct regstat *cur,int i,signed char tr,int hr)

@@ -752,6 +752,12 @@ void InterpretOpcode(struct r4300_core* r4300)
 	} /* switch ((op >> 26) & 0x3F) */
 }
 
+/* Joey64: one instruction at interp_PC (a branch runs its delay slot too), for new_dynarec's cold blocks. */
+void pure_interp_step(struct r4300_core* r4300)
+{
+    InterpretOpcode(r4300);
+}
+
 void run_pure_interpreter(struct r4300_core* r4300)
 {
    *r4300_stop(r4300) = 0;
