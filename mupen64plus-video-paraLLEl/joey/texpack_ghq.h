@@ -9,5 +9,7 @@ bool texpack_ghq_init(const char *dir, const char *romname);
 void texpack_ghq_shutdown();
 // The pack's texture for a GLideN64 key (Rice CRC: palette CRC << 32 | texture CRC; N64 format and size), as RGBA8
 // (R in the low byte). palette: GLideN64's TexFilterPalette (512 entries), used for true CI pack textures.
+void texpack_ghq_fmtstats(bool on);
+void texpack_ghq_fmtstats_line(char *buf, size_t len);
 bool texpack_ghq_lookup(uint64_t crc, unsigned fmt, unsigned siz, const uint16_t *palette, std::vector<uint32_t> &out,
                         unsigned &width, unsigned &height);

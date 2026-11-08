@@ -1139,6 +1139,8 @@ static void init(const char *romname)
 	{
 		const char *m = getenv("N64_RDP_TEXPACK_MIPS");
 		mips_on = !(m && m[0] == '0');
+		const char *f = getenv("N64_RDP_TEXPACK_FMTSTATS");
+		texpack_ghq_fmtstats(f && f[0] == '1');
 	}
 	size_t bytes = 0;
 	texels = static_cast<uint32_t *>(frontend->enable_texpack(mb << 20, bytes, &image));
@@ -1236,6 +1238,13 @@ static void on_frame(unsigned textured)
 	       "600 frames: %u of %u textured draws replaced, %u waiting.\n", loaded_count.load(), loaded_kb.load() >> 10,
 	       unsigned((capacity * 4) >> 20), failed_count.load(), evicted_count.load(), hits, textured, pending_draws);
 	frames = hits = pending_draws = 0;
+	if (const char *f = getenv("N64_RDP_TEXPACK_FMTSTATS"))
+		if (f[0] == '1')
+		{
+			char line[400];
+			texpack_ghq_fmtstats_line(line, sizeof(line));
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: texture packs: formats: %s.\n", line);
+		}
 }
 }
 
