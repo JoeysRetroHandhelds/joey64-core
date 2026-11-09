@@ -2204,10 +2204,55 @@ size_t retro_serialize_size (void)
     return 16788288 + 1024 + 4 + 4096;
 }
 
+/* Joey64 (run-ahead, 2026-11-09): when the game thread waits at the end of a frame (new_vi), a state is taken or
+ * loaded right here, with no instruction run in between. The state job instead ran the game on to its next
+ * interrupt first (and a load then started from a point a little past the frame's end), so taking and loading
+ * a state every frame changed the game: Pokemon Snap and Mario Kart 64 froze, SM64 drifted. N64_STATE_DIRECT=0
+ * keeps the job. Not with GLideN64's threaded renderer, whose game thread doesn't wait in new_vi. */
+extern int g_at_frame_edge;
+static bool state_direct(int load)
+{
+   static int on = -1;
+   if (on < 0)
+   {
+      const char *e = getenv("N64_STATE_DIRECT"); /* 0 off, s saves only, l loads only (debug) */
+      on = !e || !e[0] ? 3 : e[0] == '0' ? 0 : e[0] == 's' ? 1 : e[0] == 'l' ? 2 : 3;
+   }
+   return (on & (load ? 2 : 1)) && g_at_frame_edge && !(current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer);
+}
+
 bool retro_serialize(void *data, size_t size)
 {
    if (initializing)
       return false;
+
+   if (state_direct(0))
+   {
+      bool ok;
+      /* An RSP task still running at the frame's end (interrupt_unsafe_state) isn't in a state: the job waits until
+       * it's done, past the frame's end, and a state taken now loses the task (the game then waits for it for good:
+       * SM64 froze). Not now, then: the frontend runs this frame without run-ahead. */
+      static unsigned tried, unsafe;
+      if (++tried >= 600)
+      {
+         if (unsafe)
+            log_cb(RETRO_LOG_INFO, CORE_NAME ": state at the frame's end: %u of %u with an RSP task running\n", unsafe, tried);
+         tried = unsafe = 0;
+      }
+      if (g_dev.r4300.cp0.interrupt_unsafe_state)
+      {
+         unsafe++;
+         return false;
+      }
+      retro_savestate_result = 0;
+      if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
+         glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
+      ok = savestates_save_m64p(&g_dev, data) && retro_savestate_result;
+      if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
+         glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
+      retro_savestate_complete = true;
+      return ok;
+   }
 
    retro_savestate_complete = false;
    retro_savestate_result = 0;
@@ -2256,6 +2301,19 @@ bool retro_unserialize(const void *data, size_t size)
       if (version >= 0x00010200) need += 4096;
       if (size < need)
          return false;
+   }
+
+   if (state_direct(1))
+   {
+      int ret;
+      if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
+         glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
+      ret = savestates_load_m64p(&g_dev, data);
+      if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
+         glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
+      retro_savestate_complete = true;
+      retro_savestate_result = ret;
+      return ret != 0;
    }
 
    retro_savestate_complete = false;

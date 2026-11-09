@@ -829,6 +829,8 @@ static void pause_loop(void)
 
 /* called on vertical interrupt.
  * Allow the core to perform various things */
+int g_at_frame_edge = 0;
+
 void new_vi(void)
 {
 #if defined(PROFILE)
@@ -841,7 +843,11 @@ void new_vi(void)
     main_check_inputs();
 
     netplay_check_sync(&g_dev.r4300.cp0);
+    /* Joey64: retro_run returns here, the frame's end. While the game thread waits here, retro_serialize and
+     * retro_unserialize take and load the state at once, with no instruction run in between (run-ahead). */
+    g_at_frame_edge = 1;
     retro_return();
+    g_at_frame_edge = 0;
 }
 
 static void main_switch_pak(int control_id)

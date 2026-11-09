@@ -198,6 +198,65 @@ static void savestates_clear_job(void)
 #define COPYARRAY(dst, buff, type, count) \
     memcpy(dst, GETARRAY(buff, type, count), sizeof(type)*count)
 #define GETDATA(buff, type) *GETARRAY(buff, type, 1)
+
+/* Joey64 (run-ahead, 2026-11-09): a libretro state is read where the frontend keeps it (no 16 MB copy into a
+ * fresh buffer: 7 ms a load on the Thor, page faults included), and RDRAM and the TLB tables are written only
+ * where they differ. Only the recompiled code of RDRAM pages whose bytes changed is dropped (as a DMA does), not
+ * all of it, unless the TLB tables changed or the game maps code through the TLB. N64_STATE_FLUSH_ALL=1 drops
+ * it all, as before. */
+#ifdef __LIBRETRO__
+#define SS_FREE(p) ((void)0)
+#else
+#define SS_FREE(p) free(p)
+#endif
+static uint8_t ss_changed_pages[RDRAM_MAX_SIZE / 4096];
+static int ss_tables_changed;
+
+/* Copies [count] words from [src] over [dst] page by page, only the pages that differ; marks them. */
+static void ss_copy_rdram(uint32_t* dst, const unsigned char* src, size_t bytes)
+{
+    size_t p, pages = bytes / 4096;
+    for (p = 0; p < pages; ++p)
+    {
+        uint8_t* d = (uint8_t*)dst + p * 4096;
+        const uint8_t* s = src + p * 4096;
+        ss_changed_pages[p] = memcmp(d, s, 4096) != 0;
+        if (ss_changed_pages[p])
+            memcpy(d, s, 4096);
+    }
+}
+
+static void ss_copy_table(uint32_t* dst, const unsigned char* src, size_t bytes)
+{
+    if (memcmp(dst, src, bytes) != 0)
+    {
+        memcpy(dst, src, bytes);
+        ss_tables_changed = 1;
+    }
+}
+
+/* After a load: the jump to the state's PC, and the recompiled code that no longer matches RDRAM dropped. */
+static void ss_drop_changed_code(struct r4300_core* r4300, int full)
+{
+    static int flush_all = -1;
+    size_t p;
+    if (flush_all < 0)
+    {
+        const char* e = getenv("N64_STATE_FLUSH_ALL");
+        flush_all = e && e[0] == '1';
+    }
+    if (full || flush_all || ss_tables_changed)
+    {
+        invalidate_r4300_cached_code(r4300, 0, 0);
+        return;
+    }
+    for (p = 0; p < RDRAM_MAX_SIZE / 4096; ++p)
+        if (ss_changed_pages[p])
+        {
+            invalidate_r4300_cached_code(r4300, 0x80000000u + (uint32_t)p * 4096, 4096);
+            invalidate_r4300_cached_code(r4300, 0xA0000000u + (uint32_t)p * 4096, 4096);
+        }
+}
 #define PUTARRAY(src, buff, type, count) \
     memcpy(buff, src, sizeof(type)*count); \
     to_little_endian_buffer(buff, sizeof(type), count); \
@@ -333,7 +392,11 @@ int savestates_load_m64p(struct device* dev, const void *data)
 
     /* Read the rest of the savestate */
     savestateSize = 16788244;
+#ifdef __LIBRETRO__
+    savestateData = curr = (unsigned char *)data + 44; /* read in place (Joey64) */
+#else
     savestateData = curr = (unsigned char *)malloc(savestateSize);
+#endif
     if (savestateData == NULL)
     {
         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient memory to load state.");
@@ -354,7 +417,7 @@ int savestates_load_m64p(struct device* dev, const void *data)
             (gzread(f, queue, sizeof(queue)) % 4) != 0)
         {
             main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read Mupen64Plus savestate 1.0 data from %s", filepath);
-            free(savestateData);
+            SS_FREE(savestateData);
             gzclose(f);
 #ifdef USE_SDL
             SDL_UnlockMutex(savestates_lock);
@@ -362,7 +425,6 @@ int savestates_load_m64p(struct device* dev, const void *data)
             return 0;
         }
 #else
-        memcpy(savestateData, data + 44, savestateSize);
         memcpy(queue, data + 44 + savestateSize, sizeof(queue));
 #endif
     }
@@ -374,7 +436,7 @@ int savestates_load_m64p(struct device* dev, const void *data)
             gzread(f, using_tlb_data, sizeof(using_tlb_data)) != sizeof(using_tlb_data))
         {
             main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read Mupen64Plus savestate 1.1 data from %s", filepath);
-            free(savestateData);
+            SS_FREE(savestateData);
             gzclose(f);
 #ifdef USE_SDL
             SDL_UnlockMutex(savestates_lock);
@@ -382,7 +444,6 @@ int savestates_load_m64p(struct device* dev, const void *data)
             return 0;
         }
 #else
-        memcpy(savestateData, data + 44, savestateSize);
         memcpy(queue, data + 44 + savestateSize, sizeof(queue));
         memcpy(using_tlb_data, data + 44 + savestateSize + sizeof(queue), sizeof(using_tlb_data));
 #endif
@@ -396,7 +457,7 @@ int savestates_load_m64p(struct device* dev, const void *data)
             gzread(f, data_0001_0200, sizeof(data_0001_0200)) != sizeof(data_0001_0200))
         {
             main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read Mupen64Plus savestate 1.2+ data from %s", filepath);
-            free(savestateData);
+            SS_FREE(savestateData);
             gzclose(f);
 #ifdef USE_SDL
             SDL_UnlockMutex(savestates_lock);
@@ -404,7 +465,6 @@ int savestates_load_m64p(struct device* dev, const void *data)
             return 0;
         }
 #else
-        memcpy(savestateData, data + 44, savestateSize);
         memcpy(queue, data + 44 + savestateSize, sizeof(queue));
         memcpy(using_tlb_data, data + 44 + savestateSize + sizeof(queue), sizeof(using_tlb_data));
         memcpy(data_0001_0200, data + 44 + savestateSize + sizeof(queue) + sizeof(using_tlb_data), sizeof(data_0001_0200));
@@ -423,7 +483,7 @@ int savestates_load_m64p(struct device* dev, const void *data)
     if (!savestates_queue_has_terminator(queue, sizeof(queue)))
     {
         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Invalid event queue in savestate");
-        free(savestateData);
+        SS_FREE(savestateData);
         return 0;
     }
 
@@ -542,7 +602,7 @@ int savestates_load_m64p(struct device* dev, const void *data)
     dev->dp.dps_regs[DPS_BUFTEST_ADDR_REG] = GETDATA(curr, uint32_t);
     dev->dp.dps_regs[DPS_BUFTEST_DATA_REG] = GETDATA(curr, uint32_t);
 
-    COPYARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
+    ss_copy_rdram(dev->rdram.dram, curr, RDRAM_MAX_SIZE); curr += RDRAM_MAX_SIZE; /* only what differs (Joey64) */
     COPYARRAY(dev->sp.mem, curr, uint32_t, SP_MEM_SIZE/4);
     COPYARRAY(dev->pif.ram, curr, uint8_t, PIF_RAM_SIZE);
 
@@ -551,8 +611,9 @@ int savestates_load_m64p(struct device* dev, const void *data)
     /* by default, reset flashram state here and load it later if available */
     poweron_flashram(&dev->cart.flashram);
 
-    COPYARRAY(dev->r4300.cp0.tlb.LUT_r, curr, uint32_t, 0x100000);
-    COPYARRAY(dev->r4300.cp0.tlb.LUT_w, curr, uint32_t, 0x100000);
+    ss_tables_changed = 0;
+    ss_copy_table(dev->r4300.cp0.tlb.LUT_r, curr, 0x100000 * 4); curr += 0x100000 * 4;
+    ss_copy_table(dev->r4300.cp0.tlb.LUT_w, curr, 0x100000 * 4); curr += 0x100000 * 4;
 
     *r4300_llbit(&dev->r4300) = GETDATA(curr, uint32_t);
     COPYARRAY(r4300_regs(&dev->r4300), curr, int64_t, 32);
@@ -594,7 +655,7 @@ int savestates_load_m64p(struct device* dev, const void *data)
         dev->r4300.cp0.tlb.entries[i].phys_odd = GETDATA(curr, uint32_t);
     }
 
-    savestates_load_set_pc(&dev->r4300, GETDATA(curr, uint32_t));
+    generic_jump_to(&dev->r4300, GETDATA(curr, uint32_t)); /* code dropped at the end (ss_drop_changed_code) */
 
     *r4300_cp0_next_interrupt(&dev->r4300.cp0) = GETDATA(curr, uint32_t);
     curr += 4; /* here there used to be next_vi */
@@ -1079,7 +1140,13 @@ int savestates_load_m64p(struct device* dev, const void *data)
 
     *r4300_cp0_last_addr(&dev->r4300.cp0) = *r4300_pc(&dev->r4300);
 
-    free(savestateData);
+#ifdef NEW_DYNAREC
+    ss_drop_changed_code(&dev->r4300, using_tlb != 0);
+#else
+    ss_drop_changed_code(&dev->r4300, 0);
+#endif
+
+    SS_FREE(savestateData);
 
 #ifndef __LIBRETRO__
     main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State loaded from: %s", namefrompath(filepath));
@@ -1660,9 +1727,11 @@ static void savestates_save_m64p_work(struct work_struct *work)
     gzclose(f);
     main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Saved state to: %s", namefrompath(save->filepath));
 #else
-    memcpy(save->mempointer, save->data, save->size);
+    /* built in place (Joey64) */
 #endif
+#ifndef __LIBRETRO__
     free(save->data);
+#endif
 #ifndef __LIBRETRO__
     free(save->filepath);
 #endif
@@ -1713,7 +1782,11 @@ int savestates_save_m64p(const struct device* dev, void *data)
 
     // Allocate memory for the save state data
     save->size = 16788288 + sizeof(queue) + 4 + 4096;
+#ifdef __LIBRETRO__
+    save->data = curr = save->mempointer; /* straight into the frontend's buffer (Joey64) */
+#else
     save->data = curr = malloc(save->size);
+#endif
     if (save->data == NULL)
     {
         free(save->filepath);
