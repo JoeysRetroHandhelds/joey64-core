@@ -2436,6 +2436,23 @@ static void tlb_speed_hacks()
   }
 }
 
+
+/* Joey64: code in cartridge ROM (KSEG0 0x90000000 / KSEG1 0xb0000000 + the PI cart domain 0x10000000-0x1fbfffff).
+ * Real hardware and the interpreters run it; new_dynarec stopped with "Compile at bogus memory address" and exit(1).
+ * Sin and Punishment's English patch runs a hook at the end of its 32 MB ROM (0xb1ffff70: writes a stub into RDRAM
+ * and jumps to it). The ROM is held as native 32-bit words like RDRAM and never changes, so a block compiles from it
+ * as it would from RDRAM. Returns the host pointer for addr, or NULL when addr is not inside the loaded ROM; *limit
+ * gets the virtual address where the ROM ends. */
+static u_int *cart_rom_source(u_int addr, u_int *limit)
+{
+  u_int seg = addr & 0xe0000000;
+  u_int phys = addr & 0x1fffffff;
+  if ((seg != 0x80000000 && seg != 0xa0000000) || phys < 0x10000000 || phys >= 0x1fc00000) return NULL;
+  u_int off = phys - 0x10000000;
+  if (g_dev.cart.cart_rom.rom == NULL || off >= g_dev.cart.cart_rom.rom_size) return NULL;
+  if (limit) *limit = addr - off + g_dev.cart.cart_rom.rom_size;
+  return (u_int *)((uintptr_t)g_dev.cart.cart_rom.rom + (off & ~3u));
+}
 /**** Linker ****/
 u_int verify_dirty(struct ll_entry * head)
 {
@@ -2460,8 +2477,8 @@ u_int verify_dirty(struct ll_entry * head)
     }
     source=(void*)(head->start+(map_value<<2));
   }
-  else
-    assert(0);
+  else if((source=cart_rom_source(head->start,NULL))==NULL)
+    return head->vaddr; /* not a place code can be: treat as changed (was assert(0), a NULL memcmp in release builds) */
 
   if(memcmp(source,head->copy,head->length))
     return head->vaddr;
@@ -9396,6 +9413,10 @@ static int new_recompile_block_impl(int addr)
       return 1; // Caller will invoke exception handler
     }
     //DebugMessage(M64MSG_VERBOSE, "source= %x",(intptr_t)source);
+  }
+  else if ((source = cart_rom_source((u_int)start, &pagelimit)) != NULL) {
+    static int told;
+    if (!told++) DebugMessage(M64MSG_INFO, "dynarec: compiling code in cartridge ROM (first at %x)", (int)addr);
   }
   else {
     //DebugMessage(M64MSG_VERBOSE, "Compile at bogus memory address: %x ", (int)addr);
