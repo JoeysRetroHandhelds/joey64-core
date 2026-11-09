@@ -32,6 +32,40 @@ extern "C"
 	int hleTryAudioTask(void);
 	static bool hle_audio;
 
+	// Joey64 (run-ahead): what this RSP keeps from one call to the next, outside the core's state (its registers,
+	// vector unit and delay slot; the PC goes through SP_PC_REG). Kept with a run-ahead state so one can be taken
+	// while a task is still running, and so the extra frames' register changes don't stay after the load.
+	struct parallel_rsp_saved
+	{
+		uint32_t sr[33];
+		RSP::CP2 cp2;
+		uint32_t pc, has_delay_slot, branch_target;
+	};
+	size_t parallel_rsp_state_size(void)
+	{
+		return sizeof(parallel_rsp_saved);
+	}
+	void parallel_rsp_state_save(void *out)
+	{
+		auto &s = RSP::cpu.get_state();
+		auto *o = static_cast<parallel_rsp_saved *>(out);
+		memcpy(o->sr, s.sr, sizeof(o->sr));
+		o->cp2 = s.cp2;
+		o->pc = s.pc;
+		o->has_delay_slot = s.has_delay_slot;
+		o->branch_target = s.branch_target;
+	}
+	void parallel_rsp_state_load(const void *in)
+	{
+		auto &s = RSP::cpu.get_state();
+		auto *i = static_cast<const parallel_rsp_saved *>(in);
+		memcpy(s.sr, i->sr, sizeof(i->sr));
+		s.cp2 = i->cp2;
+		s.pc = i->pc;
+		s.has_delay_slot = i->has_delay_slot;
+		s.branch_target = i->branch_target;
+	}
+
 	// Hack entry point to use when loading savestates when we're tracing.
 	void rsp_clear_registers()
 	{

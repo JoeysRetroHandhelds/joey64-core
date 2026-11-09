@@ -2210,6 +2210,36 @@ size_t retro_serialize_size (void)
  * a state every frame changed the game: Pokemon Snap and Mario Kart 64 froze, SM64 drifted. N64_STATE_DIRECT=0
  * keeps the job. Not with GLideN64's threaded renderer, whose game thread doesn't wait in new_vi. */
 extern int g_at_frame_edge;
+
+/* Joey64 (run-ahead): a state the frontend takes for run-ahead and loads back into this same core
+(GET_SAVESTATE_CONTEXT = RUNAHEAD_SAME_INSTANCE) may be taken while an RSP task is still running: what parallel-RSP
+keeps outside the core's state (its registers) and the task flags go into ra_side, which the next such load puts
+back. Before, those frames went without run-ahead (about 5% in SM64: a repeated picture, then a jump). Every
+run-ahead state carries them, so the extra frames' RSP register changes don't stay either. N64_RA_RSP=0: the old
+way (no state while a task runs). */
+#ifdef HAVE_PARALLEL_RSP
+size_t parallel_rsp_state_size(void);
+void parallel_rsp_state_save(void *out);
+void parallel_rsp_state_load(const void *in);
+#else
+static size_t parallel_rsp_state_size(void) { return (size_t)-1; }
+static void parallel_rsp_state_save(void *out) { (void)out; }
+static void parallel_rsp_state_load(const void *in) { (void)in; }
+#endif
+static struct { int valid; uint32_t task_locked, unsafe; unsigned char rsp[2048]; } ra_side;
+static bool ra_same_instance(void)
+{
+   static int on = -1;
+   int ctx = 0;
+   if (on < 0)
+   {
+      const char *e = getenv("N64_RA_RSP");
+      on = !(e && e[0] == '0') && parallel_rsp_state_size() <= sizeof(ra_side.rsp);
+   }
+   return on && current_rsp_type == RSP_PLUGIN_PARALLEL
+       && environ_cb(RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT, &ctx) && ctx == RETRO_SAVESTATE_CONTEXT_RUNAHEAD_SAME_INSTANCE;
+}
+
 static bool state_direct(int load)
 {
    static int on = -1;
@@ -2233,13 +2263,14 @@ bool retro_serialize(void *data, size_t size)
        * it's done, past the frame's end, and a state taken now loses the task (the game then waits for it for good:
        * SM64 froze). Not now, then: the frontend runs this frame without run-ahead. */
       static unsigned tried, unsafe, rdp_part;
+      const bool same = ra_same_instance();
       if (++tried >= 600)
       {
          if (unsafe || rdp_part)
             log_cb(RETRO_LOG_INFO, CORE_NAME ": state at the frame's end: %u of %u with an RSP task running, %u with a display list in part\n", unsafe, tried, rdp_part);
          tried = unsafe = rdp_part = 0;
       }
-      if (g_dev.r4300.cp0.interrupt_unsafe_state)
+      if (g_dev.r4300.cp0.interrupt_unsafe_state && !same)
       {
          unsafe++;
          return false;
@@ -2255,6 +2286,14 @@ bool retro_serialize(void *data, size_t size)
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
       ok = savestates_save_m64p(&g_dev, data) && retro_savestate_result;
+      ra_side.valid = 0;
+      if (ok && same)
+      {
+         ra_side.task_locked = g_dev.sp.rsp_task_locked;
+         ra_side.unsafe = g_dev.r4300.cp0.interrupt_unsafe_state;
+         parallel_rsp_state_save(ra_side.rsp);
+         ra_side.valid = 1;
+      }
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
       retro_savestate_complete = true;
@@ -2316,6 +2355,13 @@ bool retro_unserialize(const void *data, size_t size)
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
       ret = savestates_load_m64p(&g_dev, data);
+      /* the run-ahead state just taken: its RSP registers and task flags (the loader clears the flags) */
+      if (ret && ra_side.valid && ra_same_instance())
+      {
+         g_dev.sp.rsp_task_locked = ra_side.task_locked;
+         g_dev.r4300.cp0.interrupt_unsafe_state = ra_side.unsafe;
+         parallel_rsp_state_load(ra_side.rsp);
+      }
       /* states at the frame's end are taken with no display list in part (retro_serialize): none now either */
       if (ret && current_rdp_type == RDP_PLUGIN_PARALLEL)
          parallel_drop_pending_commands();
