@@ -2280,6 +2280,19 @@ static bool state_direct(int load)
    return (on & (load ? 2 : 1)) && g_at_frame_edge && !(current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer);
 }
 
+/* Copy-on-write run-ahead states (savestates.c) need smart sync's record of what the RDP draws */
+static int ra_cow_allowed(void)
+{
+#if !defined(_WIN32)
+   if (current_rdp_type == RDP_PLUGIN_PARALLEL && parallel_smart_on())
+   {
+      savestates_rdp_settle = parallel_smart_settle;
+      return 1;
+   }
+#endif
+   return 0;
+}
+
 /* The checks retro_serialize makes at the frame's end: when one fails, the frontend shows this frame's own picture. */
 int ra_state_would_refuse(void)
 {
@@ -2325,7 +2338,7 @@ bool retro_serialize(void *data, size_t size)
       retro_savestate_result = 0;
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
-      savestates_ra_context = same;
+      savestates_ra_context = same ? 1 + ra_cow_allowed() : 0;
       ok = savestates_save_m64p(&g_dev, data) && retro_savestate_result;
       savestates_ra_context = 0;
       ra_side.valid = 0;
@@ -2399,7 +2412,7 @@ bool retro_unserialize(const void *data, size_t size)
       int ret;
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
-      savestates_ra_context = ra_same_instance();
+      savestates_ra_context = ra_same_instance() ? 1 + ra_cow_allowed() : 0;
       ret = savestates_load_m64p(&g_dev, data);
       savestates_ra_context = 0;
       /* the run-ahead state just taken: its RSP registers and task flags (the loader clears the flags) */

@@ -35,6 +35,12 @@
 #include <string.h>
 #include <sys/types.h>
 #include <time.h>
+#if defined(__LIBRETRO__) && !defined(_WIN32)
+#include <signal.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#define SS_COW 1
+#endif
 #include <zlib.h>
 
 #define M64P_CORE_PROTOTYPES 1
@@ -252,6 +258,120 @@ static int ss_tlb_mark_matches(const unsigned char* mark)
 }
 static unsigned ss_tlb_saves_skipped, ss_tlb_loads_skipped;
 
+/* Joey64 (run-ahead copy-on-write, 2026-11-09): run-ahead's own state (savestates_ra_context == 2: libretro.c, with
+ * parallel-RDP's smart sync on) doesn't copy RDRAM's 8 MB. The take waits for the RDP's drawing (smart sync's
+ * settle; the copy did that too, faulting on the drawn pages) and makes RDRAM read-only. The first CPU write to a page
+ * faults: its bytes go into the state then and it opens again. A page the RDP will draw goes in first too, before
+ * the GPU gets the draw (smart sync's set_pages, ra_cow_drawn). The put back waits for the RDP again, opens RDRAM and
+ * copies back only those pages. The state's RDRAM is then whole only for those pages: it's run-ahead's alone, put
+ * back once. N64_STATE_COW=0: the full copy. */
+void (*savestates_rdp_settle)(void);
+#ifdef SS_COW
+static struct
+{
+    volatile int armed;
+    uint8_t* ram;
+    uint8_t* buf;
+    size_t shift, pages;
+    uint8_t copied[RDRAM_MAX_SIZE / 4096];
+    struct sigaction old;
+    int installed;
+    unsigned cpu, drawn, loads;
+} ss_cow;
+
+static void ss_cow_copy(size_t p)
+{
+    const size_t sz = (size_t)1 << ss_cow.shift;
+    memcpy(ss_cow.buf + p * sz, ss_cow.ram + p * sz, sz);
+    ss_cow.copied[p] = 1;
+    mprotect(ss_cow.ram + p * sz, sz, PROT_READ | PROT_WRITE);
+}
+
+static void ss_cow_handler(int sig, siginfo_t* info, void* uc)
+{
+    uint8_t* a = (uint8_t*)info->si_addr;
+    if (ss_cow.armed && a >= ss_cow.ram && a < ss_cow.ram + RDRAM_MAX_SIZE)
+    {
+        size_t p = (size_t)(a - ss_cow.ram) >> ss_cow.shift;
+        if (!ss_cow.copied[p])
+        {
+            ss_cow_copy(p);
+            ss_cow.cpu++;
+            return; /* the write runs again, now on an open page */
+        }
+    }
+    if (ss_cow.old.sa_flags & SA_SIGINFO)
+    {
+        if (ss_cow.old.sa_sigaction)
+            ss_cow.old.sa_sigaction(sig, info, uc);
+    }
+    else if (ss_cow.old.sa_handler == SIG_DFL)
+    {
+        sigaction(sig, &ss_cow.old, NULL);
+        raise(sig);
+    }
+    else if (ss_cow.old.sa_handler != SIG_IGN)
+        ss_cow.old.sa_handler(sig);
+}
+
+void ra_cow_drawn(uint32_t start, uint32_t end)
+{
+    size_t p;
+    if (!ss_cow.armed || end <= start)
+        return;
+    if (end > RDRAM_MAX_SIZE) end = RDRAM_MAX_SIZE;
+    for (p = start >> ss_cow.shift; p <= ((end - 1) >> ss_cow.shift); ++p)
+        if (!ss_cow.copied[p])
+        {
+            ss_cow_copy(p);
+            ss_cow.drawn++;
+        }
+}
+
+static int ss_cow_on(const struct device* dev)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char* e = getenv("N64_STATE_COW");
+        long ps = sysconf(_SC_PAGESIZE);
+        on = !(e && e[0] == '0') && ps >= 4096 && (RDRAM_MAX_SIZE % ps) == 0;
+        if (on)
+        {
+            ss_cow.shift = 0;
+            while (((size_t)1 << ss_cow.shift) < (size_t)ps) ss_cow.shift++;
+            ss_cow.pages = RDRAM_MAX_SIZE >> ss_cow.shift;
+        }
+    }
+    if (!on || savestates_ra_context != 2 || !savestates_rdp_settle)
+        return 0;
+    if (((uintptr_t)dev->rdram.dram & (((uintptr_t)1 << ss_cow.shift) - 1)) != 0)
+        return 0;
+    if (!ss_cow.installed)
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = ss_cow_handler;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGSEGV, &sa, &ss_cow.old) != 0)
+            return 0;
+        ss_cow.installed = 1;
+    }
+    return 1;
+}
+
+/* RDRAM open again; nothing more goes into the state */
+static void ss_cow_disarm(void)
+{
+    if (!ss_cow.armed)
+        return;
+    ss_cow.armed = 0;
+    __sync_synchronize();
+    mprotect(ss_cow.ram, RDRAM_MAX_SIZE, PROT_READ | PROT_WRITE);
+}
+#endif
+
 static void ss_copy_table(uint32_t* dst, const unsigned char* src, size_t bytes)
 {
     if (memcmp(dst, src, bytes) != 0)
@@ -302,6 +422,12 @@ static void ss_drop_changed_code(struct r4300_core* r4300, int full)
                 l_loads, l_full, l_changed / 300.0, l_code / 300.0, l_ms / 300.0, ss_tlb_saves_skipped, ss_tlb_loads_skipped);
             l_loads = l_full = l_changed = l_code = 0; l_ms = 0;
             ss_tlb_saves_skipped = ss_tlb_loads_skipped = 0;
+#ifdef SS_COW
+            if (ss_cow.loads)
+                DebugMessage(M64MSG_INFO, "copy-on-write states: %u loads, %.1f pages a state from CPU writes, %.1f from RDP draws",
+                    ss_cow.loads, ss_cow.cpu / (double)ss_cow.loads, ss_cow.drawn / (double)ss_cow.loads);
+            ss_cow.loads = ss_cow.cpu = ss_cow.drawn = 0;
+#endif
         }
     }
 #ifdef NEW_DYNAREC
@@ -672,7 +798,45 @@ int savestates_load_m64p(struct device* dev, const void *data)
     dev->dp.dps_regs[DPS_BUFTEST_ADDR_REG] = GETDATA(curr, uint32_t);
     dev->dp.dps_regs[DPS_BUFTEST_DATA_REG] = GETDATA(curr, uint32_t);
 
+#ifdef SS_COW
+    if (ss_cow.armed && savestates_ra_context == 2 && ss_cow.buf == (const uint8_t*)curr)
+    {
+        /* the copy-on-write state: back only the pages that went into it */
+        const size_t sz = (size_t)1 << ss_cow.shift, sub = sz / 4096;
+        size_t p, k;
+        savestates_rdp_settle();
+        ss_cow_disarm();
+        memset(ss_changed_pages, 0, sizeof(ss_changed_pages));
+        for (p = 0; p < ss_cow.pages; ++p)
+            if (ss_cow.copied[p])
+                for (k = 0; k < sub; ++k)
+                {
+                    uint8_t* d = (uint8_t*)dev->rdram.dram + p * sz + k * 4096;
+                    const uint8_t* s = (const uint8_t*)curr + p * sz + k * 4096;
+                    if (memcmp(d, s, 4096) != 0)
+                    {
+                        memcpy(d, s, 4096);
+                        ss_changed_pages[p * sub + k] = 1;
+                    }
+                }
+        ss_cow.loads++;
+    }
+    else
+    {
+        if (ss_cow.armed)
+        {
+            /* any other load: RDRAM open first (and a copy-on-write state can't be loaded by anything else) */
+            if (savestates_rdp_settle) savestates_rdp_settle();
+            ss_cow_disarm();
+            if (ss_cow.buf == (const uint8_t*)curr)
+                DebugMessage(M64MSG_ERROR, "copy-on-write state loaded outside run-ahead: RDRAM pages may be old");
+        }
+        ss_copy_rdram(dev->rdram.dram, curr, RDRAM_MAX_SIZE); /* only what differs (Joey64) */
+    }
+    curr += RDRAM_MAX_SIZE;
+#else
     ss_copy_rdram(dev->rdram.dram, curr, RDRAM_MAX_SIZE); curr += RDRAM_MAX_SIZE; /* only what differs (Joey64) */
+#endif
     COPYARRAY(dev->sp.mem, curr, uint32_t, SP_MEM_SIZE/4);
     COPYARRAY(dev->pif.ram, curr, uint8_t, PIF_RAM_SIZE);
 
@@ -2046,7 +2210,31 @@ int savestates_save_m64p(const struct device* dev, void *data)
     PUTDATA(curr, uint32_t, dev->dp.dps_regs[DPS_BUFTEST_ADDR_REG]);
     PUTDATA(curr, uint32_t, dev->dp.dps_regs[DPS_BUFTEST_DATA_REG]);
 
+#ifdef SS_COW
+    if (ss_cow.armed)
+    {
+        /* a state taken while the last one is still armed: RDRAM open again first */
+        if (savestates_rdp_settle) savestates_rdp_settle();
+        ss_cow_disarm();
+    }
+    if (ss_cow_on(dev))
+    {
+        savestates_rdp_settle(); /* the RDP's drawing in RDRAM before it goes read-only */
+        ss_cow.ram = (uint8_t*)dev->rdram.dram;
+        ss_cow.buf = (uint8_t*)curr;
+        memset(ss_cow.copied, 0, sizeof(ss_cow.copied));
+        __sync_synchronize();
+        if (mprotect(ss_cow.ram, RDRAM_MAX_SIZE, PROT_READ) == 0)
+            ss_cow.armed = 1;
+        else
+            memcpy(curr, dev->rdram.dram, RDRAM_MAX_SIZE);
+        curr += RDRAM_MAX_SIZE;
+    }
+    else
+        PUTARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
+#else
     PUTARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
+#endif
     PUTARRAY(dev->sp.mem, curr, uint32_t, SP_MEM_SIZE/4);
     PUTARRAY(dev->pif.ram, curr, uint8_t, PIF_RAM_SIZE);
 

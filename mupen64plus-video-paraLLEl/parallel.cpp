@@ -58,6 +58,16 @@ extern "C" int parallel_pending_commands(void)
 	return RDP::pending_commands();
 }
 
+extern "C" int parallel_smart_on(void)
+{
+	return RDP::smart_on() ? 1 : 0;
+}
+
+extern "C" void parallel_smart_settle(void)
+{
+	RDP::smart_settle();
+}
+
 extern "C" void parallel_drop_pending_commands(void)
 {
 	RDP::drop_pending_commands();

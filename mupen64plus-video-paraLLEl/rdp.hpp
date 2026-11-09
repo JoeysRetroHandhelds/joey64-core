@@ -20,6 +20,9 @@ void begin_frame();
 
 void process_commands();
 int pending_commands();
+// Joey64 (run-ahead copy-on-write): smart sync tracks every RDRAM page the RDP draws; settle waits for what it drew
+bool smart_on();
+void smart_settle();
 void drop_pending_commands();
 extern const struct retro_hw_render_interface_vulkan *vulkan;
 

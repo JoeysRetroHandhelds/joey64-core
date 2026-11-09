@@ -369,6 +369,7 @@ bool frame_valid = true;
 // sync, which async shows black, at or below sync cost; Flip (Mali) Snap 14.4 -> 5.0 ms/frame vs sync. Most games
 // touch drawn pages every frame (Flip: SM64 587, OoT 599 waits per 600 SyncFulls), so it is no faster than sync
 // for them and much slower than async: it replaces sync only.
+extern "C" void ra_cow_drawn(uint32_t start, uint32_t end);
 namespace Smart
 {
 static bool enabled;
@@ -453,6 +454,7 @@ static void set_pages(uint32_t start, uint32_t end, uint8_t kind)
 		return;
 	if (end > rdram_size)
 		end = rdram_size;
+	ra_cow_drawn(start, end); // before the GPU gets the draw: run-ahead keeps these pages' bytes first
 	if (precise || debug)
 		add_range(drawn, start, end);
 	for (size_t p = start >> page_shift; p <= ((end - 1) >> page_shift); p++)
@@ -754,6 +756,21 @@ static void track(RDP::Op op, uint32_t w1, uint32_t w2)
 		break;
 	}
 }
+}
+
+bool smart_on()
+{
+	return Smart::enabled && synchronous && frontend;
+}
+
+// Waits for everything the RDP drew up to the last SyncFull and opens the pages again (what a fault on them does).
+void smart_settle()
+{
+	if (!Smart::enabled || !frontend)
+		return;
+	if (Smart::any_locked || Smart::any_opened)
+		frontend->wait_for_timeline(Smart::sync_signal);
+	Smart::unlock_all();
 }
 
 static const unsigned cmd_len_lut[64] = {
