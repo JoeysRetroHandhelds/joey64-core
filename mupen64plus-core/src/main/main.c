@@ -1268,13 +1268,27 @@ struct gb_cart_data
 
 static struct gb_cart_data l_gb_carts_data[GAME_CONTROLLERS_COUNT];
 
+/* Joey64: each port's own Game Boy game and save. The libretro subsystem gives one pair for the whole play, so every
+ * port with a Transfer Pak got player 1's game; the host sets N64_TPAK_ROM_<port> and N64_TPAK_RAM_<port> (1-4)
+ * before loading the game. A variable that is set but empty means no cartridge (ROM) or a generated name (RAM);
+ * unset, the port takes the subsystem's pair as upstream does. */
+static char* tpak_port_path(const char* what, int control_id, const char* shared)
+{
+    char name[32];
+    snprintf(name, sizeof(name), "N64_TPAK_%s_%d", what, control_id + 1);
+    const char* v = getenv(name);
+    if (v != NULL)
+        return strdup(v);
+    return shared ? strdup(shared) : NULL;
+}
+
 static void init_gb_rom(void* opaque, void** storage, const struct storage_backend_interface** istorage)
 {
     struct gb_cart_data* data = (struct gb_cart_data*)opaque;
 
     /* Ask the core loader for rom filename */
     char* rom_filename = (g_media_loader.get_gb_cart_rom == NULL)
-        ? (retro_transferpak_rom_path ? strdup(retro_transferpak_rom_path) : NULL)
+        ? tpak_port_path("ROM", data->control_id, retro_transferpak_rom_path)
         : g_media_loader.get_gb_cart_rom(g_media_loader.cb_data, data->control_id);
 
     /* Handle the no cart case */
@@ -1318,7 +1332,7 @@ static void init_gb_ram(void* opaque, size_t ram_size, void** storage, const str
 
     /* Ask the core loader for ram filename */
     char* ram_filename = (g_media_loader.get_gb_cart_ram == NULL)
-        ? (retro_transferpak_ram_path ? strdup(retro_transferpak_ram_path) : NULL)
+        ? tpak_port_path("RAM", data->control_id, retro_transferpak_ram_path)
         : g_media_loader.get_gb_cart_ram(g_media_loader.cb_data, data->control_id);
 
     /* Handle the no RAM case
