@@ -2482,6 +2482,9 @@ bool take_frame_valid()
 	return v;
 }
 
+extern "C" int g_ra_video_hidden;
+extern "C" int ra_state_would_refuse(void);
+
 void complete_frame()
 {
 	if (!frontend)
@@ -2524,6 +2527,31 @@ void complete_frame()
 		});
 		device->timestamp_log_reset();
 		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: bench per frame:%s\n", line.c_str());
+	}
+
+	// Joey64 (run-ahead, 2026-11-09): a frame whose picture is never shown (the real frame before the extra ones)
+	// isn't scanned out, as if it were a repeat. Not for interlaced output (the next scanout blends this one in) nor
+	// when the frame's state will be refused (the frontend then shows this picture). N64_RA_SKIP_SCANOUT=0: off.
+	{
+		static int skip_hidden = -1;
+		static unsigned hidden_skipped, hidden_frames;
+		if (skip_hidden < 0)
+		{
+			const char *e = getenv("N64_RA_SKIP_SCANOUT");
+			skip_hidden = !(e && e[0] == '0');
+		}
+		if (g_ra_video_hidden && skip_hidden)
+		{
+			bool skip = !(*GET_GFX_INFO(VI_STATUS_REG) & 0x40) && !ra_state_would_refuse();
+			hidden_skipped += skip;
+			if (++hidden_frames >= 600)
+			{
+				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: %u of the last %u hidden frames not scanned out\n", hidden_skipped, hidden_frames);
+				hidden_skipped = hidden_frames = 0;
+			}
+			if (skip)
+				return;
+		}
 	}
 
 	if (Dup::enabled)
