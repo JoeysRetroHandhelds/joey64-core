@@ -2057,7 +2057,10 @@ int savestates_save_m64p(const struct device* dev, void *data)
         return 0;
     }
 
-    memset(save->data, 0, save->size);
+    /* Joey64: not for run-ahead's own state (savestates_ra_context): its buffer is only ever put back by this core, and
+     * the 16.8 MB clear was most of the take (and would wipe the TLB tables and their mark the skip looks for). */
+    if (!savestates_ra_context)
+        memset(save->data, 0, save->size);
 
     // Write the save state data to memory
     PUTARRAY(savestate_magic, curr, unsigned char, 8);
@@ -2231,7 +2234,9 @@ int savestates_save_m64p(const struct device* dev, void *data)
         curr += RDRAM_MAX_SIZE;
     }
     else
-        PUTARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
+    {
+        PUTARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4); /* a macro of two statements */
+    }
 #else
     PUTARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
 #endif
