@@ -2232,16 +2232,23 @@ bool retro_serialize(void *data, size_t size)
       /* An RSP task still running at the frame's end (interrupt_unsafe_state) isn't in a state: the job waits until
        * it's done, past the frame's end, and a state taken now loses the task (the game then waits for it for good:
        * SM64 froze). Not now, then: the frontend runs this frame without run-ahead. */
-      static unsigned tried, unsafe;
+      static unsigned tried, unsafe, rdp_part;
       if (++tried >= 600)
       {
-         if (unsafe)
-            log_cb(RETRO_LOG_INFO, CORE_NAME ": state at the frame's end: %u of %u with an RSP task running\n", unsafe, tried);
-         tried = unsafe = 0;
+         if (unsafe || rdp_part)
+            log_cb(RETRO_LOG_INFO, CORE_NAME ": state at the frame's end: %u of %u with an RSP task running, %u with a display list in part\n", unsafe, tried, rdp_part);
+         tried = unsafe = rdp_part = 0;
       }
       if (g_dev.r4300.cp0.interrupt_unsafe_state)
       {
          unsafe++;
+         return false;
+      }
+      /* parallel-RDP keeps a display list that arrived in part outside the state: after a load the next part would
+       * be added to whatever the extra frames left there. A guard: no game tested has had one at the frame's end. */
+      if (current_rdp_type == RDP_PLUGIN_PARALLEL && parallel_pending_commands() > 0)
+      {
+         rdp_part++;
          return false;
       }
       retro_savestate_result = 0;
@@ -2309,6 +2316,9 @@ bool retro_unserialize(const void *data, size_t size)
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
       ret = savestates_load_m64p(&g_dev, data);
+      /* states at the frame's end are taken with no display list in part (retro_serialize): none now either */
+      if (ret && current_rdp_type == RDP_PLUGIN_PARALLEL)
+         parallel_drop_pending_commands();
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
       retro_savestate_complete = true;

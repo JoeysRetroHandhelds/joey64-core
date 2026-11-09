@@ -1938,6 +1938,21 @@ static void jc_bump(void)
   if(++jc_gen==0) { memset(jc_tab,0,sizeof(jc_tab)); jc_gen=1; }
 }
 
+/* Joey64 (run-ahead): a state load empties the jump cache whatever code it drops (savestates.c), and
+ * new_dynarec_jc_live counts what is left in it, for the N64_JC_CHECK=1 test (0 right after a load). */
+void new_dynarec_jc_clear(void)
+{
+  jc_bump();
+}
+
+int new_dynarec_jc_live(void)
+{
+  int i, n = 0;
+  for(i=0;i<(1<<JC_BITS);i++)
+    if(jc_tab[i].gen==jc_gen) n++;
+  return n;
+}
+
 static void remove_hash(u_int vaddr)
 {
   //DebugMessage(M64MSG_VERBOSE, "remove hash: %x",vaddr);

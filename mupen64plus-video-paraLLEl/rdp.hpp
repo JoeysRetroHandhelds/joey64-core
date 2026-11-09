@@ -19,6 +19,8 @@ void deinit();
 void begin_frame();
 
 void process_commands();
+int pending_commands();
+void drop_pending_commands();
 extern const struct retro_hw_render_interface_vulkan *vulkan;
 
 extern unsigned width;

@@ -106,7 +106,12 @@ void write_mi_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask
 
         r4300_check_interrupt(mi->r4300, CP0_CAUSE_IP2, mi->regs[MI_INTR_REG] & mi->regs[MI_INTR_MASK_REG]);
         cp0_update_count(mi->r4300);
-        if (*cp0_cycle_count >= 0) gen_interrupt(mi->r4300);
+        /* Joey64 (run-ahead): not the frame's end (the VI scanout event) from inside this store: retro_run would return
+         * inside the recompiler's store helper, and after a state loaded there the block the store came from carried
+         * on instead of the loaded PC (Pokemon Snap froze with run-ahead, 2026-11-09). The next interrupt check, a few
+         * instructions on, takes the event. */
+        if (*cp0_cycle_count >= 0 && !(mi->r4300->cp0.q.first && mi->r4300->cp0.q.first->data.type == VI_SCANOUT_EVT))
+            gen_interrupt(mi->r4300);
         break;
     }
 }

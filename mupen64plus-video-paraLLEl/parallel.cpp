@@ -53,6 +53,16 @@ void parallelProcessRDPList(void)
 	RDP::process_commands();
 }
 
+extern "C" int parallel_pending_commands(void)
+{
+	return RDP::pending_commands();
+}
+
+extern "C" void parallel_drop_pending_commands(void)
+{
+	RDP::drop_pending_commands();
+}
+
 void parallelRomClosed(void)
 {
 }

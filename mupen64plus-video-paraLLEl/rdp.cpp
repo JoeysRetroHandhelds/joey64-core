@@ -2114,6 +2114,18 @@ static void init(const uint8_t *rdram, uint32_t size)
 }
 
 
+/* Joey64 (run-ahead): 64-bit words of a display list received but not yet run (a command that arrived in part). */
+int pending_commands()
+{
+	return cmd_ptr - cmd_cur;
+}
+
+void drop_pending_commands()
+{
+	cmd_ptr = 0;
+	cmd_cur = 0;
+}
+
 void process_commands()
 {
 	const uint32_t DP_CURRENT = *GET_GFX_INFO(DPC_CURRENT_REG) & 0x00FFFFF8;

@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <time.h>
 #include <zlib.h>
 
 #define M64P_CORE_PROTOTYPES 1
@@ -50,6 +51,9 @@
 #include "plugin/plugin.h"
 #include "rom.h"
 #include "savestates.h"
+#ifdef NEW_DYNAREC
+#include "device/r4300/new_dynarec/new_dynarec.h"
+#endif
 #include "util.h"
 #include "workqueue.h"
 
@@ -202,8 +206,7 @@ static void savestates_clear_job(void)
 /* Joey64 (run-ahead, 2026-11-09): a libretro state is read where the frontend keeps it (no 16 MB copy into a
  * fresh buffer: 7 ms a load on the Thor, page faults included), and RDRAM and the TLB tables are written only
  * where they differ. Only the recompiled code of RDRAM pages whose bytes changed is dropped (as a DMA does), not
- * all of it, unless the TLB tables changed or the game maps code through the TLB. N64_STATE_FLUSH_ALL=1 drops
- * it all, as before. */
+ * all of it, unless the TLB tables changed. N64_STATE_FLUSH_ALL=1 drops it all, as before. */
 #ifdef __LIBRETRO__
 #define SS_FREE(p) ((void)0)
 #else
@@ -240,6 +243,13 @@ static void ss_drop_changed_code(struct r4300_core* r4300, int full)
 {
     static int flush_all = -1;
     size_t p;
+    /* Dev (N64_LOAD_STATS=1): every 300 loads, the pages changed, those with compiled code, and the time it took */
+    static int lstats = -1;
+    static unsigned l_loads, l_full, l_changed, l_code;
+    static double l_ms;
+    struct timespec t0, t1;
+    if (lstats < 0) { const char* e = getenv("N64_LOAD_STATS"); lstats = e && e[0] == '1'; }
+    if (lstats) clock_gettime(CLOCK_MONOTONIC, &t0);
     if (flush_all < 0)
     {
         const char* e = getenv("N64_STATE_FLUSH_ALL");
@@ -248,14 +258,50 @@ static void ss_drop_changed_code(struct r4300_core* r4300, int full)
     if (full || flush_all || ss_tables_changed)
     {
         invalidate_r4300_cached_code(r4300, 0, 0);
-        return;
+        l_full++;
     }
-    for (p = 0; p < RDRAM_MAX_SIZE / 4096; ++p)
-        if (ss_changed_pages[p])
+    else
+        for (p = 0; p < RDRAM_MAX_SIZE / 4096; ++p)
+            if (ss_changed_pages[p])
+            {
+                l_changed++;
+                if (!r4300->cached_interp.invalid_code[0x80000 + p] || !r4300->cached_interp.invalid_code[0xA0000 + p]) l_code++;
+                invalidate_r4300_cached_code(r4300, 0x80000000u + (uint32_t)p * 4096, 4096);
+                invalidate_r4300_cached_code(r4300, 0xA0000000u + (uint32_t)p * 4096, 4096);
+            }
+    if (lstats)
+    {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        l_ms += (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        if (++l_loads >= 300)
         {
-            invalidate_r4300_cached_code(r4300, 0x80000000u + (uint32_t)p * 4096, 4096);
-            invalidate_r4300_cached_code(r4300, 0xA0000000u + (uint32_t)p * 4096, 4096);
+            DebugMessage(M64MSG_INFO, "load stats: %u loads, %u full flushes, %.1f pages changed, %.1f with code, drop %.3f ms a load",
+                l_loads, l_full, l_changed / 300.0, l_code / 300.0, l_ms / 300.0);
+            l_loads = l_full = l_changed = l_code = 0; l_ms = 0;
         }
+    }
+#ifdef NEW_DYNAREC
+    /* The jump cache is emptied on every load, code dropped or not; N64_JC_CHECK=1 checks it (logs every 300 loads). */
+    new_dynarec_jc_clear();
+    {
+        static int check = -1;
+        static unsigned loads, left;
+        if (check < 0)
+        {
+            const char* e = getenv("N64_JC_CHECK");
+            check = e && e[0] == '1';
+        }
+        if (check)
+        {
+            left += new_dynarec_jc_live() != 0;
+            if (++loads >= 300)
+            {
+                DebugMessage(M64MSG_INFO, "jump cache check: %u of %u state loads left entries", left, loads);
+                loads = left = 0;
+            }
+        }
+    }
+#endif
 }
 #define PUTARRAY(src, buff, type, count) \
     memcpy(buff, src, sizeof(type)*count); \
@@ -1141,7 +1187,14 @@ int savestates_load_m64p(struct device* dev, const void *data)
     *r4300_cp0_last_addr(&dev->r4300.cp0) = *r4300_pc(&dev->r4300);
 
 #ifdef NEW_DYNAREC
-    ss_drop_changed_code(&dev->r4300, using_tlb != 0);
+    /* Joey64: TLB-mapped code is filed under its physical page (invalidate_block, the write protect in new_dynarec's
+     * assembler), so dropping the changed pages drops it too; only a changed TLB (ss_tables_changed) needs a full flush.
+     * A full flush on every load cost SM64 5.4 ms a run-ahead frame on the Thor. N64_STATE_TLB_FULL=1: the old way. */
+    {
+        static int tlb_full = -1;
+        if (tlb_full < 0) { const char* e = getenv("N64_STATE_TLB_FULL"); tlb_full = e && e[0] == '1'; }
+        ss_drop_changed_code(&dev->r4300, tlb_full && using_tlb != 0);
+    }
 #else
     ss_drop_changed_code(&dev->r4300, 0);
 #endif
@@ -1778,6 +1831,7 @@ int savestates_save_m64p(const struct device* dev, void *data)
     if(autoinc_save_slot)
         savestates_inc_slot();
 
+    memset(queue, 0, sizeof(queue)); /* Joey64: no stack bytes past the queue's end (same states compare equal) */
     save_eventqueue_infos(&dev->r4300.cp0, queue);
 
     // Allocate memory for the save state data
