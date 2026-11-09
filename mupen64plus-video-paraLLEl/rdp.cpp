@@ -2657,8 +2657,15 @@ bool parallel_create_device(struct retro_vulkan_context *frontend_context, VkIns
 	}
 
 	::RDP::context->set_system_handles(handles);
-	// The frontend made the instance with our application info: tell Granite which version it asked for.
-	::RDP::context->set_application_info(parallel_get_application_info());
+	// The frontend made the instance with our application info: tell Granite which version it asked for, but never above
+	// what the loader supports. A Vulkan 1.1 loader accepts a 1.2 apiVersion and gives a 1.1 instance, while Granite then
+	// refuses ("Vulkan loader does not support required Vulkan version"): every game failed to start on the Flip's
+	// stock Mali-G52 (loader 1.1) with the 1.2 request (2026-11-09).
+	VkApplicationInfo app_info = *parallel_get_application_info();
+	uint32_t loader_version = volkGetInstanceVersion();
+	if (loader_version < app_info.apiVersion)
+		app_info.apiVersion = loader_version > VK_API_VERSION_1_1 ? loader_version : VK_API_VERSION_1_1;
+	::RDP::context->set_application_info(&app_info);
 
 	if (!::RDP::context->init_device_from_instance(
 				instance, gpu, surface, required_device_extensions, num_required_device_extensions,
