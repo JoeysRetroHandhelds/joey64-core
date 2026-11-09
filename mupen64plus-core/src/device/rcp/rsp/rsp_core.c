@@ -323,6 +323,13 @@ void write_rsp_regs2(void* opaque, uint32_t address, uint32_t value, uint32_t ma
         masked_write(&sp->regs2[reg], value, mask);
 }
 
+/* Joey64 (run-ahead, 2026-11-09): set by libretro.c for a frame whose sound is thrown away and whose state is never
+ * kept (the frontend's GET_AUDIO_VIDEO_ENABLE bit 3, run-ahead's extra frames). Audio tasks then end at once as
+ * if the microcode had run to its break: halted, broke, and the SP interrupt if the game asked for one on break.
+ * The sound buffers in RDRAM keep what they had; the state put back after the extra frames has the real ones. */
+int g_rsp_skip_audio;
+unsigned g_rsp_audio_skipped;
+
 void do_SP_Task(struct rsp_core* sp)
 {
     uint32_t save_pc = sp->regs2[SP_PC_REG] & ~0xfff;
@@ -358,6 +365,14 @@ void do_SP_Task(struct rsp_core* sp)
         sp_delay_time = 1000;
 
         protect_framebuffers(&sp->dp->fb);
+    }
+    else if (sp->mem[0xfc0/4] == 2 && g_rsp_skip_audio)
+    {
+        sp->regs[SP_STATUS_REG] |= SP_STATUS_HALT | SP_STATUS_BROKE;
+        if (sp->regs[SP_STATUS_REG] & SP_STATUS_INTR_BREAK)
+            sp->mi->regs[MI_INTR_REG] |= MI_INTR_SP;
+        g_rsp_audio_skipped++;
+        sp_delay_time = 4000;
     }
     else if (sp->mem[0xfc0/4] == 2)
     {

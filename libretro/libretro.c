@@ -2116,6 +2116,24 @@ void retro_run (void)
 
     pgo_flush();
 
+    /* Joey64: run-ahead's extra frames (sound off for good, bit 3): their audio tasks aren't run
+     * (g_rsp_skip_audio, rsp_core.c). N64_RA_SKIP_AUDIO=0 runs them. */
+    {
+       extern int g_rsp_skip_audio;
+       extern unsigned g_rsp_audio_skipped;
+       static int allow = -1;
+       static unsigned frames;
+       int av = 0;
+       if (allow < 0) { const char* e = getenv("N64_RA_SKIP_AUDIO"); allow = !(e && e[0] == '0'); }
+       g_rsp_skip_audio = allow && environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av) && (av & 8);
+       if (++frames >= 1200)
+       {
+          if (g_rsp_audio_skipped)
+             log_cb(RETRO_LOG_INFO, CORE_NAME ": run-ahead: %u audio tasks not run in the last %u frames\n", g_rsp_audio_skipped, frames);
+          frames = 0; g_rsp_audio_skipped = 0;
+       }
+    }
+
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
        update_variables(false);
 
