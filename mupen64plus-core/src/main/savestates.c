@@ -229,6 +229,29 @@ static void ss_copy_rdram(uint32_t* dst, const unsigned char* src, size_t bytes)
     }
 }
 
+/* Joey64 (run-ahead, 2026-11-09): the 8 MB of TLB tables are skipped when nothing changed them. A save writes a
+ * mark into the unused bytes where flashram state used to be: J64T, this run's number, the tables' generation
+ * (g_tlb_lut_gen). Only for run-ahead's own states (savestates_ra_context, set by libretro.c): a save into a buffer
+ * that already holds this run's tables at this generation leaves them there, and a load of a state whose tables
+ * are at the generation the tables are at now doesn't compare them. Any other state gets the full copy and
+ * compare. N64_STATE_TLB_SKIP=0 turns it off. */
+int savestates_ra_context;
+static uint32_t ss_run_id;
+static int ss_tlb_skip_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("N64_STATE_TLB_SKIP"); on = !(e && e[0] == '0'); }
+    if (!ss_run_id) ss_run_id = ((uint32_t)time(NULL) * 2654435761u) | 1u;
+    return on && savestates_ra_context;
+}
+static int ss_tlb_mark_matches(const unsigned char* mark)
+{
+    uint32_t m[3];
+    memcpy(m, mark, sizeof(m));
+    return m[0] == 0x5434364Au && m[1] == ss_run_id && m[2] == g_tlb_lut_gen;
+}
+static unsigned ss_tlb_saves_skipped, ss_tlb_loads_skipped;
+
 static void ss_copy_table(uint32_t* dst, const unsigned char* src, size_t bytes)
 {
     if (memcmp(dst, src, bytes) != 0)
@@ -275,9 +298,10 @@ static void ss_drop_changed_code(struct r4300_core* r4300, int full)
         l_ms += (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
         if (++l_loads >= 300)
         {
-            DebugMessage(M64MSG_INFO, "load stats: %u loads, %u full flushes, %.1f pages changed, %.1f with code, drop %.3f ms a load",
-                l_loads, l_full, l_changed / 300.0, l_code / 300.0, l_ms / 300.0);
+            DebugMessage(M64MSG_INFO, "load stats: %u loads, %u full flushes, %.1f pages changed, %.1f with code, drop %.3f ms a load, TLB tables skipped in %u saves and %u loads",
+                l_loads, l_full, l_changed / 300.0, l_code / 300.0, l_ms / 300.0, ss_tlb_saves_skipped, ss_tlb_loads_skipped);
             l_loads = l_full = l_changed = l_code = 0; l_ms = 0;
+            ss_tlb_saves_skipped = ss_tlb_loads_skipped = 0;
         }
     }
 #ifdef NEW_DYNAREC
@@ -653,13 +677,31 @@ int savestates_load_m64p(struct device* dev, const void *data)
     COPYARRAY(dev->pif.ram, curr, uint8_t, PIF_RAM_SIZE);
 
     dev->cart.use_flashram = GETDATA(curr, int32_t);
-    curr += 4+8+4+4; /* Here there used to be flashram state */
-    /* by default, reset flashram state here and load it later if available */
-    poweron_flashram(&dev->cart.flashram);
+    {
+        const unsigned char* mark = (const unsigned char*)curr;
+        uint32_t m[3];
+        curr += 4+8+4+4; /* Here there used to be flashram state (now the TLB tables' mark, Joey64) */
+        /* by default, reset flashram state here and load it later if available */
+        poweron_flashram(&dev->cart.flashram);
 
-    ss_tables_changed = 0;
-    ss_copy_table(dev->r4300.cp0.tlb.LUT_r, curr, 0x100000 * 4); curr += 0x100000 * 4;
-    ss_copy_table(dev->r4300.cp0.tlb.LUT_w, curr, 0x100000 * 4); curr += 0x100000 * 4;
+        ss_tables_changed = 0;
+        memcpy(m, mark, sizeof(m));
+        if (ss_tlb_skip_on() && ss_tlb_mark_matches(mark))
+        {
+            curr += 0x100000 * 4 * 2; /* the tables hold what the state's do */
+            ss_tlb_loads_skipped++;
+        }
+        else
+        {
+            ss_copy_table(dev->r4300.cp0.tlb.LUT_r, curr, 0x100000 * 4); curr += 0x100000 * 4;
+            ss_copy_table(dev->r4300.cp0.tlb.LUT_w, curr, 0x100000 * 4); curr += 0x100000 * 4;
+            /* now at the state's generation, if the state is one of this run's; otherwise a new one */
+            if (m[0] == 0x5434364Au && m[1] == ss_run_id && ss_run_id)
+                g_tlb_lut_gen = m[2];
+            else
+                tlb_new_gen();
+        }
+    }
 
     *r4300_llbit(&dev->r4300) = GETDATA(curr, uint32_t);
     COPYARRAY(r4300_regs(&dev->r4300), curr, int64_t, 32);
@@ -1437,6 +1479,7 @@ static int savestates_load_pj64(struct device* dev,
     // tlb
     memset(dev->r4300.cp0.tlb.LUT_r, 0, 0x400000);
     memset(dev->r4300.cp0.tlb.LUT_w, 0, 0x400000);
+    tlb_new_gen();
     for (i=0; i < 32; i++)
     {
         unsigned int MyPageMask, MyEntryHi, MyEntryLo0, MyEntryLo1;
@@ -2008,10 +2051,24 @@ int savestates_save_m64p(const struct device* dev, void *data)
     PUTARRAY(dev->pif.ram, curr, uint8_t, PIF_RAM_SIZE);
 
     PUTDATA(curr, int32_t, dev->cart.use_flashram);
-    curr += 4+8+4+4; // Here used to be flashram state
-
-    PUTARRAY(dev->r4300.cp0.tlb.LUT_r, curr, uint32_t, 0x100000);
-    PUTARRAY(dev->r4300.cp0.tlb.LUT_w, curr, uint32_t, 0x100000);
+    {
+        unsigned char* mark = (unsigned char*)curr;
+        uint32_t m[3];
+        curr += 4+8+4+4; // Here used to be flashram state (now the TLB tables' mark, Joey64)
+        if (ss_tlb_skip_on() && ss_tlb_mark_matches(mark))
+        {
+            curr += 0x100000 * 4 * 2; /* already in this buffer */
+            ss_tlb_saves_skipped++;
+        }
+        else
+        {
+            PUTARRAY(dev->r4300.cp0.tlb.LUT_r, curr, uint32_t, 0x100000);
+            PUTARRAY(dev->r4300.cp0.tlb.LUT_w, curr, uint32_t, 0x100000);
+        }
+        if (!ss_run_id) ss_run_id = ((uint32_t)time(NULL) * 2654435761u) | 1u;
+        m[0] = 0x5434364Au; m[1] = ss_run_id; m[2] = g_tlb_lut_gen;
+        memcpy(mark, m, sizeof(m));
+    }
 
     /* OK to cast away const qualifier */
     PUTDATA(curr, uint32_t, *r4300_llbit((struct r4300_core*)&dev->r4300));

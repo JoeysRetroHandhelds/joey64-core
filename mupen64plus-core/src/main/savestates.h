@@ -59,6 +59,8 @@ int savestates_load_m64p(struct device* dev, char *filepath);
 #else
 int savestates_save_m64p(const struct device* dev, void *data);
 int savestates_load_m64p(struct device* dev, const void *data);
+/* Joey64: set by libretro.c around run-ahead's own saves and loads (the TLB tables' skip) */
+extern int savestates_ra_context;
 #endif
 
 #endif /* __SAVESTAVES_H__ */

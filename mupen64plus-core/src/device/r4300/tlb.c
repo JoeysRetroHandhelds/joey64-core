@@ -29,8 +29,17 @@
 #include <assert.h>
 #include <string.h>
 
+uint32_t g_tlb_lut_gen;
+static uint32_t tlb_gen_counter;
+
+void tlb_new_gen(void)
+{
+    g_tlb_lut_gen = ++tlb_gen_counter;
+}
+
 void poweron_tlb(struct tlb* tlb)
 {
+    tlb_new_gen();
     /* clear TLB entries */
     memset(tlb->entries, 0, 32 * sizeof(tlb->entries[0]));
     memset(tlb->LUT_r, 0, 0x100000 * sizeof(tlb->LUT_r[0]));
@@ -44,6 +53,7 @@ void tlb_unmap(struct tlb* tlb, size_t entry)
 
     assert(entry < 32);
     e = &tlb->entries[entry];
+    tlb_new_gen();
 
     if (e->v_even)
     {
@@ -71,6 +81,7 @@ void tlb_map(struct tlb* tlb, size_t entry)
 
     assert(entry < 32);
     e = &tlb->entries[entry];
+    tlb_new_gen();
 
     if (e->v_even)
     {

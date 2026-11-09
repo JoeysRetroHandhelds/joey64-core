@@ -61,6 +61,11 @@ struct tlb
 
 void poweron_tlb(struct tlb* tlb);
 
+/* Joey64 (run-ahead): names what LUT_r/LUT_w hold. A new number on every change (tlb_new_gen); a state load that
+ * puts back tables saved at generation G sets it back to G, since the tables then hold what they held at G. */
+extern uint32_t g_tlb_lut_gen;
+void tlb_new_gen(void);
+
 void tlb_unmap(struct tlb* tlb, size_t entry);
 void tlb_map(struct tlb* tlb, size_t entry);
 
