@@ -2226,7 +2226,9 @@ static size_t parallel_rsp_state_size(void) { return (size_t)-1; }
 static void parallel_rsp_state_save(void *out) { (void)out; }
 static void parallel_rsp_state_load(const void *in) { (void)in; }
 #endif
-static struct { int valid; uint32_t task_locked, unsafe; unsigned char rsp[2048]; } ra_side;
+static struct { int valid; uint32_t task_locked, unsafe; unsigned char rsp[2048];
+   struct sp_dma sp_fifo[SP_DMA_FIFO_SIZE]; struct ai_dma ai_fifo[AI_DMA_FIFO_SIZE]; unsigned ai_format_changed; } ra_side;
+/* the state file holds neither the RSP's DMA queue nor the audio queue's addresses (the loader guesses those) */
 static bool ra_same_instance(void)
 {
    static int on = -1;
@@ -2262,17 +2264,17 @@ bool retro_serialize(void *data, size_t size)
       /* An RSP task still running at the frame's end (interrupt_unsafe_state) isn't in a state: the job waits until
        * it's done, past the frame's end, and a state taken now loses the task (the game then waits for it for good:
        * SM64 froze). Not now, then: the frontend runs this frame without run-ahead. */
-      static unsigned tried, unsafe, rdp_part;
+      static unsigned tried, unsafe, unsafe_cpu, rdp_part;
       const bool same = ra_same_instance();
       if (++tried >= 600)
       {
-         if (unsafe || rdp_part)
-            log_cb(RETRO_LOG_INFO, CORE_NAME ": state at the frame's end: %u of %u with an RSP task running, %u with a display list in part\n", unsafe, tried, rdp_part);
-         tried = unsafe = rdp_part = 0;
+         if (unsafe || unsafe_cpu || rdp_part)
+            log_cb(RETRO_LOG_INFO, CORE_NAME ": state at the frame's end: of %u, refused %u with an RSP task running, %u inside a CPU instruction, %u with a display list in part\n", tried, unsafe, unsafe_cpu, rdp_part);
+         tried = unsafe = unsafe_cpu = rdp_part = 0;
       }
-      if (g_dev.r4300.cp0.interrupt_unsafe_state && !same)
+      if (g_dev.r4300.cp0.interrupt_unsafe_state && !(same && g_dev.r4300.cp0.interrupt_unsafe_state == INTR_UNSAFE_RSP))
       {
-         unsafe++;
+         if (g_dev.r4300.cp0.interrupt_unsafe_state & INTR_UNSAFE_R4300) unsafe_cpu++; else unsafe++;
          return false;
       }
       /* parallel-RDP keeps a display list that arrived in part outside the state: after a load the next part would
@@ -2292,6 +2294,9 @@ bool retro_serialize(void *data, size_t size)
          ra_side.task_locked = g_dev.sp.rsp_task_locked;
          ra_side.unsafe = g_dev.r4300.cp0.interrupt_unsafe_state;
          parallel_rsp_state_save(ra_side.rsp);
+         memcpy(ra_side.sp_fifo, g_dev.sp.fifo, sizeof(ra_side.sp_fifo));
+         memcpy(ra_side.ai_fifo, g_dev.ai.fifo, sizeof(ra_side.ai_fifo));
+         ra_side.ai_format_changed = g_dev.ai.samples_format_changed;
          ra_side.valid = 1;
       }
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
@@ -2361,6 +2366,9 @@ bool retro_unserialize(const void *data, size_t size)
          g_dev.sp.rsp_task_locked = ra_side.task_locked;
          g_dev.r4300.cp0.interrupt_unsafe_state = ra_side.unsafe;
          parallel_rsp_state_load(ra_side.rsp);
+         memcpy(g_dev.sp.fifo, ra_side.sp_fifo, sizeof(ra_side.sp_fifo));
+         memcpy(g_dev.ai.fifo, ra_side.ai_fifo, sizeof(ra_side.ai_fifo));
+         g_dev.ai.samples_format_changed = ra_side.ai_format_changed;
       }
       /* states at the frame's end are taken with no display list in part (retro_serialize): none now either */
       if (ret && current_rdp_type == RDP_PLUGIN_PARALLEL)
