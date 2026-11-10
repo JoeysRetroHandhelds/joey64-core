@@ -48,6 +48,8 @@ enum class Op
 	// Joey64 texture packs: words[0] bits 0-2 tile, words[1] texel offset (0 = none), words[2] width | height << 16,
 	// words[3] original width | original height << 16 (CommandProcessor::set_tile_replace).
 	MetaTileReplace = 5,
+	// Joey64 run-ahead: words[1] != 0 draws no upscaled pass until the next one (CommandProcessor::set_skip_upscaled).
+	MetaSetSkipUpscaled = 6,
 
 	FillTriangle = 0x08,
 	FillZBufferTriangle = 0x09,

@@ -1080,6 +1080,12 @@ void CommandProcessor::enqueue_command_direct(unsigned, const uint32_t *words)
 		break;
 	}
 
+	case Op::MetaSetSkipUpscaled:
+	{
+		renderer.set_skip_upscaled(words[1] != 0);
+		break;
+	}
+
 	case Op::MetaTileReplace:
 	{
 		renderer.set_tile_replace(words[0] & 7u, (words[0] & 8u) != 0, words[1], words[2], words[3], (words[0] & 16u) != 0);
@@ -1098,6 +1104,15 @@ void CommandProcessor::set_quirks(const Quirks &quirks_)
 	const uint32_t words[2] = {
 		uint32_t(Op::MetaSetQuirks) << 24u,
 		quirks_.u.words[0],
+	};
+	enqueue_command_inner(2, words);
+}
+
+void CommandProcessor::set_skip_upscaled(bool skip)
+{
+	const uint32_t words[2] = {
+		uint32_t(Op::MetaSetSkipUpscaled) << 24u,
+		skip ? 1u : 0u,
 	};
 	enqueue_command_inner(2, words);
 }

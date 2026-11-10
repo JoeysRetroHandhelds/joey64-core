@@ -728,6 +728,14 @@ void Renderer::flush_and_signal()
 	assert(!stream.cmd);
 }
 
+void Renderer::set_skip_upscaled(bool skip)
+{
+	// A pass already queued keeps the setting it was recorded under.
+	if (skip != skip_upscaled)
+		flush_queues();
+	skip_upscaled = skip;
+}
+
 void Renderer::set_color_framebuffer(uint32_t addr, uint32_t width, FBFormat fmt)
 {
 	if (fb.addr != addr || fb.width != width || fb.fmt != fmt)
@@ -3149,7 +3157,7 @@ bool Renderer::render_pass_is_upscaled() const
 
 bool Renderer::should_render_upscaled() const
 {
-	if (caps.upscaling > 1)
+	if (caps.upscaling > 1 && !skip_upscaled)
 	{
 		// A heuristic. There is no point to render upscaled for purely off-screen passes.
 		// We should ideally only upscale the final pass which hits screen.
