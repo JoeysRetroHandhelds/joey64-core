@@ -90,21 +90,6 @@ static int is_valid_rom(const unsigned char *buffer, unsigned int size)
         return 0;
 }
 
-/* Copies the source block of memory to the destination block of memory while
- * switching the endianness of .v64 and .n64 images to the .z64 format, which
- * is native to the Nintendo 64. The data extraction routines and MD5 hashing
- * function may only act on the .z64 big-endian format.
- *
- * IN: src: The source block of memory. This must be a valid Nintendo 64 ROM
- *          image of 'len' bytes.
- *     len: The length of the source and destination, in bytes.
- * OUT: dst: The destination block of memory. This must be a valid buffer for
- *           at least 'len' bytes.
- *      imagetype: A pointer to a byte that gets updated with the value of
- *                 V64IMAGE, N64IMAGE or Z64IMAGE according to the format of
- *                 the source block. The value is undefined if 'src' does not
- *                 represent a valid Nintendo 64 ROM image.
- */
 /* Joey64 (2026-11-10): Super Mario Star Road and other SM64 hacks built with old tools carry a bad G_SETCOMBINE,
  * FC 12 7F FF FF FF F8 38, that accurate renderers (parallel-RDP, angrylion, real hardware plugins) draw as black.
  * Newer GLideN64 works around it at draw time (GLideN64 issue 1745); the RetroPie forum fix (topic 17605) replaces
@@ -132,6 +117,21 @@ static void fix_bad_setcombine(uint8_t* rom, size_t len)
         DebugMessage(M64MSG_INFO, "Joey64: replaced %u bad SetCombine commands (FC127FFFFFFFF838)", (unsigned)n);
 }
 
+/* Copies the source block of memory to the destination block of memory while
+ * switching the endianness of .v64 and .n64 images to the .z64 format, which
+ * is native to the Nintendo 64. The data extraction routines and MD5 hashing
+ * function may only act on the .z64 big-endian format.
+ *
+ * IN: src: The source block of memory. This must be a valid Nintendo 64 ROM
+ *          image of 'len' bytes.
+ *     len: The length of the source and destination, in bytes.
+ * OUT: dst: The destination block of memory. This must be a valid buffer for
+ *           at least 'len' bytes.
+ *      imagetype: A pointer to a byte that gets updated with the value of
+ *                 V64IMAGE, N64IMAGE or Z64IMAGE according to the format of
+ *                 the source block. The value is undefined if 'src' does not
+ *                 represent a valid Nintendo 64 ROM image.
+ */
 static void swap_copy_rom(void* dst, const void* src, size_t len, unsigned char* imagetype)
 {
     if (memcmp(src, V64_SIGNATURE, sizeof(V64_SIGNATURE)) == 0)
