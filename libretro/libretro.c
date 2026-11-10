@@ -489,7 +489,10 @@ static void* EmuThreadFunction(void* param)
     if (netplay_port)
     {
         uint32_t version;
-        if (CoreDoCommand(M64CMD_NETPLAY_GET_VERSION, 0x010000, &version) == M64ERR_SUCCESS)
+        m64p_error ver = CoreDoCommand(M64CMD_NETPLAY_GET_VERSION, NETPLAY_API_VERSION, &version);
+        if (ver != M64ERR_SUCCESS)
+            log_cb(RETRO_LOG_ERROR, "Netplay: version check failed (%d), playing offline\n", (int)ver);
+        else
         {
             log_cb(RETRO_LOG_INFO, "Netplay: using core version %u\n", version);
 

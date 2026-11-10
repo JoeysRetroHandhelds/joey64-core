@@ -130,6 +130,10 @@ static struct controller_input_compat *l_cin_compats;
 static uint8_t l_plugin[4];
 static uint8_t l_buffer_target;
 static uint8_t l_player_lag[4];
+//Joey64: our last inputs, sent again (see netplay_send_input)
+#define NP_RESEND 8
+static struct { uint32_t count, keys; uint8_t plugin; } l_sent[4][NP_RESEND];
+static uint8_t l_sent_n[4], l_sent_pos[4];
 
 //UDP packets
 static np_packet l_packets[4];
@@ -213,6 +217,8 @@ m64p_error netplay_start(const char* host, int port)
         l_netplay_control[i] = -1;
         l_plugin[i] = 0;
         l_player_lag[i] = 0;
+        l_sent_n[i] = 0;
+        l_sent_pos[i] = 0;
     }
 
     l_canFF = 0;
@@ -420,6 +426,8 @@ static void netplay_process()
     }
 }
 
+static void netplay_resend_inputs(void);
+
 static int netplay_ensure_valid(uint8_t control_id)
 {
     //This function makes sure we have data for a certain event
@@ -444,6 +452,7 @@ static int netplay_ensure_valid(uint8_t control_id)
         }
         if (now - asked >= 5)
         {
+            netplay_resend_inputs();
             netplay_request_input(control_id);
             asked = now;
         }
@@ -529,15 +538,42 @@ static uint32_t netplay_get_input(uint8_t control_id)
     return keys;
 }
 
-static void netplay_send_input(uint8_t control_id, uint32_t keys)
+//Joey64 (2026-11-10): each input went out once, so one UDP packet lost on Wi-Fi left every player waiting
+//for it until the connection counted as lost. Our last NP_RESEND inputs are kept and sent again: the one
+//before with each new one, and all of them while we wait for input (servers keep the first copy of a count).
+
+static void np_send_key(uint8_t control_id, uint32_t count, uint32_t keys, uint8_t plugin)
 {
     l_send_input_packet->data[0] = UDP_SEND_KEY_INFO;
     l_send_input_packet->data[1] = control_id; //player number
-    SDLNet_Write32(l_cin_compats[control_id].netplay_count, &l_send_input_packet->data[2]); // current event count
+    SDLNet_Write32(count, &l_send_input_packet->data[2]); // event count
     SDLNet_Write32(keys, &l_send_input_packet->data[6]); //key data
-    l_send_input_packet->data[10] = l_plugin[control_id]; //current plugin
+    l_send_input_packet->data[10] = plugin; //current plugin
     l_send_input_packet->len = 11;
     SDLNet_UDP_Send(l_udpSocket, l_udpChannel, l_send_input_packet);
+}
+
+static void netplay_resend_inputs(void)
+{
+    for (uint8_t id = 0; id < 4; ++id)
+        for (uint8_t i = 0; i < l_sent_n[id]; ++i)
+            np_send_key(id, l_sent[id][i].count, l_sent[id][i].keys, l_sent[id][i].plugin);
+}
+
+static void netplay_send_input(uint8_t control_id, uint32_t keys)
+{
+    uint8_t pos = l_sent_pos[control_id];
+    l_sent[control_id][pos].count = l_cin_compats[control_id].netplay_count;
+    l_sent[control_id][pos].keys = keys;
+    l_sent[control_id][pos].plugin = l_plugin[control_id];
+    l_sent_pos[control_id] = (uint8_t)((pos + 1) % NP_RESEND);
+    if (l_sent_n[control_id] < NP_RESEND) ++l_sent_n[control_id];
+    np_send_key(control_id, l_cin_compats[control_id].netplay_count, keys, l_plugin[control_id]);
+    if (l_sent_n[control_id] > 1)
+    {
+        uint8_t prev = (uint8_t)((pos + NP_RESEND - 1) % NP_RESEND);
+        np_send_key(control_id, l_sent[control_id][prev].count, l_sent[control_id][prev].keys, l_sent[control_id][prev].plugin);
+    }
 }
 
 uint8_t netplay_register_player(uint8_t player, uint8_t plugin, uint8_t rawdata, uint32_t reg_id)
