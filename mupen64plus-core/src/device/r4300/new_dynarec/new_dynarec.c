@@ -3608,6 +3608,35 @@ static void invalidate_all_pages(void)
   tlb_speed_hacks();
 }
 
+void new_dynarec_tlb_drain(void)
+{
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  drc_drain();
+#endif
+}
+
+void new_dynarec_tlb_page_drop(u_int page)
+{
+  if(page<0x80000||page>0xBFFFF)
+  {
+    invalidate_block(page);
+    g_dev.r4300.new_dynarec_hot_state.memory_map[page]=(uintptr_t)-1;
+  }
+}
+
+void new_dynarec_tlb_page_map(u_int page)
+{
+  if(page>=0x80000&&page<=0xBFFFF) return;
+  /* as TLBWI_new does for each page of the new entry */
+  if(g_dev.r4300.cp0.tlb.LUT_r[page]) {
+    g_dev.r4300.new_dynarec_hot_state.memory_map[page]=((uintptr_t)g_dev.rdram.dram+(uintptr_t)((g_dev.r4300.cp0.tlb.LUT_r[page]&0xFFFFF000)-0x80000000)-(page<<12))>>2;
+    if(!g_dev.r4300.cp0.tlb.LUT_w[page]||!g_dev.r4300.cached_interp.invalid_code[page])
+      g_dev.r4300.new_dynarec_hot_state.memory_map[page]|=WRITE_PROTECT;
+    using_tlb=1;
+  }
+  else g_dev.r4300.new_dynarec_hot_state.memory_map[page]=(uintptr_t)-1;
+}
+
 void invalidate_cached_code_new_dynarec(struct r4300_core* r4300, uint32_t address, size_t size)
 {
     size_t i;
