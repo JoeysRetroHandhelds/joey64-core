@@ -70,6 +70,25 @@ static uint32_t np_ticks(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
 }
+
+static uint64_t np_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+//Joey64 (2026-11-10): connection numbers, logged every 5 s in a room so a session log shows a bad connection:
+//round trip of input requests (sent to the server's answer), the waits for input (a frame that couldn't go on),
+//input events heard, copies heard again (resends and gratuitous ones), requests sent, and the server's lag.
+static struct {
+    uint64_t req_at[4];          // when the oldest unanswered request for that player went out (us), 0 = none
+    uint64_t rtt_sum, rtt_max;   // us
+    uint32_t rtt_n;
+    uint32_t waits, wait_ms, wait_max;
+    uint32_t heard, dup, sent_req, packets;
+    uint32_t since;
+} l_ns;
 static void np_udp_send(np_packet *p)
 {
     if (np_udp >= 0) send(np_udp, p->data, p->len, 0);
@@ -130,6 +149,8 @@ static struct controller_input_compat *l_cin_compats;
 static uint8_t l_plugin[4];
 static uint8_t l_buffer_target;
 static uint8_t l_player_lag[4];
+//Joey64: when the server last sent us anything (see netplay_ensure_valid)
+static uint32_t l_last_heard;
 //Joey64: our last inputs, sent again (see netplay_send_input)
 #define NP_RESEND 8
 static struct { uint32_t count, keys; uint8_t plugin; } l_sent[4][NP_RESEND];
@@ -219,6 +240,7 @@ m64p_error netplay_start(const char* host, int port)
         l_player_lag[i] = 0;
         l_sent_n[i] = 0;
         l_sent_pos[i] = 0;
+        memset(&l_ns, 0, sizeof l_ns);
     }
 
     l_canFF = 0;
@@ -320,6 +342,8 @@ static void netplay_request_input(uint8_t control_id)
     l_request_input_packet->data[11] = buffer_size(control_id); //our local buffer size
     l_request_input_packet->len = 12;
     SDLNet_UDP_Send(l_udpSocket, l_udpChannel, l_request_input_packet);
+    if (!l_ns.req_at[control_id]) l_ns.req_at[control_id] = np_us();
+    ++l_ns.sent_req;
 }
 
 static int check_valid(uint8_t control_id, uint32_t count)
@@ -342,6 +366,7 @@ static void netplay_process()
     uint8_t plugin, player, current_status;
     while (SDLNet_UDP_Recv(l_udpSocket, l_process_packet) == 1)
     {
+        l_last_heard = np_ticks();
         if (!netplay_packet_has_data(l_process_packet, 0, 5))
         {
             DebugMessage(M64MSG_ERROR, "Netplay: received truncated message from server");
@@ -367,8 +392,18 @@ static void netplay_process()
                 //current_status is a status update from the server
                 //it will let us know if another player has disconnected, or the games have desynced
                 current_status = l_process_packet->data[2];
+                ++l_ns.packets;
                 if (l_process_packet->data[0] == UDP_RECEIVE_KEY_INFO)
+                {
                     l_player_lag[player] = l_process_packet->data[3];
+                    if (l_ns.req_at[player])
+                    {
+                        uint64_t rtt = np_us() - l_ns.req_at[player];
+                        l_ns.rtt_sum += rtt; ++l_ns.rtt_n;
+                        if (rtt > l_ns.rtt_max) l_ns.rtt_max = rtt;
+                        l_ns.req_at[player] = 0;
+                    }
+                }
                 if (current_status != l_status)
                 {
                     if (((current_status & 0x1) ^ (l_status & 0x1)) != 0)
@@ -377,6 +412,15 @@ static void netplay_process()
                     {
                         if (((current_status & (0x1 << dis)) ^ (l_status & (0x1 << dis))) != 0)
                             log_cb(RETRO_LOG_INFO, "Netplay: player %u has disconnected\n", dis);
+                    }
+                    //Joey64 (2026-11-10): Joey64's room puts the paused player (1-4, 0 = none) in bits 5-7;
+                    //other servers leave them 0. The app shows who paused from these lines.
+                    if (((current_status ^ l_status) & 0xE0) != 0)
+                    {
+                        if (current_status >> 5)
+                            log_cb(RETRO_LOG_INFO, "Netplay: player %u paused\n", current_status >> 5);
+                        else
+                            log_cb(RETRO_LOG_INFO, "Netplay: nobody is paused\n");
                     }
                     l_status = current_status;
                 }
@@ -390,6 +434,7 @@ static void netplay_process()
 
                     if (((count - l_cin_compats[player].netplay_count) > (UINT32_MAX / 2)) || (check_valid(player, count))) //event doesn't need to be recorded
                     {
+                        ++l_ns.dup;
                         curr += 5;
                         continue;
                     }
@@ -413,6 +458,7 @@ static void netplay_process()
                         break;
                     }
                     new_event->count = count;
+                    ++l_ns.heard;
                     new_event->buttons = keys;
                     new_event->plugin = plugin;
                     new_event->next = l_cin_compats[player].event_first;
@@ -439,16 +485,25 @@ static int netplay_ensure_valid(uint8_t control_id)
         return 0;
 
     //We need this event's input and don't have it: ask the server every 5 ms while reading what it sends.
-    //After 10 seconds without it, the connection counts as lost.
+    //Joey64 (2026-11-10): the connection counts as lost only when the server has sent nothing for 10 s (or its TCP
+    //connection closed). While it still answers, the input is late because that player is paused or slow (a pause
+    //menu, a call, the screen off), so we keep waiting: before, 10 s of any wait dropped every other player.
     const uint32_t start = np_ticks();
     uint32_t asked = start;
+    int said = 0;
+    l_last_heard = start;
     while (!check_valid(control_id, l_cin_compats[control_id].netplay_count))
     {
         const uint32_t now = np_ticks();
-        if (l_udpChannel == -1 || now - start > 10000)
+        if (l_udpChannel == -1 || now - l_last_heard > 10000)
         {
             l_udpChannel = -1;
             return 0;
+        }
+        if (!said && now - start > 1000)
+        {
+            log_cb(RETRO_LOG_INFO, "Netplay: waiting for player %u\n", control_id + 1);
+            said = 1;
         }
         if (now - asked >= 5)
         {
@@ -459,6 +514,13 @@ static int netplay_ensure_valid(uint8_t control_id)
         struct pollfd pfd = { np_udp, POLLIN, 0 };
         poll(&pfd, 1, 1);
         netplay_process();
+    }
+    if (said)
+        log_cb(RETRO_LOG_INFO, "Netplay: player %u is back after %u ms\n", control_id + 1, np_ticks() - start);
+    {
+        uint32_t waited = np_ticks() - start;
+        ++l_ns.waits; l_ns.wait_ms += waited;
+        if (waited > l_ns.wait_max) l_ns.wait_max = waited;
     }
     return 1;
 }
@@ -481,10 +543,29 @@ static void netplay_delete_event(struct netplay_event* current, uint8_t control_
     free(current);
 }
 
+static void netplay_log_stats(void)
+{
+    uint32_t now = np_ticks();
+    if (!l_ns.since) { l_ns.since = now; return; }
+    if (now - l_ns.since < 5000) return;
+    //(no round trip here: we read replies once a frame, so it would time the game loop; the app pings the room itself)
+    log_cb(RETRO_LOG_INFO, "Netplay: net: %u waits for input (%u ms, worst %u ms), "
+           "%u inputs heard, %u copies, %u requests, %u packets in %.1f s, lag %u/%u/%u/%u\n",
+           l_ns.waits, l_ns.wait_ms, l_ns.wait_max, l_ns.heard, l_ns.dup, l_ns.sent_req, l_ns.packets,
+           (now - l_ns.since) / 1000.0, l_player_lag[0], l_player_lag[1], l_player_lag[2], l_player_lag[3]);
+    uint64_t keep[4];
+    memcpy(keep, l_ns.req_at, sizeof keep);
+    memset(&l_ns, 0, sizeof l_ns);
+    memcpy(l_ns.req_at, keep, sizeof keep);
+    l_ns.since = now;
+}
+
 static uint32_t netplay_get_input(uint8_t control_id)
 {
     uint32_t keys;
     struct retro_fastforwarding_override ff_override;
+
+    netplay_log_stats();
 
     netplay_process();
     netplay_request_input(control_id);
