@@ -3195,7 +3195,15 @@ void Renderer::flush_queues()
 	{
 		if (has_single_sampled_render_pass)
 		{
-			maintain_queues();
+			// Joey64 (2026-11-10): N64_RDP_SPLIT_UPSCALED=1 always submits the 1x pass on its own here, so the fence
+			// the CPU waits on (smart sync's faults, SyncFull in synchronous mode, run-ahead's take and put back)
+			// signals once RDRAM is written, not after the upscaled pass, which only feeds the picture. New Tetris
+			// reads back every frame; with run-ahead at 2x it ran 23-27 fps with the GPU at 550 MHz (Thor).
+			static const bool split = getenv("N64_RDP_SPLIT_UPSCALED") && getenv("N64_RDP_SPLIT_UPSCALED")[0] == '1';
+			if (split)
+				submit_to_queue();
+			else
+				maintain_queues();
 			ensure_command_buffer();
 
 			// We're going to keep reading the same data structures, so make sure
