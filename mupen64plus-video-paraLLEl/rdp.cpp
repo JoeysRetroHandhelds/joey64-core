@@ -2598,7 +2598,21 @@ void complete_frame()
 	{
 		bool same = Dup::same_as_last();
 		// Run-ahead's automatic native draws: did the shown extra frame show rows it drew itself?
-		if (RaNative::mode == 3 && (RaNative::cur_av & 9) == 9 && !RaNative::off && active_upscaling > 1)
+		// N64_RA_NATIVE_DEBUG=1: count shown extra frames that drew what they showed, per 600, without turning off.
+		static const bool ra_dbg = getenv("N64_RA_NATIVE_DEBUG") && getenv("N64_RA_NATIVE_DEBUG")[0] == '1';
+		if (ra_dbg && (RaNative::cur_av & 9) == 9)
+		{
+			static unsigned shown, drew, first = ~0u;
+			if (Dup::last_drew && first == ~0u)
+				first = shown;
+			drew += Dup::last_drew;
+			if (++shown % 600 == 0)
+			{
+				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead debug: %u of the last 600 shown frames drew what they showed (first at shown frame %u)\n", drew, first);
+				drew = 0;
+			}
+		}
+		else if (RaNative::mode == 3 && (RaNative::cur_av & 9) == 9 && !RaNative::off && active_upscaling > 1)
 		{
 			if (Dup::last_drew)
 			{
