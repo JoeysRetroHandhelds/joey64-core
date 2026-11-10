@@ -3107,7 +3107,11 @@ static void blk_save(void)
   if (fclose(f) == 0 && rename(tmp, blk_path) == 0) blk_saves++;
 }
 
-/* Once a frame (VI interrupt, between blocks): up to 512 listed blocks checked against RAM, the matching ones queued. */
+/* Once a frame (VI interrupt, between blocks): up to 512 listed blocks checked against RAM, the matching ones queued.
+ * Early compiles only fill an idle queue (2026-11-10): at most 8 a frame and only while fewer than 4 compiles wait, so
+ * a block the game needs now never waits behind them. Queued in bursts of 64 a frame, 1400+ of them held Cruis'n
+ * USA's own new code in the interpreter long enough to change its timing, and it hung on a black screen on the Flip
+ * (1055 listed blocks fine, 1406 black, the same either half of the list). */
 void new_dynarec_blocklist_tick(void)
 {
   if (blk_on < 0) blk_init();
@@ -3118,7 +3122,7 @@ void new_dynarec_blocklist_tick(void)
     DebugMessage(M64MSG_INFO, "dynarec: block list: %d blocks known (%u from the file), %u queued early so far", blk_n, blk_loaded, blk_queued);
   }
   int checked, queued = 0;
-  for (checked = 0; checked < 512 && blk_n > 0 && queued < 64; checked++) {
+  for (checked = 0; checked < 512 && blk_n > 0 && queued < 8 && ((drc_qt - drc_qh) & 4095) < 4; checked++) {
     struct blk_ent *b = &blk_tab[blk_rr];
     blk_rr = (blk_rr + 1) % blk_n;
     if (b->done) continue;
