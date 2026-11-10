@@ -793,6 +793,11 @@ static unsigned clean; // shown extra frames in a row whose shown rows that fram
 // The first 60 shown frames don't count: starting from a state, GoldenEye's first shown frame looked like it drew what
 // it showed and no other one in 1200 did (Thor). Native draws can't start before 600 anyway.
 static unsigned warm;
+// This frame's draws are at native size only (set_hidden_frame's choice for it). When such a frame turns out to have
+// drawn what it shows, that picture is not shown: the last one is held one refresh instead. Spider-Man (Thor
+// 2026-11-09): the first frame of its copyright screen, drawn straight into the shown buffer after 600 frames that
+// weren't, came out with softer text and a faint bar; held, it shows the black frame before once more.
+static bool native_now;
 }
 void set_hidden_frame(int av)
 {
@@ -819,6 +824,7 @@ void set_hidden_frame(int av)
 		frontend->set_skip_upscaled(skip);
 		last = skip;
 	}
+	RaNative::native_now = skip;
 	native += skip;
 	if (++frames >= 1200)
 	{
@@ -2624,7 +2630,13 @@ void complete_frame()
 			else if (Dup::last_drew)
 			{
 				RaNative::off = true;
-				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: a shown frame drew what it showed (after %u that didn't): extra frames upscaled from now on\n", RaNative::clean);
+				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: a shown frame drew what it showed (after %u that didn't): extra frames upscaled from now on%s\n",
+				       RaNative::clean, RaNative::native_now ? "; it was drawn at native size, so the last picture is held for it" : "");
+				if (RaNative::native_now)
+				{
+					same = true;              // not scanned out: the last picture stays
+					Dup::have_last = false;   // and the next refresh is scanned out whatever it holds
+				}
 			}
 			else if (RaNative::clean < 600 && ++RaNative::clean == 600)
 				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: 600 shown frames showed what the frame before drew: extra frames at native size from now on\n");
