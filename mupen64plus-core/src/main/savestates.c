@@ -926,6 +926,10 @@ int savestates_load_m64p(struct device* dev, const void *data)
     *r4300_cp1_fcr31(&dev->r4300.cp1) = FCR31;
     set_fpr_pointers(&dev->r4300.cp1, cp0_regs[CP0_STATUS_REG]);
     update_x86_rounding_mode(&dev->r4300.cp1);
+#ifdef NEW_DYNAREC
+    if (dev->r4300.emumode == EMUMODE_DYNAREC)
+        new_dynarec_load_rounding();
+#endif
 
     for (i = 0; i < 32; i++)
     {
@@ -1563,6 +1567,10 @@ static int savestates_load_pj64(struct device* dev,
     FCR31 = GETDATA(curr, uint32_t);
     *r4300_cp1_fcr31(&dev->r4300.cp1) = FCR31;
     update_x86_rounding_mode(&dev->r4300.cp1);
+#ifdef NEW_DYNAREC
+    if (dev->r4300.emumode == EMUMODE_DYNAREC)
+        new_dynarec_load_rounding();
+#endif
 
     // hi / lo
     *r4300_mult_hi(&dev->r4300) = GETDATA(curr, int64_t);

@@ -46,6 +46,17 @@
 
 /* local variables */
 static struct hle_t g_hle;
+
+/* Joey64 (run-ahead, 2026-11-10): the audio lists' state kept from one task to the next (the alist buffer, the
+ * audio/naudio/nead variables, the MP3 buffer) is in g_hle, outside the core's state. The extra frames' audio tasks
+ * changed it and the next real task ran on from there: Perfect Dark's RAM differed from a plain run from frame 3 on
+ * (Thor, HLE audio under parallel-RSP and with GLideN64; exact with cxd4). Run-ahead states carry it now. */
+#include <stddef.h>
+#define HLE_RA_FROM offsetof(struct hle_t, alist_buffer)
+#define HLE_RA_TO offsetof(struct hle_t, cached_ucodes)
+size_t hle_ra_state_size(void) { return HLE_RA_TO - HLE_RA_FROM; }
+void hle_ra_state_save(void *out) { memcpy(out, (const unsigned char*)&g_hle + HLE_RA_FROM, HLE_RA_TO - HLE_RA_FROM); }
+void hle_ra_state_load(const void *in) { memcpy((unsigned char*)&g_hle + HLE_RA_FROM, in, HLE_RA_TO - HLE_RA_FROM); }
 static void (*l_CheckInterrupts)(void) = NULL;
 static void (*l_ProcessDlistList)(void) = NULL;
 static void (*l_ProcessAlistList)(void) = NULL;
