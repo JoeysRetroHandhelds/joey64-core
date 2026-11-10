@@ -363,7 +363,7 @@ private:
 	{
 		bool valid = false;
 		uint32_t primitive_index = 0;
-		Vulkan::BufferHandle hidden_rdram, tmem, upscaled_hidden_rdram;
+		Vulkan::BufferHandle hidden_rdram, tmem;
 	} ra_saved;
 	void ra_copy(Vulkan::Buffer &dst, Vulkan::Buffer &src);
 	unsigned pending_render_passes = 0;

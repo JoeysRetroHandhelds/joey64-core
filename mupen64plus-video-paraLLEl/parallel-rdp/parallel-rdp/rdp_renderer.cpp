@@ -785,13 +785,9 @@ void Renderer::ra_state(bool restore)
 		ra_copy(*ra_saved.hidden_rdram, *hidden_rdram);
 		make(ra_saved.tmem, *tmem);
 		ra_copy(*ra_saved.tmem, *tmem);
-		if (upscaling_multisampled_hidden_rdram)
-		{
-			make(ra_saved.upscaled_hidden_rdram, *upscaling_multisampled_hidden_rdram);
-			ra_copy(*ra_saved.upscaled_hidden_rdram, *upscaling_multisampled_hidden_rdram);
-		}
-		else
-			ra_saved.upscaled_hidden_rdram.reset();
+		// Not the upscaled copy (64 MB at 4x, two copies a frame cost a quarter of the frame rate on the Thor):
+		// it only feeds the picture, and update_upscaled_domain_pre rewrites its samples from the 1x RDRAM and
+		// hidden bits wherever the put-back RDRAM differs from what the extra frames left.
 		ra_saved.valid = true;
 	}
 	else
@@ -805,10 +801,6 @@ void Renderer::ra_state(bool restore)
 		stream.depth_blend_state = ra_saved_cpu.depth_blend_state;
 		ra_copy(*hidden_rdram, *ra_saved.hidden_rdram);
 		ra_copy(*tmem, *ra_saved.tmem);
-		if (upscaling_multisampled_hidden_rdram && ra_saved.upscaled_hidden_rdram &&
-		    ra_saved.upscaled_hidden_rdram->get_create_info().size ==
-		    upscaling_multisampled_hidden_rdram->get_create_info().size)
-			ra_copy(*upscaling_multisampled_hidden_rdram, *ra_saved.upscaled_hidden_rdram);
 	}
 }
 
