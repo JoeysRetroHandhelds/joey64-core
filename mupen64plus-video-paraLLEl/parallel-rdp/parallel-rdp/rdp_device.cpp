@@ -1086,9 +1086,25 @@ void CommandProcessor::enqueue_command_direct(unsigned, const uint32_t *words)
 		break;
 	}
 
-	case Op::MetaRaPrimitiveBase:
+	case Op::MetaRaState:
 	{
-		renderer.ra_primitive_base(words[1] != 0);
+		bool restore = words[1] != 0;
+		if (!restore)
+		{
+			ra_saved.scissor_state = scissor_state;
+			ra_saved.static_state = static_state;
+			ra_saved.depth_blend = depth_blend;
+			ra_saved.texture_image = texture_image;
+			ra_saved.valid = true;
+		}
+		else if (ra_saved.valid)
+		{
+			scissor_state = ra_saved.scissor_state;
+			static_state = ra_saved.static_state;
+			depth_blend = ra_saved.depth_blend;
+			texture_image = ra_saved.texture_image;
+		}
+		renderer.ra_state(restore);
 		break;
 	}
 
@@ -1123,10 +1139,10 @@ void CommandProcessor::set_skip_upscaled(bool skip)
 	enqueue_command_inner(2, words);
 }
 
-void CommandProcessor::ra_primitive_base(bool restore)
+void CommandProcessor::ra_state(bool restore)
 {
 	const uint32_t words[2] = {
-		uint32_t(Op::MetaRaPrimitiveBase) << 24u,
+		uint32_t(Op::MetaRaState) << 24u,
 		restore ? 1u : 0u,
 	};
 	enqueue_command_inner(2, words);

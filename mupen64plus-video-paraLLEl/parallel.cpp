@@ -78,9 +78,9 @@ extern "C" void parallel_drop_pending_commands(void)
 	RDP::drop_pending_commands();
 }
 
-extern "C" void parallel_ra_primitive_base(int restore)
+extern "C" void parallel_ra_state(int restore)
 {
-	RDP::ra_primitive_base(restore != 0);
+	RDP::ra_state(restore != 0);
 }
 
 void parallelRomClosed(void)

@@ -19,7 +19,7 @@ void parallel_begin_frame(void);
 void parallel_set_synchronous_rdp(bool enable);
 int parallel_pending_commands(void);
 void parallel_drop_pending_commands(void);
-void parallel_ra_primitive_base(int restore);
+void parallel_ra_state(int restore);
 int parallel_smart_on(void);
 void parallel_smart_settle(void);
 void parallel_set_hidden_frame(int av);

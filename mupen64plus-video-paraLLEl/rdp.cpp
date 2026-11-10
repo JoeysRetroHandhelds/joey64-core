@@ -2205,11 +2205,11 @@ void drop_pending_commands()
 	cmd_cur = 0;
 }
 
-/* Joey64 (run-ahead): keep or put back the dither noise seed with the run-ahead state (CommandProcessor::ra_primitive_base). */
-void ra_primitive_base(bool restore)
+/* Joey64 (run-ahead): keep or put back the RDP's own state with the run-ahead state (CommandProcessor::ra_state). */
+void ra_state(bool restore)
 {
 	if (frontend)
-		frontend->ra_primitive_base(restore);
+		frontend->ra_state(restore);
 }
 
 void process_commands()

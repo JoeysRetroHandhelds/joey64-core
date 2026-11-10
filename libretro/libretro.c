@@ -2324,9 +2324,9 @@ bool retro_serialize(void *data, size_t size)
          memcpy(ra_side.sp_fifo, g_dev.sp.fifo, sizeof(ra_side.sp_fifo));
          memcpy(ra_side.ai_fifo, g_dev.ai.fifo, sizeof(ra_side.ai_fifo));
          ra_side.ai_format_changed = g_dev.ai.samples_format_changed;
-         /* parallel-RDP's dither noise seed (its triangle count), which the extra frames advance */
+         /* what parallel-RDP holds outside RDRAM (registers, TMEM, coverage bits, noise seed): the extra frames change it */
          if (current_rdp_type == RDP_PLUGIN_PARALLEL)
-            parallel_ra_primitive_base(0);
+            parallel_ra_state(0);
          ra_side.valid = 1;
       }
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
@@ -2407,7 +2407,7 @@ bool retro_unserialize(const void *data, size_t size)
       {
          parallel_drop_pending_commands();
          if (ra_side.valid && ra_same_instance())
-            parallel_ra_primitive_base(1);
+            parallel_ra_state(1);
       }
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);

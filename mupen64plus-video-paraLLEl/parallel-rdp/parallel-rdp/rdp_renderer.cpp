@@ -736,19 +736,79 @@ void Renderer::set_skip_upscaled(bool skip)
 	skip_upscaled = skip;
 }
 
-void Renderer::ra_primitive_base(bool restore)
+void Renderer::ra_copy(Vulkan::Buffer &dst, Vulkan::Buffer &src)
 {
-	// A triangle's noise seed is base_primitive_index + its place in the queued pass, and a flush adds the pass's
-	// count, so base + queued is the count wherever passes are cut: keep that, and put it back after a flush.
+	// Its own command buffer, after everything recorded so far (submitted first) on the same queue.
+	auto cmd = device->request_command_buffer(Vulkan::CommandBuffer::Type::AsyncCompute);
+	cmd->barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+	             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+	             VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+	cmd->copy_buffer(dst, src);
+	cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+	             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+	             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+	             VK_ACCESS_2_TRANSFER_READ_BIT);
+	device->submit(cmd);
+}
+
+void Renderer::ra_state(bool restore)
+{
+	if (restore && !ra_saved.valid)
+		return;
+	// Everything queued so far goes to the GPU first, so the copies see (or replace) all of it.
+	flush_queues();
+	submit_to_queue();
+
+	auto make = [&](Vulkan::BufferHandle &h, const Vulkan::Buffer &like) {
+		if (!h || h->get_create_info().size != like.get_create_info().size)
+		{
+			Vulkan::BufferCreateInfo info = {};
+			info.size = like.get_create_info().size;
+			info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+			info.domain = Vulkan::BufferDomain::Device;
+			h = device->create_buffer(info);
+		}
+	};
+
 	if (!restore)
 	{
-		ra_saved_primitive_index = base_primitive_index + uint32_t(stream.triangle_setup.size());
-		ra_saved_primitive_valid = true;
+		// A triangle's noise seed is base_primitive_index + its place in its pass, and each pass adds its count,
+		// so after the flush this is the count however passes are cut.
+		ra_saved.primitive_index = base_primitive_index;
+		ra_saved_cpu.constants = constants;
+		ra_saved_cpu.fb_state = fb;
+		memcpy(ra_saved_cpu.tiles, tiles, sizeof(tiles));
+		ra_saved_cpu.scissor_state = stream.scissor_state;
+		ra_saved_cpu.static_raster_state = stream.static_raster_state;
+		ra_saved_cpu.depth_blend_state = stream.depth_blend_state;
+		make(ra_saved.hidden_rdram, *hidden_rdram);
+		ra_copy(*ra_saved.hidden_rdram, *hidden_rdram);
+		make(ra_saved.tmem, *tmem);
+		ra_copy(*ra_saved.tmem, *tmem);
+		if (upscaling_multisampled_hidden_rdram)
+		{
+			make(ra_saved.upscaled_hidden_rdram, *upscaling_multisampled_hidden_rdram);
+			ra_copy(*ra_saved.upscaled_hidden_rdram, *upscaling_multisampled_hidden_rdram);
+		}
+		else
+			ra_saved.upscaled_hidden_rdram.reset();
+		ra_saved.valid = true;
 	}
-	else if (ra_saved_primitive_valid)
+	else
 	{
-		flush_queues();
-		base_primitive_index = ra_saved_primitive_index;
+		base_primitive_index = ra_saved.primitive_index;
+		constants = ra_saved_cpu.constants;
+		fb = ra_saved_cpu.fb_state;
+		memcpy(tiles, ra_saved_cpu.tiles, sizeof(tiles));
+		stream.scissor_state = ra_saved_cpu.scissor_state;
+		stream.static_raster_state = ra_saved_cpu.static_raster_state;
+		stream.depth_blend_state = ra_saved_cpu.depth_blend_state;
+		ra_copy(*hidden_rdram, *ra_saved.hidden_rdram);
+		ra_copy(*tmem, *ra_saved.tmem);
+		if (upscaling_multisampled_hidden_rdram && ra_saved.upscaled_hidden_rdram &&
+		    ra_saved.upscaled_hidden_rdram->get_create_info().size ==
+		    upscaling_multisampled_hidden_rdram->get_create_info().size)
+			ra_copy(*upscaling_multisampled_hidden_rdram, *ra_saved.upscaled_hidden_rdram);
 	}
 }
 
