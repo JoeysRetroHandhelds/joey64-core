@@ -146,6 +146,12 @@ public:
 	void set_quirks(const Quirks &quirks);
 	// Joey64 run-ahead: in command order, draw no upscaled pass (true) or draw it again (false).
 	void set_skip_upscaled(bool skip);
+	// Joey64 run-ahead: in command order, keep (false) or put back (true) what the RDP holds outside RDRAM, which
+	// a save state doesn't have: its registers (other modes, combiner, colours, scissor, tiles, images), TMEM, the
+	// hidden RDRAM bits (coverage) and the primitive count that seeds the dither noise. The extra frames change
+	// them; a rollback that left them there gave the real frame other pixels than a run without run-ahead (Snap's
+	// RDRAM differed, Thor 2026-11-09).
+	void ra_state(bool restore);
 
 	// Joey64 texture packs. enable_texpack: call once before any command; makes a host-visible replacement texel
 	// buffer of up to max_bytes (capped at the device's storage buffer range) and switches every draw to the TEXPACK
@@ -274,6 +280,16 @@ private:
 		TextureFormat fmt;
 		TextureSize size;
 	} texture_image = {};
+
+	// Joey64 run-ahead (ra_state): the registers above as the run-ahead state was taken.
+	struct
+	{
+		bool valid = false;
+		ScissorState scissor_state;
+		StaticRasterizationState static_state;
+		DepthBlendState depth_blend;
+		decltype(texture_image) texture_image;
+	} ra_saved;
 
 	uint64_t timeline_value = 0;
 	uint64_t thread_timeline_value = 0;

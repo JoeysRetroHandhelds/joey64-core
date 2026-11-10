@@ -161,6 +161,8 @@ public:
 	void flush_and_signal();
 	// Joey64 run-ahead: no upscaled pass while set (the frame's picture is never shown); the native pass still runs.
 	void set_skip_upscaled(bool skip);
+	// Joey64 run-ahead: keep the RDP's own state (CommandProcessor::ra_state) or put it back.
+	void ra_state(bool restore);
 
 	int resolve_shader_define(const char *name, const char *define) const;
 
@@ -340,6 +342,16 @@ private:
 
 		bool use_prim_depth = false;
 	} constants;
+	// Joey64 run-ahead (ra_state): the CPU-side state as the run-ahead state was taken.
+	struct
+	{
+		Constants constants;
+		decltype(fb) fb_state;
+		TileInfo tiles[Limits::MaxNumTiles];
+		ScissorState scissor_state;
+		StaticRasterizationState static_raster_state;
+		DepthBlendState depth_blend_state;
+	} ra_saved_cpu;
 
 	RenderBuffersUpdater buffer_instances[Limits::NumSyncStates];
 	InternalSynchronization internal_sync[Limits::NumSyncStates];
@@ -347,6 +359,13 @@ private:
 	unsigned buffer_instance = 0;
 	void bind_stream_instance();
 	uint32_t base_primitive_index = 0;
+	struct RaSaved
+	{
+		bool valid = false;
+		uint32_t primitive_index = 0;
+		Vulkan::BufferHandle hidden_rdram, tmem;
+	} ra_saved;
+	void ra_copy(Vulkan::Buffer &dst, Vulkan::Buffer &src);
 	unsigned pending_render_passes = 0;
 	unsigned pending_render_passes_upscaled = 0;
 	unsigned pending_primitives = 0;
