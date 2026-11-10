@@ -146,6 +146,10 @@ public:
 	void set_quirks(const Quirks &quirks);
 	// Joey64 run-ahead: in command order, draw no upscaled pass (true) or draw it again (false).
 	void set_skip_upscaled(bool skip);
+	// Joey64 run-ahead: in command order, keep (false) or put back (true) the renderer's primitive count, which
+	// seeds the dither noise. The extra frames' draws advance it; a rollback that left it there gave the real
+	// frame other noise than a run without run-ahead (Snap's RDRAM differed, Thor 2026-11-09).
+	void ra_primitive_base(bool restore);
 
 	// Joey64 texture packs. enable_texpack: call once before any command; makes a host-visible replacement texel
 	// buffer of up to max_bytes (capped at the device's storage buffer range) and switches every draw to the TEXPACK

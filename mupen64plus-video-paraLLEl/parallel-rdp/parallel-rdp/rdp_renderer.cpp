@@ -736,6 +736,22 @@ void Renderer::set_skip_upscaled(bool skip)
 	skip_upscaled = skip;
 }
 
+void Renderer::ra_primitive_base(bool restore)
+{
+	// A triangle's noise seed is base_primitive_index + its place in the queued pass, and a flush adds the pass's
+	// count, so base + queued is the count wherever passes are cut: keep that, and put it back after a flush.
+	if (!restore)
+	{
+		ra_saved_primitive_index = base_primitive_index + uint32_t(stream.triangle_setup.size());
+		ra_saved_primitive_valid = true;
+	}
+	else if (ra_saved_primitive_valid)
+	{
+		flush_queues();
+		base_primitive_index = ra_saved_primitive_index;
+	}
+}
+
 void Renderer::set_color_framebuffer(uint32_t addr, uint32_t width, FBFormat fmt)
 {
 	if (fb.addr != addr || fb.width != width || fb.fmt != fmt)

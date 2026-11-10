@@ -2324,6 +2324,9 @@ bool retro_serialize(void *data, size_t size)
          memcpy(ra_side.sp_fifo, g_dev.sp.fifo, sizeof(ra_side.sp_fifo));
          memcpy(ra_side.ai_fifo, g_dev.ai.fifo, sizeof(ra_side.ai_fifo));
          ra_side.ai_format_changed = g_dev.ai.samples_format_changed;
+         /* parallel-RDP's dither noise seed (its triangle count), which the extra frames advance */
+         if (current_rdp_type == RDP_PLUGIN_PARALLEL)
+            parallel_ra_primitive_base(0);
          ra_side.valid = 1;
       }
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
@@ -2401,7 +2404,11 @@ bool retro_unserialize(const void *data, size_t size)
       }
       /* states at the frame's end are taken with no display list in part (retro_serialize): none now either */
       if (ret && current_rdp_type == RDP_PLUGIN_PARALLEL)
+      {
          parallel_drop_pending_commands();
+         if (ra_side.valid && ra_same_instance())
+            parallel_ra_primitive_base(1);
+      }
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
       retro_savestate_complete = true;

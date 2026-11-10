@@ -25,6 +25,7 @@ bool smart_on();
 void smart_settle();
 void set_hidden_frame(int av);
 void drop_pending_commands();
+void ra_primitive_base(bool restore);
 extern const struct retro_hw_render_interface_vulkan *vulkan;
 
 extern unsigned width;

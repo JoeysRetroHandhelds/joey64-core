@@ -161,6 +161,8 @@ public:
 	void flush_and_signal();
 	// Joey64 run-ahead: no upscaled pass while set (the frame's picture is never shown); the native pass still runs.
 	void set_skip_upscaled(bool skip);
+	// Joey64 run-ahead: keep the primitive count (triangles so far, the dither noise seed) or put it back.
+	void ra_primitive_base(bool restore);
 
 	int resolve_shader_define(const char *name, const char *define) const;
 
@@ -347,6 +349,8 @@ private:
 	unsigned buffer_instance = 0;
 	void bind_stream_instance();
 	uint32_t base_primitive_index = 0;
+	uint32_t ra_saved_primitive_index = 0;
+	bool ra_saved_primitive_valid = false;
 	unsigned pending_render_passes = 0;
 	unsigned pending_render_passes_upscaled = 0;
 	unsigned pending_primitives = 0;

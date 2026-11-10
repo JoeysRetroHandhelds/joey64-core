@@ -50,6 +50,9 @@ enum class Op
 	MetaTileReplace = 5,
 	// Joey64 run-ahead: words[1] != 0 draws no upscaled pass until the next one (CommandProcessor::set_skip_upscaled).
 	MetaSetSkipUpscaled = 6,
+	// Joey64 run-ahead: words[1] 0 keeps the primitive count (the dither noise seed), 1 puts it back
+	// (CommandProcessor::ra_primitive_base).
+	MetaRaPrimitiveBase = 7,
 
 	FillTriangle = 0x08,
 	FillZBufferTriangle = 0x09,
