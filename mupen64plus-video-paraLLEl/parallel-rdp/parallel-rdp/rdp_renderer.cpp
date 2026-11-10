@@ -2965,6 +2965,16 @@ void Renderer::resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd)
 	Util::SmallVector<uint32_t, 1024> masked_page_copies;
 	Util::SmallVector<uint32_t, 1024> to_clear_write_mask;
 
+	// Joey64 run-ahead (2026-11-10): once a run-ahead state has been taken, direct uploads are recorded as copies in the
+	// command stream instead of a CPU memcpy into the mapped RDRAM. The memcpy lands at once, under GPU work still
+	// in flight: after a put back, the next frame's uploads of the put-back (older) RDRAM went under the shown extra
+	// frame's VI fetch, which rewrote the upscaled picture from them (Paper Mario at 4x on the Thor showed a frame of
+	// the other scene about 300 times a minute). In stream order the copies come after that fetch.
+	// N64_RDP_ORDERED_UPLOAD=0: never, 1: always, default: after the first run-ahead state.
+	static const int ordered_env = getenv("N64_RDP_ORDERED_UPLOAD") ? atoi(getenv("N64_RDP_ORDERED_UPLOAD")) : -1;
+	const bool ordered = ordered_env == 1 || (ordered_env < 0 && ra_saved.valid);
+	Util::SmallVector<std::pair<unsigned, unsigned>, 64> ordered_copies; // first page, page count
+
 	// If we're able to map RDRAM directly, we can just memcpy straight into RDRAM if we have an unmasked copy.
 	// Important for iGPU.
 	if (rdram->get_allocation().is_host_allocation())
@@ -2974,6 +2984,13 @@ void Renderer::resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd)
 			uint32_t base_index = 32 * (&direct - incoherent.page_to_direct_copy.data());
 			Util::for_each_bit_range(direct, [&](unsigned index, unsigned count) {
 				index += base_index;
+				if (ordered)
+				{
+					ordered_copies.push_back({ index, count });
+					for (unsigned k = 0; k < count; k++)
+						to_clear_write_mask.push_back(index + k);
+					return;
+				}
 				if (incoherent.compare_before_upload)
 				{
 					upload_pages_compared(index, count);
@@ -3119,6 +3136,23 @@ void Renderer::resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd)
 	{
 		cmd.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
 		            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+	}
+
+	if (!ordered_copies.empty())
+	{
+		// After whatever read or wrote these pages before in the stream.
+		cmd.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT, 0,
+		            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+		for (auto &c : ordered_copies)
+		{
+			const size_t offset = size_t(c.first) * ImplementationConstants::IncoherentPageSize;
+			const size_t size = size_t(c.second) * ImplementationConstants::IncoherentPageSize;
+			if (void *dst = cmd.update_buffer(*rdram, offset, size))
+				memcpy(dst, incoherent.host_rdram + offset, size);
+		}
+		cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+		            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 	}
 
 	// If we cannot map the device memory, copy. We're latency sensitive, so don't use DMA queue.

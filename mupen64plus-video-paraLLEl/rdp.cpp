@@ -2206,8 +2206,28 @@ void drop_pending_commands()
 }
 
 /* Joey64 (run-ahead): keep or put back the RDP's own state with the run-ahead state (CommandProcessor::ra_state). */
+// Run-ahead (2026-11-10): before the put back, the compute queue's work so far is waited for (the shown extra frame's
+// VI fetch, which reads RDRAM and rewrites the upscaled samples from it). Where the GPU's RDRAM is host-mapped and there
+// is no external host memory (the Thor), a page upload is a CPU memcpy straight into the GPU's RDRAM with no wait, so
+// the next frame's uploads of the put-back (older) RDRAM landed under that fetch: Paper Mario at 4x showed a frame of
+// the other scene about 300 times a minute (Thor: 0 with the wait, also 0 with a whole-device wait there; waiting for
+// all RDP work instead, or keeping the upscaled buffers with the state, didn't do it).
+// Off by default: it cost 15-20% uncapped (Thor, OoT 4x 71 -> 57 fps); the renderer orders those uploads instead
+// (N64_RDP_ORDERED_UPLOAD). N64_RA_PUTBACK_WAIT: 1 at the put back, 3 at the take as well, 0 off (default).
+static int ra_wait_bits()
+{
+	static const int b = getenv("N64_RA_PUTBACK_WAIT") ? atoi(getenv("N64_RA_PUTBACK_WAIT")) : 0;
+	return b;
+}
 void ra_state(bool restore)
 {
+	if (device && (ra_wait_bits() & (restore ? 1 : 2)))
+	{
+		Vulkan::Fence fence;
+		device->submit_empty(Vulkan::CommandBuffer::Type::AsyncCompute, &fence);
+		if (fence)
+			fence->wait();
+	}
 	if (frontend)
 		frontend->ra_state(restore);
 }
