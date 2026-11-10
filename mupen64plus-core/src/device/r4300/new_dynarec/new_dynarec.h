@@ -94,6 +94,11 @@ extern unsigned int using_tlb;
 
 void invalidate_cached_code_new_dynarec(struct r4300_core* r4300, uint32_t address, size_t size);
 void new_dynarec_jc_clear(void);
+/* Joey64 (run-ahead): a state load changes one virtual page's TLB mapping, as TLBWI would. Call drop with the old
+ * LUT_r / LUT_w still in place (the code compiled under the old mapping goes), then map once they hold the new. */
+void new_dynarec_tlb_page_drop(unsigned int page);
+void new_dynarec_tlb_page_map(unsigned int page);
+void new_dynarec_tlb_drain(void);
 int new_dynarec_jc_live(void);
 void new_dynarec_init(void);
 void new_dyna_start(void);

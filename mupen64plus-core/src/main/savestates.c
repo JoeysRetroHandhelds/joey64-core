@@ -381,6 +381,49 @@ static void ss_copy_table(uint32_t* dst, const unsigned char* src, size_t bytes)
     }
 }
 
+/* Joey64 (run-ahead, 2026-11-10): Conker changes its TLB every frame, so every run-ahead load found the tables changed
+ * and dropped all compiled code (6.4 ms a put back on the Thor, 58.7 fps uncapped with run-ahead 1). With the
+ * recompiler and run-ahead's own states, each virtual page whose mapping differs is handled as TLBWI handles it:
+ * its old mapping's code dropped, its map entry set from the new one. Anything else (the interpreter, a file or
+ * rewind state, N64_RA_TLB_PAGES=0) takes the tables whole and the full flush, as before. */
+static unsigned ss_tlb_pages_changed;
+static void ss_copy_luts(struct r4300_core* r4300, const unsigned char* src_r, const unsigned char* src_w)
+{
+#ifdef NEW_DYNAREC
+    static int pages_on = -1;
+    if (pages_on < 0) { const char* e = getenv("N64_RA_TLB_PAGES"); pages_on = !(e && e[0] == '0'); }
+    if (pages_on && savestates_ra_context && r4300->emumode == EMUMODE_DYNAREC)
+    {
+        uint32_t* r = r4300->cp0.tlb.LUT_r;
+        uint32_t* w = r4300->cp0.tlb.LUT_w;
+        size_t c, j;
+        int drained = 0;
+        for (c = 0; c < 0x100000; c += 1024)
+        {
+            if (!memcmp(r + c, src_r + c * 4, 4096) && !memcmp(w + c, src_w + c * 4, 4096))
+                continue;
+            for (j = c; j < c + 1024; ++j)
+            {
+                uint32_t nr, nw;
+                memcpy(&nr, src_r + j * 4, 4);
+                memcpy(&nw, src_w + j * 4, 4);
+                if (r[j] == nr && w[j] == nw)
+                    continue;
+                if (!drained) { new_dynarec_tlb_drain(); drained = 1; }
+                new_dynarec_tlb_page_drop((unsigned)j);
+                r[j] = nr;
+                w[j] = nw;
+                new_dynarec_tlb_page_map((unsigned)j);
+                ss_tlb_pages_changed++;
+            }
+        }
+        return;
+    }
+#endif
+    ss_copy_table(r4300->cp0.tlb.LUT_r, src_r, 0x100000 * 4);
+    ss_copy_table(r4300->cp0.tlb.LUT_w, src_w, 0x100000 * 4);
+}
+
 /* After a load: the jump to the state's PC, and the recompiled code that no longer matches RDRAM dropped. */
 static void ss_drop_changed_code(struct r4300_core* r4300, int full)
 {
@@ -420,10 +463,11 @@ static void ss_drop_changed_code(struct r4300_core* r4300, int full)
         l_ms += (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
         if (++l_loads >= 300)
         {
-            DebugMessage(M64MSG_INFO, "load stats: %u loads, %u full flushes, %.1f pages changed, %.1f with code, drop %.3f ms a load, TLB tables skipped in %u saves and %u loads",
-                l_loads, l_full, l_changed / 300.0, l_code / 300.0, l_ms / 300.0, ss_tlb_saves_skipped, ss_tlb_loads_skipped);
+            DebugMessage(M64MSG_INFO, "load stats: %u loads, %u full flushes, %.1f pages changed, %.1f with code, drop %.3f ms a load, TLB tables skipped in %u saves and %u loads, %.1f TLB pages remapped a load",
+                l_loads, l_full, l_changed / 300.0, l_code / 300.0, l_ms / 300.0, ss_tlb_saves_skipped, ss_tlb_loads_skipped,
+                ss_tlb_pages_changed / 300.0);
             l_loads = l_full = l_changed = l_code = 0; l_ms = 0;
-            ss_tlb_saves_skipped = ss_tlb_loads_skipped = 0;
+            ss_tlb_saves_skipped = ss_tlb_loads_skipped = 0; ss_tlb_pages_changed = 0;
 #ifdef SS_COW
             if (ss_cow.loads)
                 DebugMessage(M64MSG_INFO, "copy-on-write states: %u loads, %.1f pages a state from CPU writes, %.1f from RDP draws",
@@ -861,8 +905,7 @@ int savestates_load_m64p(struct device* dev, const void *data)
         }
         else
         {
-            ss_copy_table(dev->r4300.cp0.tlb.LUT_r, curr, 0x100000 * 4); curr += 0x100000 * 4;
-            ss_copy_table(dev->r4300.cp0.tlb.LUT_w, curr, 0x100000 * 4); curr += 0x100000 * 4;
+            ss_copy_luts(&dev->r4300, curr, curr + 0x100000 * 4); curr += 0x100000 * 4 * 2;
             /* now at the state's generation, if the state is one of this run's; otherwise a new one */
             if (m[0] == 0x5434364Au && m[1] == ss_run_id && ss_run_id)
                 g_tlb_lut_gen = m[2];
