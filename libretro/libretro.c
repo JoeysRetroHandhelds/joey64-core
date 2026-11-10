@@ -2139,7 +2139,9 @@ void retro_run (void)
     if (current_rdp_type == RDP_PLUGIN_PARALLEL)
     {
        int av = 3;
-       parallel_set_hidden_frame(environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av) && !(av & 1));
+       if (!environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av))
+          av = 3;
+       parallel_set_hidden_frame(av);
     }
 #endif
 
