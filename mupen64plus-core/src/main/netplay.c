@@ -151,8 +151,11 @@ static uint8_t l_buffer_target;
 static uint8_t l_player_lag[4];
 //Joey64: when the server last sent us anything (see netplay_ensure_valid)
 static uint32_t l_last_heard;
-//Joey64: our last inputs, sent again (see netplay_send_input)
-#define NP_RESEND 8
+//Joey64: our last inputs, sent again (see netplay_send_input). More than a Joey64 room's largest input delay (12):
+//an input lost on the way is needed delay frames later, and only the last NP_RESEND are ever sent again.
+#define NP_RESEND 20
+//Joey64 (2026-11-10): [8, player, n, n x (count32, keys32, plugin)], several inputs in one packet (Joey64 rooms)
+#define UDP_JOEY_KEY_BATCH 8
 static struct { uint32_t count, keys; uint8_t plugin; } l_sent[4][NP_RESEND];
 static uint8_t l_sent_n[4], l_sent_pos[4];
 
@@ -639,9 +642,26 @@ static void np_send_key(uint8_t control_id, uint32_t count, uint32_t keys, uint8
 
 static void netplay_resend_inputs(void)
 {
+    //all of a player's kept inputs in one packet (a Joey64 room; the join's ROM check made sure it is one)
     for (uint8_t id = 0; id < 4; ++id)
+    {
+        if (!l_sent_n[id])
+            continue;
+        uint8_t *d = l_send_input_packet->data;
+        d[0] = UDP_JOEY_KEY_BATCH;
+        d[1] = id;
+        d[2] = l_sent_n[id];
+        int k = 3;
         for (uint8_t i = 0; i < l_sent_n[id]; ++i)
-            np_send_key(id, l_sent[id][i].count, l_sent[id][i].keys, l_sent[id][i].plugin);
+        {
+            SDLNet_Write32(l_sent[id][i].count, &d[k]);
+            SDLNet_Write32(l_sent[id][i].keys, &d[k + 4]);
+            d[k + 8] = l_sent[id][i].plugin;
+            k += 9;
+        }
+        l_send_input_packet->len = k;
+        SDLNet_UDP_Send(l_udpSocket, l_udpChannel, l_send_input_packet);
+    }
 }
 
 static void netplay_send_input(uint8_t control_id, uint32_t keys)
