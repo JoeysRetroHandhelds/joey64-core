@@ -782,7 +782,9 @@ void smart_settle()
 // what that same frame drew (often or sometimes), so their pictures went blocky.
 // N64_RA_NATIVE_HIDDEN=3 (automatic): only the shown extra frame (bits 0 and 3), and only once 600 of them in a row
 // showed rows no draw of that same frame touched (Dup's tracking); the first one that did turns it off for good.
-// Off by default. Set at each retro_run, before the frame's commands, so it applies in command order.
+// Mode 3 is the default (Joey 2026-11-09, after all 14 quick-set games showed the same pictures at 4x on the Thor);
+// N64_RA_NATIVE_HIDDEN=0 turns it off. Without run-ahead no frame has bit 3, so nothing changes.
+// Set at each retro_run, before the frame's commands, so it applies in command order.
 namespace RaNative
 {
 static int mode = -1, cur_av = 3;
@@ -800,8 +802,8 @@ void set_hidden_frame(int av)
 	if (allow < 0)
 	{
 		const char *e = getenv("N64_RA_NATIVE_HIDDEN");
-		allow = e ? atoi(e) : 0;
-		if (allow)
+		allow = e ? atoi(e) : 3;
+		if (e && allow)
 			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: %s frames drawn at native size\n",
 			       allow == 3 ? "shown extra (automatic)" : allow == 2 ? "extra" : "hidden");
 		RaNative::mode = allow;
