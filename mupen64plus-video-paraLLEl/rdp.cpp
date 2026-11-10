@@ -788,6 +788,9 @@ namespace RaNative
 static int mode = -1, cur_av = 3;
 static bool off;
 static unsigned clean; // shown extra frames in a row whose shown rows that frame didn't draw
+// The first 60 shown frames don't count: starting from a state, GoldenEye's first shown frame looked like it drew what
+// it showed and no other one in 1200 did (Thor). Native draws can't start before 600 anyway.
+static unsigned warm;
 }
 void set_hidden_frame(int av)
 {
@@ -2614,7 +2617,9 @@ void complete_frame()
 		}
 		else if (RaNative::mode == 3 && (RaNative::cur_av & 9) == 9 && !RaNative::off && active_upscaling > 1)
 		{
-			if (Dup::last_drew)
+			if (RaNative::warm < 60)
+				RaNative::warm++;
+			else if (Dup::last_drew)
 			{
 				RaNative::off = true;
 				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: a shown frame drew what it showed (after %u that didn't): extra frames upscaled from now on\n", RaNative::clean);
