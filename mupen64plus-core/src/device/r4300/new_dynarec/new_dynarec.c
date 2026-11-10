@@ -3608,6 +3608,20 @@ static void invalidate_all_pages(void)
   tlb_speed_hacks();
 }
 
+/* Joey64 (2026-11-10): the recompiled code writes the host FPCR's rounding mode only when the game runs CTC1, and a
+ * state load put back FCR31 without it, so the game ran on with the rounding mode it had before the load. Run-ahead
+ * loads a state every frame: Perfect Dark's RAM differed from a plain run from the first one on (Thor, frame 3). */
+void new_dynarec_load_rounding(void)
+{
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64 && defined(__aarch64__)
+  uint64_t fpcr;
+  uint32_t rm = g_dev.r4300.new_dynarec_hot_state.rounding_modes[*r4300_cp1_fcr31(&g_dev.r4300.cp1) & 3];
+  __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+  fpcr = (fpcr & ~(uint64_t)0xc00000) | rm;
+  __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+#endif
+}
+
 void new_dynarec_tlb_drain(void)
 {
 #if NEW_DYNAREC == NEW_DYNAREC_ARM64

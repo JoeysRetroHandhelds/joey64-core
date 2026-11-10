@@ -2238,6 +2238,9 @@ static size_t parallel_rsp_state_size(void) { return (size_t)-1; }
 static void parallel_rsp_state_save(void *out) { (void)out; }
 static void parallel_rsp_state_load(const void *in) { (void)in; }
 #endif
+size_t hle_ra_state_size(void);
+void hle_ra_state_save(void *out);
+void hle_ra_state_load(const void *in);
 static struct { int valid; uint32_t task_locked, unsafe; unsigned char rsp[2048];
    struct sp_dma sp_fifo[SP_DMA_FIFO_SIZE]; struct ai_dma ai_fifo[AI_DMA_FIFO_SIZE]; unsigned ai_format_changed; } ra_side;
 /* the state file holds neither the RSP's DMA queue nor the audio queue's addresses (the loader guesses those) */
@@ -2252,6 +2255,21 @@ static bool ra_same_instance(void)
    }
    return on && current_rsp_type == RSP_PLUGIN_PARALLEL
        && environ_cb(RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT, &ctx) && ctx == RETRO_SAVESTATE_CONTEXT_RUNAHEAD_SAME_INSTANCE;
+}
+
+/* The HLE audio lists' state (hle_ra_state_*), for any RSP: HLE audio under parallel-RSP, and the HLE RSP that
+ * GLideN64 runs with (ra_same_instance is parallel-RSP only). N64_RA_HLE=0 leaves it out. */
+static struct { int valid; unsigned char buf[0x3000]; } ra_hle;
+static bool ra_hle_context(void)
+{
+   static int on = -1;
+   int ctx = 0;
+   if (on < 0)
+   {
+      const char *e = getenv("N64_RA_HLE");
+      on = !(e && e[0] == '0') && hle_ra_state_size() <= sizeof(ra_hle.buf);
+   }
+   return on && environ_cb(RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT, &ctx) && ctx == RETRO_SAVESTATE_CONTEXT_RUNAHEAD_SAME_INSTANCE;
 }
 
 static bool state_direct(int load)
@@ -2316,6 +2334,12 @@ bool retro_serialize(void *data, size_t size)
       ok = savestates_save_m64p(&g_dev, data) && retro_savestate_result;
       savestates_ra_context = 0;
       ra_side.valid = 0;
+      ra_hle.valid = 0;
+      if (ok && ra_hle_context())
+      {
+         hle_ra_state_save(ra_hle.buf);
+         ra_hle.valid = 1;
+      }
       if (ok && same)
       {
          ra_side.task_locked = g_dev.sp.rsp_task_locked;
@@ -2402,6 +2426,8 @@ bool retro_unserialize(const void *data, size_t size)
          memcpy(g_dev.ai.fifo, ra_side.ai_fifo, sizeof(ra_side.ai_fifo));
          g_dev.ai.samples_format_changed = ra_side.ai_format_changed;
       }
+      if (ret && ra_hle.valid && ra_hle_context())
+         hle_ra_state_load(ra_hle.buf);
       /* states at the frame's end are taken with no display list in part (retro_serialize): none now either */
       if (ret && current_rdp_type == RDP_PLUGIN_PARALLEL)
       {
