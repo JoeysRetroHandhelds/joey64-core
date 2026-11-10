@@ -3065,7 +3065,7 @@ static void blk_init(void)
 {
   const char *e = getenv("N64_DRC_LIST");
   blk_on = 0;
-  if (!e || !*e || drc_thread_on() <= 0) return;
+  if (!e || !*e || !strcmp(e, "0") || drc_thread_on() <= 0) return; /* "0": off (dev) */
   blk_tab = (struct blk_ent *)calloc(BLK_MAX, sizeof(*blk_tab));
   blk_hash = (u_int *)calloc(BLK_HASH, sizeof(*blk_hash));
   if (!blk_tab || !blk_hash) { free(blk_tab); free(blk_hash); blk_tab = NULL; blk_hash = NULL; return; }
