@@ -777,8 +777,18 @@ void smart_settle()
 // a later upscaled pass picks up what they drew, blown up from native). [av] is the frontend's GET_AUDIO_VIDEO_ENABLE.
 // N64_RA_NATIVE_HIDDEN=1: frames without video (run-ahead's real frame). Thor: visibly blockier, since most games show
 // at a frame's end what they drew in the frame before, so the real frame's drawing is what's on screen.
-// N64_RA_NATIVE_HIDDEN=2: the extra frames (bit 3), whose drawing is put back afterwards.
+// N64_RA_NATIVE_HIDDEN=2: the extra frames (bit 3), whose drawing is put back afterwards. Thor: 9 of the 14 quick-set
+// games show exactly the same pictures; Paper Mario, Smash, Snap, Perfect Dark and Cruis'n USA show at a frame's end
+// what that same frame drew (often or sometimes), so their pictures went blocky.
+// N64_RA_NATIVE_HIDDEN=3 (automatic): only the shown extra frame (bits 0 and 3), and only once 600 of them in a row
+// showed rows no draw of that same frame touched (Dup's tracking); the first one that did turns it off for good.
 // Off by default. Set at each retro_run, before the frame's commands, so it applies in command order.
+namespace RaNative
+{
+static int mode = -1, cur_av = 3;
+static bool off;
+static unsigned clean; // shown extra frames in a row whose shown rows that frame didn't draw
+}
 void set_hidden_frame(int av)
 {
 	static int allow = -1;
@@ -789,11 +799,15 @@ void set_hidden_frame(int av)
 		const char *e = getenv("N64_RA_NATIVE_HIDDEN");
 		allow = e ? atoi(e) : 0;
 		if (allow)
-			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: %s frames drawn at native size\n", allow == 2 ? "extra" : "hidden");
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: %s frames drawn at native size\n",
+			       allow == 3 ? "shown extra (automatic)" : allow == 2 ? "extra" : "hidden");
+		RaNative::mode = allow;
 	}
+	RaNative::cur_av = av;
 	if (!allow || !frontend)
 		return;
-	bool hidden = allow == 2 ? (av & 8) != 0 : !(av & 1);
+	bool hidden = allow == 3 ? (av & 9) == 9 && !RaNative::off && RaNative::clean >= 600 :
+	              allow == 2 ? (av & 8) != 0 : !(av & 1);
 	bool skip = hidden && active_upscaling > 1 && !super_sampled_read_back;
 	if (skip != last)
 	{
@@ -827,6 +841,7 @@ static vector<std::pair<uint32_t, uint32_t>> drawn; // byte ranges the RDP drew 
 static uint32_t last_vi[10];
 static uint64_t last_hash;
 static bool have_last;
+static bool last_drew; // the last refresh's rows were drawn into since the scanout before (run-ahead's automatic native draws)
 // The RDP's results reach RDRAM (where the hash looks for CPU drawing) only when its GPU work for the frame
 // finishes: right after a draw into the scanned-out range the hash still sees the old picture. Until then
 // (settle_until on the timeline) the hash is not compared, and once there it is re-baselined, so a frame the
@@ -923,6 +938,7 @@ static bool same_as_last()
 		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: dup debug: %s\n", buf);
 	}
 	drawn.clear();
+	last_drew = drew;
 	uint64_t hash = 1469598103934665603ull;
 	if (type >= 2 && s < e)
 	{
@@ -2581,6 +2597,17 @@ void complete_frame()
 	if (Dup::enabled)
 	{
 		bool same = Dup::same_as_last();
+		// Run-ahead's automatic native draws: did the shown extra frame show rows it drew itself?
+		if (RaNative::mode == 3 && (RaNative::cur_av & 9) == 9 && !RaNative::off && active_upscaling > 1)
+		{
+			if (Dup::last_drew)
+			{
+				RaNative::off = true;
+				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: a shown frame drew what it showed (after %u that didn't): extra frames upscaled from now on\n", RaNative::clean);
+			}
+			else if (RaNative::clean < 600 && ++RaNative::clean == 600)
+				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: 600 shown frames showed what the frame before drew: extra frames at native size from now on\n");
+		}
 		if (++(same ? Dup::skipped : Dup::scanned), Dup::skipped + Dup::scanned >= 600)
 		{
 			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: %u of the last 600 refreshes were repeats (not scanned out); new because: VI %u, drew %u (overflow %u), hash %u\n",
