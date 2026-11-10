@@ -99,6 +99,9 @@ void new_dynarec_jc_clear(void);
 void new_dynarec_tlb_page_drop(unsigned int page);
 void new_dynarec_tlb_page_map(unsigned int page);
 void new_dynarec_tlb_drain(void);
+/* Joey64: after a state load, the host FPU's rounding mode from the loaded FCR31 (ARM64; the recompiled code sets it
+ * only at CTC1). */
+void new_dynarec_load_rounding(void);
 int new_dynarec_jc_live(void);
 void new_dynarec_init(void);
 void new_dyna_start(void);
