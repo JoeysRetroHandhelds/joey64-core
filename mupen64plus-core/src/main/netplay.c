@@ -128,6 +128,18 @@ static int np_tcp_recv(void *d, int n)
     memset(c, 0, n);
     return n;
 }
+
+/* Joey64 (2026-11-10): the app is leaving while the core waits on the room (the ROM check, registration until
+ * every player is in, settings, input). Shutting the TCP socket ends a blocked recv at once and the connection
+ * counts as lost, so the game stops instead of waiting up to the room's 30 s (or for ever on a room that never
+ * answers). Called from the app's thread; the emulation thread closes the sockets as before. */
+__attribute__((visibility("default"))) void joey64_netplay_abort(void)
+{
+    int t = np_tcp;
+    l_udpChannel = -1;
+    if (t >= 0)
+        shutdown(t, SHUT_RDWR);
+}
 #define SDLNet_Write32(v, p) np_w32((p), (uint32_t)(v))
 #define SDLNet_Read32(p) np_r32(p)
 #define SDLNet_UDP_Send(s, ch, p) np_udp_send(p)
