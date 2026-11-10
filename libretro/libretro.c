@@ -2123,13 +2123,9 @@ void retro_run (void)
        extern unsigned g_rsp_audio_skipped;
        static int allow = -1;
        static unsigned frames;
-       extern int g_ra_video_hidden;
-       int av = 3;
-       bool have_av;
+       int av = 0;
        if (allow < 0) { const char* e = getenv("N64_RA_SKIP_AUDIO"); allow = !(e && e[0] == '0'); }
-       have_av = environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av);
-       g_rsp_skip_audio = allow && have_av && (av & 8);
-       g_ra_video_hidden = have_av && !(av & 1);
+       g_rsp_skip_audio = allow && environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av) && (av & 8);
        if (++frames >= 1200)
        {
           if (g_rsp_audio_skipped)
@@ -2251,11 +2247,6 @@ static void parallel_rsp_state_load(const void *in) { (void)in; }
 static struct { int valid; uint32_t task_locked, unsafe; unsigned char rsp[2048];
    struct sp_dma sp_fifo[SP_DMA_FIFO_SIZE]; struct ai_dma ai_fifo[AI_DMA_FIFO_SIZE]; unsigned ai_format_changed; } ra_side;
 /* the state file holds neither the RSP's DMA queue nor the audio queue's addresses (the loader guesses those) */
-/* Joey64: this frame's picture is never shown (the frontend's GET_AUDIO_VIDEO_ENABLE without bit 0: run-ahead's
- * real frame). parallel-RDP then skips its scanout (rdp.cpp) unless ra_state_would_refuse(). */
-int g_ra_video_hidden;
-int ra_state_would_refuse(void);
-
 static bool ra_same_instance(void)
 {
    static int on = -1;
@@ -2290,17 +2281,6 @@ static int ra_cow_allowed(void)
       return 1;
    }
 #endif
-   return 0;
-}
-
-/* The checks retro_serialize makes at the frame's end: when one fails, the frontend shows this frame's own picture. */
-int ra_state_would_refuse(void)
-{
-   const bool same = ra_same_instance();
-   if (g_dev.r4300.cp0.interrupt_unsafe_state && !(same && g_dev.r4300.cp0.interrupt_unsafe_state == INTR_UNSAFE_RSP))
-      return 1;
-   if (current_rdp_type == RDP_PLUGIN_PARALLEL && parallel_pending_commands() > 0)
-      return 1;
    return 0;
 }
 
