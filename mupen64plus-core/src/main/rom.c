@@ -105,6 +105,33 @@ static int is_valid_rom(const unsigned char *buffer, unsigned int size)
  *                 the source block. The value is undefined if 'src' does not
  *                 represent a valid Nintendo 64 ROM image.
  */
+/* Joey64 (2026-11-10): Super Mario Star Road and other SM64 hacks built with old tools carry a bad G_SETCOMBINE,
+ * FC 12 7F FF FF FF F8 38, that accurate renderers (parallel-RDP, angrylion, real hardware plugins) draw as black.
+ * Newer GLideN64 works around it at draw time (GLideN64 issue 1745); the RetroPie forum fix (topic 17605) replaces
+ * it in the ROM with FC 12 18 24 FF 33 FF FF, the combine the same hacks use everywhere else. Done here in memory,
+ * after the MD5 so hashes (RetroAchievements, game list) stay those of the file. N64_COMBINE_FIX=0 turns it off.
+ * Matched at any offset, as the forum patch did: in Star Road Deluxe a fifth of them are not 4-byte aligned. */
+static void fix_bad_setcombine(uint8_t* rom, size_t len)
+{
+    static const uint8_t bad[8]  = { 0xFC, 0x12, 0x7F, 0xFF, 0xFF, 0xFF, 0xF8, 0x38 };
+    static const uint8_t good[8] = { 0xFC, 0x12, 0x18, 0x24, 0xFF, 0x33, 0xFF, 0xFF };
+    const char* e = getenv("N64_COMBINE_FIX");
+    size_t i, n = 0;
+    if (e != NULL && !strcmp(e, "0"))
+        return;
+    for (i = 0; i + 8 <= len; ++i)
+    {
+        if (rom[i] == 0xFC && rom[i + 1] == 0x12 && !memcmp(rom + i, bad, 8))
+        {
+            memcpy(rom + i, good, 8);
+            ++n;
+            i += 7;
+        }
+    }
+    if (n > 0)
+        DebugMessage(M64MSG_INFO, "Joey64: replaced %u bad SetCombine commands (FC127FFFFFFFF838)", (unsigned)n);
+}
+
 static void swap_copy_rom(void* dst, const void* src, size_t len, unsigned char* imagetype)
 {
     if (memcmp(src, V64_SIGNATURE, sizeof(V64_SIGNATURE)) == 0)
@@ -176,6 +203,8 @@ m64p_error open_rom(const unsigned char* romimage, unsigned int size)
         sprintf(buffer+i*2, "%02X", digest[i]);
     buffer[32] = '\0';
     strcpy(ROM_SETTINGS.MD5, buffer);
+
+    fix_bad_setcombine((uint8_t*)mem_base_u32(g_mem_base, MM_CART_ROM), g_rom_size);
 
     /* add some useful properties to ROM_PARAMS */
     ROM_PARAMS.systemtype = rom_country_code_to_system_type(ROM_HEADER.Country_code);
