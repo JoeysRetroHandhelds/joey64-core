@@ -179,6 +179,9 @@ static const int32_t l_check_sync_packet_size = (CP0_REGS_COUNT * 4) + 5;
 #define TCP_REGISTER_PLAYER 5
 #define TCP_GET_REGISTRATION 6
 #define TCP_DISCONNECT_NOTICE 7
+/* Joey64 (2026-11-10): [0x40, the ROM's MD5 as 32 hex characters]; the room answers 2 when it is the host's
+ * ROM, 1 when not. The host's own (it joins from this device, 127.0.0.1) is the one the others must have. */
+#define TCP_JOEY_ROM_CHECK 0x40
 
 #define CS4 32
 
@@ -655,6 +658,25 @@ static void netplay_send_input(uint8_t control_id, uint32_t keys)
         uint8_t prev = (uint8_t)((pos + NP_RESEND - 1) % NP_RESEND);
         np_send_key(control_id, l_sent[control_id][prev].count, l_sent[control_id][prev].keys, l_sent[control_id][prev].plugin);
     }
+}
+
+/* 1 = the host's ROM, 0 = another one, -1 = no answer (the room closed the connection: not a Joey64 room) */
+int netplay_check_rom(const char *md5)
+{
+    char out[33];
+    uint8_t answer = 0;
+    out[0] = TCP_JOEY_ROM_CHECK;
+    for (int i = 0; i < 32; i++)
+    {
+        char ch = md5 && md5[i] ? md5[i] : '0';
+        out[1 + i] = (ch >= 'a' && ch <= 'f') ? (char)(ch - 'a' + 'A') : ch;
+        if (md5 && !md5[i]) md5 = NULL;
+    }
+    SDLNet_TCP_Send(l_tcpSocket, out, 33);
+    SDLNet_TCP_Recv(l_tcpSocket, &answer, 1);
+    log_cb(RETRO_LOG_INFO, "Netplay: ROM check %.32s: %s\n", out + 1,
+           answer == 2 ? "same as the host's" : answer == 1 ? "not the host's" : "no answer");
+    return answer == 2 ? 1 : answer == 1 ? 0 : -1;
 }
 
 uint8_t netplay_register_player(uint8_t player, uint8_t plugin, uint8_t rawdata, uint32_t reg_id)

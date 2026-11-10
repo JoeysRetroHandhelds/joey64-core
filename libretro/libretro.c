@@ -53,6 +53,7 @@
 #include "api/m64p_config.h"
 #include "osal_files.h"
 #include "main/rom.h"
+#include "main/netplay.h"
 #include "plugin/plugin.h"
 #include "device/rcp/pi/pi_controller.h"
 #include "device/pif/pif.h"
@@ -456,6 +457,17 @@ static void emu_step_initialize(void)
     plugin_connect_all();
 }
 
+/* Joey64 (2026-11-10): a join that fails stops the game instead of playing it alone (approved Play together v2:
+ * the app shows why). The app reads the code from this line: 4 = the room can't be reached (or is not a
+ * netplay room of this version), 5 = the room turned us down (that player is taken, the room is full),
+ * 6 = our ROM is not the host's. */
+static void netplay_join_failed(int code, const char *why)
+{
+    log_cb(RETRO_LOG_ERROR, "Netplay: can't join (%d): %s\n", code, why);
+    CoreDoCommand(M64CMD_NETPLAY_CLOSE, 0, NULL);
+    environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+}
+
 static void* EmuThreadFunction(void* param)
 {
     uint32_t netplay_port = 0;
@@ -490,20 +502,43 @@ static void* EmuThreadFunction(void* param)
     {
         uint32_t version;
         m64p_error ver = CoreDoCommand(M64CMD_NETPLAY_GET_VERSION, NETPLAY_API_VERSION, &version);
+        int failed = 0;
         if (ver != M64ERR_SUCCESS)
-            log_cb(RETRO_LOG_ERROR, "Netplay: version check failed (%d), playing offline\n", (int)ver);
+        {
+            netplay_join_failed(4, "the core's netplay version check failed");
+            failed = 1;
+        }
+        else if (CoreDoCommand(M64CMD_NETPLAY_INIT, netplay_port, netplay_host) != M64ERR_SUCCESS)
+        {
+            netplay_join_failed(4, "the room can't be reached");
+            failed = 1;
+        }
         else
         {
-            log_cb(RETRO_LOG_INFO, "Netplay: using core version %u\n", version);
-
-            if (CoreDoCommand(M64CMD_NETPLAY_INIT, netplay_port, netplay_host) == M64ERR_SUCCESS)
-                log_cb(RETRO_LOG_INFO, "Netplay: init success\n");
-
+            log_cb(RETRO_LOG_INFO, "Netplay: using core version %u, connected to %s:%u\n", version, netplay_host, netplay_port);
+            int rom = netplay_check_rom(ROM_SETTINGS.MD5);
+            if (rom == 0)
+            {
+                netplay_join_failed(6, "this ROM is not the host's");
+                failed = 1;
+            }
+            else if (rom < 0)
+            {
+                netplay_join_failed(4, "the room did not answer the ROM check (not a Joey64 room?)");
+                failed = 1;
+            }
+        }
+        if (!failed)
+        {
             uint32_t reg_id = 0;
             while (reg_id == 0)
             {
 #ifdef __MINGW32__
                 rand_s(&reg_id);
+#elif defined(__ANDROID__)
+                /* Joey64: rand() is never seeded, so every device drew the same id and the room took a second
+                 * device asking for a taken player as that player registering again */
+                reg_id = arc4random();
 #else
                 reg_id = rand();
 #endif
@@ -513,7 +548,18 @@ static void* EmuThreadFunction(void* param)
             if (CoreDoCommand(M64CMD_NETPLAY_CONTROL_PLAYER, netplay_player, &reg_id) == M64ERR_SUCCESS)
                 log_cb(RETRO_LOG_INFO, "Netplay: registered for player %d\n", netplay_player);
             else
-                log_cb(RETRO_LOG_ERROR, "Netplay: player %d is taken or the server refused\n", netplay_player);
+            {
+                netplay_join_failed(5, "that player is taken or the room is full");
+                failed = 1;
+            }
+        }
+        if (failed)
+        {
+            /* as when the emulator can't start (below): hand control back for good, retro_run then draws nothing */
+            if (current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer)
+                return NULL;
+            for (;;)
+                retro_return();
         }
     }
 
