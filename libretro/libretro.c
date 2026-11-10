@@ -2133,6 +2133,18 @@ void retro_run (void)
        glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
     }
 
+#ifdef HAVE_PARALLEL_RDP
+    /* Joey64 run-ahead: a frame without video (GET_AUDIO_VIDEO_ENABLE bit 0 clear) is never shown: parallel-RDP
+     * draws it at native size only when N64_RA_NATIVE_HIDDEN=1 (rdp.cpp set_hidden_frame). */
+    if (current_rdp_type == RDP_PLUGIN_PARALLEL)
+    {
+       int av = 3;
+       if (!environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av))
+          av = 3;
+       parallel_set_hidden_frame(av);
+    }
+#endif
+
     co_switch(game_thread);
 
     if(current_rdp_type == RDP_PLUGIN_GLIDEN64)

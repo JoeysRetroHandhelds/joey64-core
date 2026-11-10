@@ -21,6 +21,7 @@ int parallel_pending_commands(void);
 void parallel_drop_pending_commands(void);
 int parallel_smart_on(void);
 void parallel_smart_settle(void);
+void parallel_set_hidden_frame(int av);
 
 void parallel_set_divot_filter(bool enable);
 void parallel_set_gamma_dither(bool enable);

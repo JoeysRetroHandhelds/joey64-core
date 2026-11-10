@@ -159,6 +159,8 @@ public:
 	// This is useful so we don't needlessly queue up work when we might as well kick it to the GPU.
 	void notify_idle_command_thread();
 	void flush_and_signal();
+	// Joey64 run-ahead: no upscaled pass while set (the frame's picture is never shown); the native pass still runs.
+	void set_skip_upscaled(bool skip);
 
 	int resolve_shader_define(const char *name, const char *define) const;
 
@@ -354,6 +356,7 @@ private:
 
 	bool render_pass_is_upscaled() const;
 	bool should_render_upscaled() const;
+	bool skip_upscaled = false;
 
 	void flush_queues();
 	void submit_render_pass(Vulkan::CommandBuffer &cmd);
