@@ -773,11 +773,13 @@ void smart_settle()
 	Smart::unlock_all();
 }
 
-// Joey64 run-ahead (2026-11-09): the real frame's picture is never shown, so with upscaling it is drawn at native
-// size only (RDRAM stays exact; the shown frame's upscaled pass picks up what it didn't redraw, blown up from native).
-// N64_RA_NATIVE_HIDDEN=1 turns it on (off by default until checked game by game). Set at each retro_run, before the
-// frame's commands, so it applies in command order.
-void set_hidden_frame(bool hidden)
+// Joey64 run-ahead (2026-11-09): with upscaling, some frames' draws are done at native size only (RDRAM stays exact;
+// a later upscaled pass picks up what they drew, blown up from native). [av] is the frontend's GET_AUDIO_VIDEO_ENABLE.
+// N64_RA_NATIVE_HIDDEN=1: frames without video (run-ahead's real frame). Thor: visibly blockier, since most games show
+// at a frame's end what they drew in the frame before, so the real frame's drawing is what's on screen.
+// N64_RA_NATIVE_HIDDEN=2: the extra frames (bit 3), whose drawing is put back afterwards.
+// Off by default. Set at each retro_run, before the frame's commands, so it applies in command order.
+void set_hidden_frame(int av)
 {
 	static int allow = -1;
 	static bool last;
@@ -785,12 +787,13 @@ void set_hidden_frame(bool hidden)
 	if (allow < 0)
 	{
 		const char *e = getenv("N64_RA_NATIVE_HIDDEN");
-		allow = e && e[0] == '1';
+		allow = e ? atoi(e) : 0;
 		if (allow)
-			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: hidden frames drawn at native size\n");
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: %s frames drawn at native size\n", allow == 2 ? "extra" : "hidden");
 	}
 	if (!allow || !frontend)
 		return;
+	bool hidden = allow == 2 ? (av & 8) != 0 : !(av & 1);
 	bool skip = hidden && active_upscaling > 1 && !super_sampled_read_back;
 	if (skip != last)
 	{
