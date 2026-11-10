@@ -79,10 +79,7 @@
 #include <libretro_private.h>
 #include <libco.h>
 
-#ifdef M64P_NETPLAY
-#undef SDL_GetTicks
-#include <SDL2/SDL.h>
-#endif // M64P_NETPLAY
+/* Joey64: netplay no longer needs SDL (netplay.c uses POSIX sockets) */
 
 #ifdef HAVE_LIBNX
 #include <switch.h>

@@ -460,10 +460,32 @@ static void* EmuThreadFunction(void* param)
 {
     uint32_t netplay_port = 0;
     uint16_t netplay_player = 1;
+    char netplay_host[256] = "";
 
     initializing = false;
 
-#if 0
+    /* Joey64 (2026-11-10): N64_NETPLAY=<host>:<port>:<player 1-4> (the app sets it from Play together)
+     * joins the netplay server there as that player before the game starts. */
+    {
+        const char *np = getenv("N64_NETPLAY");
+        if (np && *np)
+        {
+            const char *c2 = strrchr(np, ':');
+            const char *c1 = NULL;
+            for (const char *q = np; q < c2; q++) if (*q == ':') c1 = q;
+            if (c1 && c2 && (size_t)(c1 - np) < sizeof(netplay_host))
+            {
+                memcpy(netplay_host, np, c1 - np);
+                netplay_host[c1 - np] = 0;
+                netplay_port = (uint32_t)atoi(c1 + 1);
+                netplay_player = (uint16_t)atoi(c2 + 1);
+                if (netplay_player < 1 || netplay_player > 4) netplay_player = 1;
+            }
+            else
+                log_cb(RETRO_LOG_ERROR, "Netplay: N64_NETPLAY must be host:port:player, got %s\n", np);
+        }
+    }
+
     if (netplay_port)
     {
         uint32_t version;
@@ -471,7 +493,7 @@ static void* EmuThreadFunction(void* param)
         {
             log_cb(RETRO_LOG_INFO, "Netplay: using core version %u\n", version);
 
-            if (CoreDoCommand(M64CMD_NETPLAY_INIT, netplay_port, "") == M64ERR_SUCCESS)
+            if (CoreDoCommand(M64CMD_NETPLAY_INIT, netplay_port, netplay_host) == M64ERR_SUCCESS)
                 log_cb(RETRO_LOG_INFO, "Netplay: init success\n");
 
             uint32_t reg_id = 0;
@@ -487,9 +509,10 @@ static void* EmuThreadFunction(void* param)
 
             if (CoreDoCommand(M64CMD_NETPLAY_CONTROL_PLAYER, netplay_player, &reg_id) == M64ERR_SUCCESS)
                 log_cb(RETRO_LOG_INFO, "Netplay: registered for player %d\n", netplay_player);
+            else
+                log_cb(RETRO_LOG_ERROR, "Netplay: player %d is taken or the server refused\n", netplay_player);
         }
     }
-#endif
 
     log_cb(RETRO_LOG_DEBUG, CORE_NAME ": [EmuThread] M64CMD_EXECUTE\n");
 
