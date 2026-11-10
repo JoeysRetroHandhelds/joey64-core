@@ -398,7 +398,9 @@ static void ss_drop_changed_code(struct r4300_core* r4300, int full)
         const char* e = getenv("N64_STATE_FLUSH_ALL");
         flush_all = e && e[0] == '1';
     }
-    if (full || flush_all || ss_tables_changed)
+    /* Only run-ahead's own loads keep the code of unchanged pages: after any other load (a file, the menu, rewind)
+     * Cruis'n USA ran 30% slower for good with it kept (Thor, 2026-11-09: 360 vs 530 fps uncapped). */
+    if (full || flush_all || ss_tables_changed || !savestates_ra_context)
     {
         invalidate_r4300_cached_code(r4300, 0, 0);
         l_full++;
@@ -831,6 +833,8 @@ int savestates_load_m64p(struct device* dev, const void *data)
             if (ss_cow.buf == (const uint8_t*)curr)
                 DebugMessage(M64MSG_ERROR, "copy-on-write state loaded outside run-ahead: RDRAM pages may be old");
         }
+        else if (savestates_ra_context && savestates_rdp_settle)
+            savestates_rdp_settle(); /* run-ahead's full copy: the RDP's drawing in RDRAM before it's compared (OoT drifted without) */
         ss_copy_rdram(dev->rdram.dram, curr, RDRAM_MAX_SIZE); /* only what differs (Joey64) */
     }
     curr += RDRAM_MAX_SIZE;
@@ -2235,6 +2239,8 @@ int savestates_save_m64p(const struct device* dev, void *data)
     }
     else
     {
+        if (savestates_ra_context && savestates_rdp_settle)
+            savestates_rdp_settle(); /* run-ahead's full copy: the RDP's drawing in RDRAM first (OoT drifted without) */
         PUTARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4); /* a macro of two statements */
     }
 #else
