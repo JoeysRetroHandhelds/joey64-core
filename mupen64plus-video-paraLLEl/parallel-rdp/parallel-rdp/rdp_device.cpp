@@ -1086,6 +1086,28 @@ void CommandProcessor::enqueue_command_direct(unsigned, const uint32_t *words)
 		break;
 	}
 
+	case Op::MetaRaState:
+	{
+		bool restore = words[1] != 0;
+		if (!restore)
+		{
+			ra_saved.scissor_state = scissor_state;
+			ra_saved.static_state = static_state;
+			ra_saved.depth_blend = depth_blend;
+			ra_saved.texture_image = texture_image;
+			ra_saved.valid = true;
+		}
+		else if (ra_saved.valid)
+		{
+			scissor_state = ra_saved.scissor_state;
+			static_state = ra_saved.static_state;
+			depth_blend = ra_saved.depth_blend;
+			texture_image = ra_saved.texture_image;
+		}
+		renderer.ra_state(restore);
+		break;
+	}
+
 	case Op::MetaTileReplace:
 	{
 		renderer.set_tile_replace(words[0] & 7u, (words[0] & 8u) != 0, words[1], words[2], words[3], (words[0] & 16u) != 0);
@@ -1113,6 +1135,15 @@ void CommandProcessor::set_skip_upscaled(bool skip)
 	const uint32_t words[2] = {
 		uint32_t(Op::MetaSetSkipUpscaled) << 24u,
 		skip ? 1u : 0u,
+	};
+	enqueue_command_inner(2, words);
+}
+
+void CommandProcessor::ra_state(bool restore)
+{
+	const uint32_t words[2] = {
+		uint32_t(Op::MetaRaState) << 24u,
+		restore ? 1u : 0u,
 	};
 	enqueue_command_inner(2, words);
 }

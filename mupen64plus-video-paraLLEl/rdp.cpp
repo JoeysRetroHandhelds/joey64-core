@@ -2206,6 +2206,13 @@ void drop_pending_commands()
 	cmd_cur = 0;
 }
 
+/* Joey64 (run-ahead): keep or put back the RDP's own state with the run-ahead state (CommandProcessor::ra_state). */
+void ra_state(bool restore)
+{
+	if (frontend)
+		frontend->ra_state(restore);
+}
+
 void process_commands()
 {
 	const uint32_t DP_CURRENT = *GET_GFX_INFO(DPC_CURRENT_REG) & 0x00FFFFF8;

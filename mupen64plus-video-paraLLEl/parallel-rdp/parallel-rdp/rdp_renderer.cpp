@@ -736,6 +736,74 @@ void Renderer::set_skip_upscaled(bool skip)
 	skip_upscaled = skip;
 }
 
+void Renderer::ra_copy(Vulkan::Buffer &dst, Vulkan::Buffer &src)
+{
+	// Its own command buffer, after everything recorded so far (submitted first) on the same queue.
+	auto cmd = device->request_command_buffer(Vulkan::CommandBuffer::Type::AsyncCompute);
+	cmd->barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+	             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+	             VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+	cmd->copy_buffer(dst, src);
+	cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+	             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+	             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+	             VK_ACCESS_2_TRANSFER_READ_BIT);
+	device->submit(cmd);
+}
+
+void Renderer::ra_state(bool restore)
+{
+	if (restore && !ra_saved.valid)
+		return;
+	// Everything queued so far goes to the GPU first, so the copies see (or replace) all of it.
+	flush_queues();
+	submit_to_queue();
+
+	auto make = [&](Vulkan::BufferHandle &h, const Vulkan::Buffer &like) {
+		if (!h || h->get_create_info().size != like.get_create_info().size)
+		{
+			Vulkan::BufferCreateInfo info = {};
+			info.size = like.get_create_info().size;
+			info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+			info.domain = Vulkan::BufferDomain::Device;
+			h = device->create_buffer(info);
+		}
+	};
+
+	if (!restore)
+	{
+		// A triangle's noise seed is base_primitive_index + its place in its pass, and each pass adds its count,
+		// so after the flush this is the count however passes are cut.
+		ra_saved.primitive_index = base_primitive_index;
+		ra_saved_cpu.constants = constants;
+		ra_saved_cpu.fb_state = fb;
+		memcpy(ra_saved_cpu.tiles, tiles, sizeof(tiles));
+		ra_saved_cpu.scissor_state = stream.scissor_state;
+		ra_saved_cpu.static_raster_state = stream.static_raster_state;
+		ra_saved_cpu.depth_blend_state = stream.depth_blend_state;
+		make(ra_saved.hidden_rdram, *hidden_rdram);
+		ra_copy(*ra_saved.hidden_rdram, *hidden_rdram);
+		make(ra_saved.tmem, *tmem);
+		ra_copy(*ra_saved.tmem, *tmem);
+		// Not the upscaled copy (64 MB at 4x, two copies a frame cost a quarter of the frame rate on the Thor):
+		// it only feeds the picture, and update_upscaled_domain_pre rewrites its samples from the 1x RDRAM and
+		// hidden bits wherever the put-back RDRAM differs from what the extra frames left.
+		ra_saved.valid = true;
+	}
+	else
+	{
+		base_primitive_index = ra_saved.primitive_index;
+		constants = ra_saved_cpu.constants;
+		fb = ra_saved_cpu.fb_state;
+		memcpy(tiles, ra_saved_cpu.tiles, sizeof(tiles));
+		stream.scissor_state = ra_saved_cpu.scissor_state;
+		stream.static_raster_state = ra_saved_cpu.static_raster_state;
+		stream.depth_blend_state = ra_saved_cpu.depth_blend_state;
+		ra_copy(*hidden_rdram, *ra_saved.hidden_rdram);
+		ra_copy(*tmem, *ra_saved.tmem);
+	}
+}
+
 void Renderer::set_color_framebuffer(uint32_t addr, uint32_t width, FBFormat fmt)
 {
 	if (fb.addr != addr || fb.width != width || fb.fmt != fmt)
