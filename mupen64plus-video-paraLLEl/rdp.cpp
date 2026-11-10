@@ -229,7 +229,8 @@ static void save_pipeline_list()
 static void build_pipelines_ahead()
 {
 	const char *env = getenv("N64_RDP_PREBUILD");
-	if ((env && env[0] == '0') || pipeline_list.empty() || !frontend)
+	// An empty list still builds the known pipelines (Renderer::known_pipelines, N64_RDP_KNOWN=0 turns those off).
+	if ((env && env[0] == '0') || !frontend)
 		return;
 	unsigned urgent = 0, background = 0;
 	struct timespec t0, t1;

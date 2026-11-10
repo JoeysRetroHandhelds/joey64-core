@@ -373,6 +373,15 @@ private:
 	void submit_rasterization(Vulkan::CommandBuffer &cmd, Vulkan::Buffer &tmem, bool upscaled);
 	void submit_depth_blend(Vulkan::CommandBuffer &cmd, Vulkan::Buffer &tmem, bool upscaled, bool force_write_mask);
 
+	// Joey64 (from parallel-n64 b681e24): the compute pipelines every frame can need, whose settings all follow
+	// from the renderer's own options, built at load even on a first run. Each draw sets its specialisation
+	// constants through the same setter, so the two cannot differ.
+	std::vector<Vulkan::DeferredPipelineCompile> known_pipelines();
+	void set_span_setup_constants(Vulkan::CommandBuffer &cmd, bool upscale);
+	void set_tile_binning_constants(Vulkan::CommandBuffer &cmd, bool upscale);
+	void set_depth_blend_constants(Vulkan::CommandBuffer &cmd, uint32_t fmt, bool same_addr,
+	                               bool upscaled, bool force_write_mask);
+
 	enum class ResolveStage { Pre, Post, SSAAResolve };
 	void submit_update_upscaled_domain(Vulkan::CommandBuffer &cmd, ResolveStage stage);
 	void submit_update_upscaled_domain(Vulkan::CommandBuffer &cmd, ResolveStage stage,
