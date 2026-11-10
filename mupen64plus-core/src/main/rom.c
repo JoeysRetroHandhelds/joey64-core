@@ -95,7 +95,12 @@ static int is_valid_rom(const unsigned char *buffer, unsigned int size)
  * Newer GLideN64 works around it at draw time (GLideN64 issue 1745); the RetroPie forum fix (topic 17605) replaces
  * it in the ROM with FC 12 18 24 FF 33 FF FF, the combine the same hacks use everywhere else. Done here in memory,
  * after the MD5 so hashes (RetroAchievements, game list) stay those of the file. N64_COMBINE_FIX=0 turns it off.
- * Matched at any offset, as the forum patch did: in Star Road Deluxe a fifth of them are not 4-byte aligned. */
+ * Matched at any offset, as the forum patch did: in Star Road Deluxe a fifth of them are not 4-byte aligned.
+ * Only in SM64-based ROMs (game code NSM) and only past the first 1 MB + 4 KB: Body Harvest uses the same combine
+ * in real display lists (6 times, the first at 0x31E08), and a change in the first megabyte fails the boot code's
+ * checksum, so the game hangs at a black screen (duo-cfix-compat, 2026-11-10). Star Road's start at 0x1142B9.
+ * Not in Super Mario 64 itself (U 635A2BFF, J 4EAA3D0E, E A03CF036, Shindou D6FBA4A8): it has the command 18 times
+ * and draws right with it; the hacks keep those 18 and add their own in new areas. */
 static void fix_bad_setcombine(uint8_t* rom, size_t len)
 {
     static const uint8_t bad[8]  = { 0xFC, 0x12, 0x7F, 0xFF, 0xFF, 0xFF, 0xF8, 0x38 };
@@ -104,7 +109,14 @@ static void fix_bad_setcombine(uint8_t* rom, size_t len)
     size_t i, n = 0;
     if (e != NULL && !strcmp(e, "0"))
         return;
-    for (i = 0; i + 8 <= len; ++i)
+    if (len < 0x40 || rom[0x3B] != 'N' || rom[0x3C] != 'S' || rom[0x3D] != 'M')
+        return;
+    {
+        uint32_t crc1 = (uint32_t)rom[0x10] << 24 | (uint32_t)rom[0x11] << 16 | (uint32_t)rom[0x12] << 8 | rom[0x13];
+        if (crc1 == 0x635A2BFF || crc1 == 0x4EAA3D0E || crc1 == 0xA03CF036 || crc1 == 0xD6FBA4A8)
+            return;
+    }
+    for (i = 0x101000; i + 8 <= len; ++i)
     {
         if (rom[i] == 0xFC && rom[i + 1] == 0x12 && !memcmp(rom + i, bad, 8))
         {
