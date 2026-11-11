@@ -531,19 +531,30 @@ static void* EmuThreadFunction(void* param)
         if (!failed)
         {
             uint32_t reg_id = 0;
-            while (reg_id == 0)
+            /* Joey64: a keyed room (the lobby gives each joiner a one-time key for its place) takes a registration
+             * from another device only when its id is that key, so the app hands the key to the joiner's core
+             * (N64_NETPLAY_KEY, hex) and it is the id as it is; without one, a random id as before */
+            const char *key = getenv("N64_NETPLAY_KEY");
+            if (key && *key)
+                reg_id = (uint32_t)strtoul(key, NULL, 16);
+            if (reg_id != 0)
+                log_cb(RETRO_LOG_INFO, "Netplay: registering with the lobby's key\n");
+            else
             {
+                while (reg_id == 0)
+                {
 #ifdef __MINGW32__
-                rand_s(&reg_id);
+                    rand_s(&reg_id);
 #elif defined(__ANDROID__)
-                /* Joey64: rand() is never seeded, so every device drew the same id and the room took a second
-                 * device asking for a taken player as that player registering again */
-                reg_id = arc4random();
+                    /* Joey64: rand() is never seeded, so every device drew the same id and the room took a second
+                     * device asking for a taken player as that player registering again */
+                    reg_id = arc4random();
 #else
-                reg_id = rand();
+                    reg_id = rand();
 #endif
+                }
+                reg_id += netplay_player;
             }
-            reg_id += netplay_player;
 
             if (CoreDoCommand(M64CMD_NETPLAY_CONTROL_PLAYER, netplay_player, &reg_id) == M64ERR_SUCCESS)
                 log_cb(RETRO_LOG_INFO, "Netplay: registered for player %d\n", netplay_player);
