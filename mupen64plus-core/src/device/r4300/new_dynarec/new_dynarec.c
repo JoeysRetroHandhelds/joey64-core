@@ -260,6 +260,7 @@ static void ensure_dynarec_cache_alignment(void)
 
 #define MAXBLOCK 4096
 #define MAX_OUTPUT_BLOCK_SIZE 262144
+#define DRC_WRAP_MARGIN (2*1024*1024) /* Joey64: see the wrap in new_recompile_block */
 #define CLOCK_DIVIDER g_dev.r4300.cp0.count_per_op
 
 struct regstat
@@ -12669,6 +12670,9 @@ static int new_recompile_block_impl(int addr)
   if(((uintptr_t)out)&7) emit_addnop(13);
   #endif
   assert((uintptr_t)out-beginning<MAX_OUTPUT_BLOCK_SIZE);
+  if ((uintptr_t)out-beginning>=MAX_OUTPUT_BLOCK_SIZE) { static int big_logged;
+    if (big_logged++ < 8) DebugMessage(M64MSG_WARNING, "dynarec: block %x is %d bytes of code (%d instructions), over %d",
+      start, (int)((uintptr_t)out-beginning), slen, MAX_OUTPUT_BLOCK_SIZE); }
   memcpy(copy,(char*)source,slen*4);
   u_int *ptr=(u_int*)copy;
   ptr[slen]=dirty_entry_count;
@@ -12681,7 +12685,11 @@ static int new_recompile_block_impl(int addr)
 
   // If we're within 256K of the end of the buffer,
   // start over from the beginning. (Is 256K enough?)
-  if(out > (u_char *)((u_char *)base_addr+(1<<TARGET_SIZE_2)-MAX_OUTPUT_BLOCK_SIZE-JUMP_TABLE_SIZE))
+  /* Joey64 (2026-11-11): no. A block can be bigger than MAX_OUTPUT_BLOCK_SIZE (the assert above is compiled out): one
+   * compiled on the compile thread, whose exits all get their own stubs, came to 606 KB for 4096 instructions, so one
+   * started just under the old mark would write over the jump table at the end of the cache. Start over 2 MB before
+   * the end instead: pass 10 keeps the quarter of the cache (8 MB) ahead of out expired, so the start is free then. */
+  if(out > (u_char *)((u_char *)base_addr+(1<<TARGET_SIZE_2)-DRC_WRAP_MARGIN-JUMP_TABLE_SIZE))
     out=(u_char *)base_addr;
 
   // Trap writes to any of the pages we compiled
