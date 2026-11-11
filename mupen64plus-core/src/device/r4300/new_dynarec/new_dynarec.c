@@ -3039,6 +3039,15 @@ static char blk_path[512];
 static double blk_last_poll, blk_last_save;
 static unsigned blk_loaded, blk_queued, blk_saves;
 
+/* Joey64 (2026-11-11): never a block in RDRAM's first 4 KB page (the exception vectors and the boot code libultra puts
+ * after them). Cruis'n USA on the Flip looped on a black screen whenever its list held one there and it was compiled
+ * early: 80000bc8 alone, or 80000180 with others; its old 2812-entry list without the 19 entries in that page was fine,
+ * as was a list recorded from a run without one (2720 blocks, none there). Installing the early block was the cause
+ * (compiled and dropped was fine), though nothing ran it or wrote over it before the game failed; its entries alone,
+ * or its pages' write protection alone, were enough, and with both left out it was fine. Why is not known. Those
+ * blocks still compile when the game runs them. */
+static int blk_page0(u_int vaddr) { return (vaddr & 0x7FFFFF) < 0x1000; }
+
 static u_int blk_sum(const u_int *p, u_int len)
 {
   u_int h = 2166136261u, i;
@@ -3075,7 +3084,7 @@ static void blk_init(void)
   if (f) {
     u_int a, l, s;
     while (fscanf(f, "%x %x %x", &a, &l, &s) == 3)
-      if (drc_in_rdram(a) && l >= 4 && l <= MAXBLOCK * 4 && blk_find(a, s, 1, l, 0) >= 0) blk_loaded++;
+      if (drc_in_rdram(a) && !blk_page0(a) && l >= 4 && l <= MAXBLOCK * 4 && blk_find(a, s, 1, l, 0) >= 0) blk_loaded++;
     fclose(f);
   }
   blk_last_poll = blk_last_save = drc_ms();
@@ -3090,7 +3099,7 @@ static void blk_collect(void)
   for (page = 0; page < 4096; page++) {
     struct ll_entry *h;
     for (h = jump_in[page]; h; h = h->next) {
-      if (h->vaddr != h->start || !drc_in_rdram(h->vaddr) || !h->copy || h->length < 4 || h->length > MAXBLOCK * 4) continue;
+      if (h->vaddr != h->start || !drc_in_rdram(h->vaddr) || blk_page0(h->vaddr) || !h->copy || h->length < 4 || h->length > MAXBLOCK * 4) continue;
       blk_find(h->vaddr, blk_sum((const u_int *)h->copy, h->length), 1, h->length, 1);
     }
   }
