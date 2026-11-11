@@ -35,6 +35,25 @@
 #define AI_STATUS_BUSY UINT32_C(0x40000000)
 #define AI_STATUS_FULL UINT32_C(0x80000000)
 
+/* Joey64: hand a span of the current DMA to the audio output only where it lies inside RDRAM. AI_DRAM_ADDR and AI_LEN
+ * are the game's values and nothing kept them in range: a DMA at or past RDRAM's top (3D Model RGB Test Program's)
+ * made the audio backend's in-place byte swap write past the allocation (SIGSEGV a second in). Clamp to the part that
+ * exists, as parallel-n64 does (its d790c66, "keep MMIO register and DMA accesses inside their memory"). */
+static void ai_push_span(struct ai_controller* ai, unsigned int diff, unsigned int length)
+{
+    size_t dram_size = ai->ri->rdram->dram_size;
+    uint32_t start = ai->fifo[0].address;
+
+    if (start >= dram_size || diff > dram_size - start)
+        return;
+    if (length > dram_size - start - diff)
+        length = (unsigned int)(dram_size - start - diff);
+    if (length < 4)
+        return;
+
+    ai->iaout->push_samples(ai->aout, (unsigned char*)ai->ri->rdram->dram + start + diff, length);
+}
+
 
 static uint32_t get_remaining_dma_length(struct ai_controller* ai)
 {
@@ -104,14 +123,14 @@ static void fifo_push(struct ai_controller* ai)
 
     if (ai->regs[AI_STATUS_REG] & AI_STATUS_BUSY)
     {
-        ai->fifo[1].address = ai->regs[AI_DRAM_ADDR_REG];
+        ai->fifo[1].address = ai->regs[AI_DRAM_ADDR_REG] & UINT32_C(0x00fffff8); /* bits 23:3, as the hardware */
         ai->fifo[1].length = ai->regs[AI_LEN_REG] & ~UINT32_C(7);
         ai->fifo[1].duration = duration;
         ai->regs[AI_STATUS_REG] |= AI_STATUS_FULL;
     }
     else
     {
-        ai->fifo[0].address = ai->regs[AI_DRAM_ADDR_REG];
+        ai->fifo[0].address = ai->regs[AI_DRAM_ADDR_REG] & UINT32_C(0x00fffff8); /* bits 23:3, as the hardware */
         ai->fifo[0].length = ai->regs[AI_LEN_REG] & ~UINT32_C(7);
         ai->fifo[0].duration = duration;
         ai->regs[AI_STATUS_REG] |= AI_STATUS_BUSY;
@@ -175,8 +194,7 @@ void read_ai_regs(void* opaque, uint32_t address, uint32_t* value)
         if (*value < ai->last_read)
         {
             unsigned int diff = ai->fifo[0].length - ai->last_read;
-            unsigned char *p = (unsigned char*)&ai->ri->rdram->dram[ai->fifo[0].address/4];
-            ai->iaout->push_samples(ai->aout, p + diff, ai->last_read - *value);
+            ai_push_span(ai, diff, ai->last_read - *value);
             ai->last_read = *value;
         }
     }
@@ -229,8 +247,7 @@ void ai_end_of_dma_event(void* opaque)
     if (ai->last_read != 0)
     {
         unsigned int diff = ai->fifo[0].length - ai->last_read;
-        unsigned char *p = (unsigned char*)&ai->ri->rdram->dram[ai->fifo[0].address/4];
-        ai->iaout->push_samples(ai->aout, p + diff, ai->last_read);
+        ai_push_span(ai, diff, ai->last_read);
         ai->last_read = 0;
     }
 
