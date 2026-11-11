@@ -2922,8 +2922,12 @@ static void *drc_worker(void *arg)
     drc_in_worker_async = async;
     int r;
     u_char *out0 = out;
-    if (async && setjmp(drc_bail_jb)) { r = DRC_DROPPED; out = out0; drc_stat_dropped++; drc_bail_hit = 1; } /* see DRC_EXIT */
-    else { drc_bail_armed = async; r = new_recompile_block_worker(a); }
+    if (async) {
+      /* setjmp only as a whole condition (C11 7.13.1.1, audit 3 L4) */
+      if (setjmp(drc_bail_jb)) { r = DRC_DROPPED; out = out0; drc_stat_dropped++; drc_bail_hit = 1; } /* see DRC_EXIT */
+      else { drc_bail_armed = 1; r = new_recompile_block_worker(a); }
+    }
+    else { drc_bail_armed = 0; r = new_recompile_block_worker(a); }
     drc_bail_armed = 0;
     drc_in_worker_async = 0;
     pthread_mutex_lock(&drc_mx);
@@ -2947,6 +2951,14 @@ static int drc_thread_on(void)
   return drc_thread;
 }
 
+/* RDRAM to read code bytes from: its second mapping (memory.c), which parallel-RDP's smart sync never protects
+ * (audit 3 M1, 2026-11-11). A read of a protected page faulted, and smart sync's handler then waited for the GPU and
+ * opened pages on the thread that read: on the worker, while the emulation thread waited for it. */
+static const void *drc_rdram_ro(void)
+{
+  return g_rdram_alias ? (const void *)g_rdram_alias : (const void *)g_dev.rdram.dram;
+}
+
 /* On the worker, at pass 9 of a queued compile: wait for the emulation thread, then check the code is unchanged.
  * 1: drop this compile. */
 static int drc_front_done(void)
@@ -2957,7 +2969,7 @@ static int drc_front_done(void)
   while (drc_tstate != DRC_T_GRANT) pthread_cond_wait(&drc_cv_worker, &drc_mx);
   pthread_mutex_unlock(&drc_mx);
   /* the emulation thread waits in drc_finish now, so RDRAM holds still */
-  const u_int *live = (const u_int *)((uintptr_t)g_dev.rdram.dram + (start & 0x7FFFFF));
+  const u_int *live = (const u_int *)((uintptr_t)drc_rdram_ro() + (start & 0x7FFFFF));
   return using_tlb != drc_job_using_tlb || memcmp(live, drc_snap, (size_t)slen * 4) != 0;
 }
 
@@ -2997,7 +3009,7 @@ static void drc_service(void)
     if (get_clean(r4300, a, ~0) || get_dirty(r4300, a, ~0)) continue; /* compiled meanwhile */
     u_int off = a & 0x7FFFFF, len = 0x800000 - off;
     if (len > MAXBLOCK * 4) len = MAXBLOCK * 4;
-    memcpy(drc_snap, (char *)g_dev.rdram.dram + off, len);
+    memcpy(drc_snap, (const char *)drc_rdram_ro() + off, len);
     memset((char *)drc_snap + len, 0, sizeof(drc_snap) - len);
     drc_job_addr = a;
     drc_job_async = 1;

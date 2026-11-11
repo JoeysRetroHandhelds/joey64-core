@@ -68,6 +68,11 @@ extern "C" void parallel_smart_settle(void)
 	RDP::smart_settle();
 }
 
+extern "C" void parallel_ra_settle(void)
+{
+	RDP::ra_settle();
+}
+
 extern "C" void parallel_set_hidden_frame(int av)
 {
 	RDP::set_hidden_frame(av);

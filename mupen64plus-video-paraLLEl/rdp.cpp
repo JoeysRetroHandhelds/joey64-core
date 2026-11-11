@@ -570,6 +570,9 @@ static void on_sync_full()
 		}
 }
 
+// A rule for new code (audit 3 L6): this handler waits for the GPU (a mutex and condition variable) and posts a
+// semaphore, which is safe only because the thread that faults never holds a lock those need. So nothing inside
+// parallel-RDP or the dynarec's compile worker may touch the primary RDRAM mapping: they go through g_rdram_alias.
 static void handler(int sig, siginfo_t *info, void *uc)
 {
 	uint8_t *addr = static_cast<uint8_t *>(info->si_addr);
@@ -772,6 +775,17 @@ void smart_settle()
 	if (Smart::any_locked || Smart::any_opened)
 		frontend->wait_for_timeline(Smart::sync_signal);
 	Smart::unlock_all();
+}
+
+// Run-ahead's take and put back (libretro.c ra_cow_allowed, audit 3 M2): smart sync's settle, or else a wait for all
+// queued work, so RDRAM holds everything the RDP drew (async parallel-RDP copies its drawing back on a worker as the
+// GPU finishes it, which could land after the put back).
+void ra_settle()
+{
+	if (Smart::enabled && synchronous)
+		smart_settle();
+	else if (frontend)
+		frontend->wait_for_timeline(frontend->signal_timeline());
 }
 
 // Joey64 run-ahead (2026-11-09): with upscaling, some frames' draws are done at native size only (RDRAM stays exact;
@@ -2362,6 +2376,9 @@ void begin_frame()
 
 bool init()
 {
+	// a pipeline cache save still running holds the old Device (audit 3 L5): deinit joins it, but an init without a
+	// deinit before it would free the Device under that thread
+	wait_pipeline_cache_saver();
 	if (!context || !vulkan)
 		return false;
 

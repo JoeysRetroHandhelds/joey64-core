@@ -242,6 +242,7 @@ static void ss_copy_rdram(uint32_t* dst, const unsigned char* src, size_t bytes)
  * are at the generation the tables are at now doesn't compare them. Any other state gets the full copy and
  * compare. N64_STATE_TLB_SKIP=0 turns it off. */
 int savestates_ra_context;
+unsigned int savestates_ra_gen, savestates_loaded_gen; /* the mark's fourth word (savestates.h, audit 3 L2) */
 static uint32_t ss_run_id;
 static int ss_tlb_skip_on(void)
 {
@@ -272,6 +273,7 @@ static struct
     volatile int armed;
     uint8_t* ram;
     uint8_t* buf;
+    const uint8_t* state; /* the start of the state buffer buf is in (audit 3 L1) */
     size_t shift, pages;
     uint8_t copied[RDRAM_MAX_SIZE / 4096];
     struct sigaction old;
@@ -283,8 +285,10 @@ static void ss_cow_copy(size_t p)
 {
     const size_t sz = (size_t)1 << ss_cow.shift;
     memcpy(ss_cow.buf + p * sz, ss_cow.ram + p * sz, sz);
-    ss_cow.copied[p] = 1;
+    /* open before marking (audit 3 L7): a write from another thread in between then finds the page open; marked
+     * first, it found it marked and still shut, and went on to the default handler */
     mprotect(ss_cow.ram + p * sz, sz, PROT_READ | PROT_WRITE);
+    ss_cow.copied[p] = 1;
 }
 
 static void ss_cow_handler(int sig, siginfo_t* info, void* uc)
@@ -595,6 +599,21 @@ int savestates_load_m64p(struct device* dev, const void *data)
 #endif
         return 0;
     }
+    savestates_loaded_gen = 0;
+#ifdef SS_COW
+    /* run-ahead's copy-on-write state holds RDRAM only for the pages copied into it, so only its put back may load it
+     * (audit 3 L1, 2026-11-11: anything else loaded it with whatever its other pages held, and only logged it) */
+    if (ss_cow.armed && ss_cow.state == (const uint8_t*)data && savestates_ra_context != 2)
+    {
+        DebugMessage(M64MSG_ERROR, "copy-on-write state loaded outside run-ahead: refused");
+#ifdef USE_SDL
+        SDL_UnlockMutex(savestates_lock);
+#else
+        pthread_mutex_unlock(&savestates_lock);
+#endif
+        return 0;
+    }
+#endif
 #endif
 
     curr += 8;
@@ -873,9 +892,7 @@ int savestates_load_m64p(struct device* dev, const void *data)
         {
             /* any other load: RDRAM open first (and a copy-on-write state can't be loaded by anything else) */
             if (savestates_rdp_settle) savestates_rdp_settle();
-            ss_cow_disarm();
-            if (ss_cow.buf == (const uint8_t*)curr)
-                DebugMessage(M64MSG_ERROR, "copy-on-write state loaded outside run-ahead: RDRAM pages may be old");
+            ss_cow_disarm(); /* (the copy-on-write state itself was refused at the start) */
         }
         else if (savestates_ra_context && savestates_rdp_settle)
             savestates_rdp_settle(); /* run-ahead's full copy: the RDP's drawing in RDRAM before it's compared (OoT drifted without) */
@@ -891,13 +908,14 @@ int savestates_load_m64p(struct device* dev, const void *data)
     dev->cart.use_flashram = GETDATA(curr, int32_t);
     {
         const unsigned char* mark = (const unsigned char*)curr;
-        uint32_t m[3];
+        uint32_t m[4];
         curr += 4+8+4+4; /* Here there used to be flashram state (now the TLB tables' mark, Joey64) */
         /* by default, reset flashram state here and load it later if available */
         poweron_flashram(&dev->cart.flashram);
 
         ss_tables_changed = 0;
         memcpy(m, mark, sizeof(m));
+        savestates_loaded_gen = m[3];
         if (ss_tlb_skip_on() && ss_tlb_mark_matches(mark))
         {
             curr += 0x100000 * 4 * 2; /* the tables hold what the state's do */
@@ -2280,6 +2298,7 @@ int savestates_save_m64p(const struct device* dev, void *data)
         savestates_rdp_settle(); /* the RDP's drawing in RDRAM before it goes read-only */
         ss_cow.ram = (uint8_t*)dev->rdram.dram;
         ss_cow.buf = (uint8_t*)curr;
+        ss_cow.state = (const uint8_t*)data;
         memset(ss_cow.copied, 0, sizeof(ss_cow.copied));
         __sync_synchronize();
         if (mprotect(ss_cow.ram, RDRAM_MAX_SIZE, PROT_READ) == 0)
@@ -2303,7 +2322,7 @@ int savestates_save_m64p(const struct device* dev, void *data)
     PUTDATA(curr, int32_t, dev->cart.use_flashram);
     {
         unsigned char* mark = (unsigned char*)curr;
-        uint32_t m[3];
+        uint32_t m[4];
         curr += 4+8+4+4; // Here used to be flashram state (now the TLB tables' mark, Joey64)
         if (ss_tlb_skip_on() && ss_tlb_mark_matches(mark))
         {
@@ -2316,7 +2335,7 @@ int savestates_save_m64p(const struct device* dev, void *data)
             PUTARRAY(dev->r4300.cp0.tlb.LUT_w, curr, uint32_t, 0x100000);
         }
         if (!ss_run_id) ss_run_id = ((uint32_t)time(NULL) * 2654435761u) | 1u;
-        m[0] = 0x5434364Au; m[1] = ss_run_id; m[2] = g_tlb_lut_gen;
+        m[0] = 0x5434364Au; m[1] = ss_run_id; m[2] = g_tlb_lut_gen; m[3] = savestates_ra_gen;
         memcpy(mark, m, sizeof(m));
     }
 

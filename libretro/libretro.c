@@ -2241,7 +2241,7 @@ static void parallel_rsp_state_load(const void *in) { (void)in; }
 size_t hle_ra_state_size(void);
 void hle_ra_state_save(void *out);
 void hle_ra_state_load(const void *in);
-static struct { int valid; uint32_t task_locked, unsafe; unsigned char rsp[2048];
+static struct { int valid; uint32_t gen, task_locked, unsafe; unsigned char rsp[2048];
    struct sp_dma sp_fifo[SP_DMA_FIFO_SIZE]; struct ai_dma ai_fifo[AI_DMA_FIFO_SIZE]; unsigned ai_format_changed; } ra_side;
 /* the state file holds neither the RSP's DMA queue nor the audio queue's addresses (the loader guesses those) */
 static bool ra_same_instance(void)
@@ -2259,7 +2259,7 @@ static bool ra_same_instance(void)
 
 /* The HLE audio lists' state (hle_ra_state_*), for any RSP: HLE audio under parallel-RSP, and the HLE RSP that
  * GLideN64 runs with (ra_same_instance is parallel-RSP only). N64_RA_HLE=0 leaves it out. */
-static struct { int valid; unsigned char buf[0x3000]; } ra_hle;
+static struct { int valid; uint32_t gen; unsigned char buf[0x3000]; } ra_hle;
 static bool ra_hle_context(void)
 {
    static int on = -1;
@@ -2283,16 +2283,34 @@ static bool state_direct(int load)
    return (on & (load ? 2 : 1)) && g_at_frame_edge && !(current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer);
 }
 
-/* Copy-on-write run-ahead states (savestates.c) need smart sync's record of what the RDP draws */
+/* GET_SAVESTATE_CONTEXT NORMAL (or a frontend without it): a state the user keeps, not run-ahead's or netplay's */
+static bool state_context_normal(void)
+{
+   int ctx = RETRO_SAVESTATE_CONTEXT_NORMAL;
+   if (!environ_cb(RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT, &ctx))
+      return true;
+   return ctx == RETRO_SAVESTATE_CONTEXT_NORMAL;
+}
+
+/* audit 3 L2 (2026-11-11): which run-ahead state ra_side and ra_hle go with. retro_serialize writes a new number into
+ * the state (savestates_ra_gen, the mark's fourth word) and keeps it with them; a load puts them back only with the
+ * state that has it, so a second buffer (rollback) never gets another state's RSP registers. */
+static uint32_t ra_gen_next;
+
+/* Copy-on-write run-ahead states (savestates.c) need smart sync's record of what the RDP draws. Either way run-ahead's
+ * take and put back wait for the RDP first (savestates_rdp_settle): smart sync's settle, or on async parallel-RDP
+ * (Mali's default) a wait for all queued work, so no copy-back of what an extra frame drew lands in RDRAM after the
+ * put back (audit 3 M2, 2026-11-11: async had no wait at all, and once set the settle stayed set). */
 static int ra_cow_allowed(void)
 {
 #if !defined(_WIN32)
-   if (current_rdp_type == RDP_PLUGIN_PARALLEL && parallel_smart_on())
+   if (current_rdp_type == RDP_PLUGIN_PARALLEL)
    {
-      savestates_rdp_settle = parallel_smart_settle;
-      return 1;
+      savestates_rdp_settle = parallel_ra_settle;
+      return parallel_smart_on() ? 1 : 0;
    }
 #endif
+   savestates_rdp_settle = NULL;
    return 0;
 }
 
@@ -2300,23 +2318,31 @@ bool retro_serialize(void *data, size_t size)
 {
    if (initializing)
       return false;
+   /* both ways below write the whole state into data (audit 3 L3: a guard, the host always passes this size) */
+   if (!data || size < retro_serialize_size())
+      return false;
 
    if (state_direct(0))
    {
-      bool ok;
+      bool ok, hle_ctx;
       /* An RSP task still running at the frame's end (interrupt_unsafe_state) isn't in a state: the job waits until
        * it's done, past the frame's end, and a state taken now loses the task (the game then waits for it for good:
-       * SM64 froze). Not now, then: the frontend runs this frame without run-ahead. */
-      static unsigned tried, unsafe, unsafe_cpu, rdp_part;
+       * SM64 froze). Run-ahead's own state isn't taken now, then: the frontend runs this frame without run-ahead.
+       * Any other (a quit save, a slot, recovery, rewind: GET_SAVESTATE_CONTEXT NORMAL) goes to the job below, which
+       * waits for a safe point (audit 3 H1, 2026-11-11: those were refused too, about 5% of frame ends in SM64 with
+       * parallel-RSP, so a quit save could fail and Continue then resumed from the older one). */
+      static unsigned tried, unsafe, unsafe_cpu, rdp_part, to_job;
       const bool same = ra_same_instance();
+      const bool normal = state_context_normal();
       if (++tried >= 600)
       {
-         if (unsafe || unsafe_cpu || rdp_part)
-            log_cb(RETRO_LOG_INFO, CORE_NAME ": state at the frame's end: of %u, refused %u with an RSP task running, %u inside a CPU instruction, %u with a display list in part\n", tried, unsafe, unsafe_cpu, rdp_part);
-         tried = unsafe = unsafe_cpu = rdp_part = 0;
+         if (unsafe || unsafe_cpu || rdp_part || to_job)
+            log_cb(RETRO_LOG_INFO, CORE_NAME ": state at the frame's end: of %u, refused %u with an RSP task running, %u inside a CPU instruction, %u with a display list in part; %u normal saves taken by the job instead\n", tried, unsafe, unsafe_cpu, rdp_part, to_job);
+         tried = unsafe = unsafe_cpu = rdp_part = to_job = 0;
       }
       if (g_dev.r4300.cp0.interrupt_unsafe_state && !(same && g_dev.r4300.cp0.interrupt_unsafe_state == INTR_UNSAFE_RSP))
       {
+         if (normal) { to_job++; goto job; }
          if (g_dev.r4300.cp0.interrupt_unsafe_state & INTR_UNSAFE_R4300) unsafe_cpu++; else unsafe++;
          return false;
       }
@@ -2324,20 +2350,29 @@ bool retro_serialize(void *data, size_t size)
        * be added to whatever the extra frames left there. A guard: no game tested has had one at the frame's end. */
       if (current_rdp_type == RDP_PLUGIN_PARALLEL && parallel_pending_commands() > 0)
       {
+         if (normal) { to_job++; goto job; }
          rdp_part++;
          return false;
       }
       retro_savestate_result = 0;
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
+      hle_ctx = ra_hle_context();
+      savestates_ra_gen = 0;
+      if (same || hle_ctx)
+      {
+         if (++ra_gen_next == 0) ++ra_gen_next;
+         savestates_ra_gen = ra_gen_next;
+      }
       savestates_ra_context = same ? 1 + ra_cow_allowed() : 0;
       ok = savestates_save_m64p(&g_dev, data) && retro_savestate_result;
       savestates_ra_context = 0;
       ra_side.valid = 0;
       ra_hle.valid = 0;
-      if (ok && ra_hle_context())
+      if (ok && hle_ctx)
       {
          hle_ra_state_save(ra_hle.buf);
+         ra_hle.gen = savestates_ra_gen;
          ra_hle.valid = 1;
       }
       if (ok && same)
@@ -2351,14 +2386,17 @@ bool retro_serialize(void *data, size_t size)
          /* what parallel-RDP holds outside RDRAM (registers, TMEM, coverage bits, noise seed): the extra frames change it */
          if (current_rdp_type == RDP_PLUGIN_PARALLEL)
             parallel_ra_state(0);
+         ra_side.gen = savestates_ra_gen;
          ra_side.valid = 1;
       }
+      savestates_ra_gen = 0;
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
       retro_savestate_complete = true;
       return ok;
    }
 
+job:
    retro_savestate_complete = false;
    retro_savestate_result = 0;
 
@@ -2411,13 +2449,16 @@ bool retro_unserialize(const void *data, size_t size)
    if (state_direct(1))
    {
       int ret;
+      uint32_t gen;
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
       savestates_ra_context = ra_same_instance() ? 1 + ra_cow_allowed() : 0;
       ret = savestates_load_m64p(&g_dev, data);
       savestates_ra_context = 0;
+      /* ra_side and ra_hle only with the run-ahead state they were taken with (audit 3 L2) */
+      gen = ret ? savestates_loaded_gen : 0;
       /* the run-ahead state just taken: its RSP registers and task flags (the loader clears the flags) */
-      if (ret && ra_side.valid && ra_same_instance())
+      if (ret && gen && ra_side.valid && ra_side.gen == gen && ra_same_instance())
       {
          g_dev.sp.rsp_task_locked = ra_side.task_locked;
          g_dev.r4300.cp0.interrupt_unsafe_state = ra_side.unsafe;
@@ -2426,13 +2467,13 @@ bool retro_unserialize(const void *data, size_t size)
          memcpy(g_dev.ai.fifo, ra_side.ai_fifo, sizeof(ra_side.ai_fifo));
          g_dev.ai.samples_format_changed = ra_side.ai_format_changed;
       }
-      if (ret && ra_hle.valid && ra_hle_context())
+      if (ret && gen && ra_hle.valid && ra_hle.gen == gen && ra_hle_context())
          hle_ra_state_load(ra_hle.buf);
       /* states at the frame's end are taken with no display list in part (retro_serialize): none now either */
       if (ret && current_rdp_type == RDP_PLUGIN_PARALLEL)
       {
          parallel_drop_pending_commands();
-         if (ra_side.valid && ra_same_instance())
+         if (gen && ra_side.valid && ra_side.gen == gen && ra_same_instance())
             parallel_ra_state(1);
       }
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
