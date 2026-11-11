@@ -2329,8 +2329,8 @@ bool retro_serialize(void *data, size_t size)
        * it's done, past the frame's end, and a state taken now loses the task (the game then waits for it for good:
        * SM64 froze). Run-ahead's own state isn't taken now, then: the frontend runs this frame without run-ahead.
        * Any other (a quit save, a slot, recovery, rewind: GET_SAVESTATE_CONTEXT NORMAL) goes to the job below, which
-       * waits for a safe point (audit 3 H1, 2026-11-11: those were refused too, about 5% of frame ends in SM64 with
-       * parallel-RSP, so a quit save could fail and Continue then resumed from the older one). */
+       * waits for a safe point (audit 3 H1, 2026-11-11: those were refused too; none came up in 15 bench scenes, about
+       * 27,000 frame-end states, but a refused quit save would fail and Continue then resume the older one). */
       static unsigned tried, unsafe, unsafe_cpu, rdp_part, to_job;
       const bool same = ra_same_instance();
       const bool normal = state_context_normal();
