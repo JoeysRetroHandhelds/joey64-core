@@ -370,12 +370,15 @@ SOURCES_CXX   += \
 	$(ROOT_DIR)/custom/GLideN64/mupenplus/CommonAPIImpl_mupenplus.cpp							  \
 	$(VIDEODIR_GLIDEN64)/src/Log.cpp
 
+# Joey64: xBRZ (GPL-3.0) is left out of the core; its texture enhancement modes enhance nothing, and Joey64 never
+# asks for them (Joey 2026-11-11: "drop xBRZ from the core").
+CXXFLAGS += -DJOEY64_NO_XBRZ
+
 SOURCES_CXX   += \
 	$(VIDEODIR_GLIDEN64)/src/GLideNHQ/TextureFilters.cpp \
 	$(VIDEODIR_GLIDEN64)/src/GLideNHQ/TextureFilters_2xsai.cpp \
 	$(VIDEODIR_GLIDEN64)/src/GLideNHQ/TextureFilters_hq2x.cpp \
 	$(VIDEODIR_GLIDEN64)/src/GLideNHQ/TextureFilters_hq4x.cpp \
-	$(VIDEODIR_GLIDEN64)/src/GLideNHQ/TextureFilters_xbrz.cpp \
 	$(VIDEODIR_GLIDEN64)/src/GLideNHQ/TxCache.cpp \
 	$(VIDEODIR_GLIDEN64)/src/GLideNHQ/TxDbg.cpp \
 	$(VIDEODIR_GLIDEN64)/src/GLideNHQ/TxFilter.cpp \

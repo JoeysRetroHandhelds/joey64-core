@@ -217,7 +217,12 @@ TxFilter::filter(uint8 *src, int srcwidth, int srcheight, ColorFormat srcformat,
 			int scale = 1, num_filters = 0;
 			uint32 filter = 0;
 
-			const uint32 enhancement = (_options & ENHANCEMENT_MASK);
+			uint32 enhancement = (_options & ENHANCEMENT_MASK);
+#ifdef JOEY64_NO_XBRZ
+			/* Joey64 builds without xBRZ: its modes enhance nothing (2xBRZ would otherwise take the default case) */
+			if (enhancement >= BRZ2X_ENHANCEMENT && enhancement <= BRZ6X_ENHANCEMENT)
+				enhancement = NO_ENHANCEMENT;
+#endif
 			switch (enhancement) {
 			case NO_ENHANCEMENT:
 				// Do nothing
@@ -233,6 +238,7 @@ TxFilter::filter(uint8 *src, int srcwidth, int srcheight, ColorFormat srcformat,
 					num_filters++;
 				}
 			break;
+#ifndef JOEY64_NO_XBRZ
 			case BRZ3X_ENHANCEMENT:
 				xbrz::init();
 				if (srcwidth  <= (_maxwidth / 3) && srcheight <= (_maxheight / 3)) {
@@ -282,6 +288,7 @@ TxFilter::filter(uint8 *src, int srcwidth, int srcheight, ColorFormat srcformat,
 					num_filters++;
 				}
 				break;
+#endif
 			default:
 				if (srcwidth  <= (_maxwidth >> 1) && srcheight <= (_maxheight >> 1)) {
 					filter |= enhancement;

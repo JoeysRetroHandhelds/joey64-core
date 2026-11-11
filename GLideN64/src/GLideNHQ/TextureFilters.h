@@ -32,7 +32,9 @@
 #define _16BPP_HACK 1
 
 #include "TxInternal.h"
+#ifndef JOEY64_NO_XBRZ
 #include "TextureFilters_xbrz.h"
+#endif
 
 /* enhancers */
 void hq4x_8888(unsigned char * pIn, unsigned char * pOut, int Xres, int Yres, int SrcPPL, int BpL);

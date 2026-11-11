@@ -763,6 +763,7 @@ void filter_8888(uint32 *src, uint32 srcwidth, uint32 srcheight, uint32 *dest, u
 		}
 	}
 	switch (filter & ENHANCEMENT_MASK) {
+#ifndef JOEY64_NO_XBRZ
 	case BRZ2X_ENHANCEMENT:
 		xbrz::scale(2, (const uint32_t *)const_cast<const uint32 *>(src), (uint32_t *)dest, srcwidth, srcheight, xbrz::ColorFormat::ABGR);
 	return;
@@ -778,6 +779,7 @@ void filter_8888(uint32 *src, uint32 srcwidth, uint32 srcheight, uint32 *dest, u
 	case BRZ6X_ENHANCEMENT:
 		xbrz::scale(6, (const uint32_t *)const_cast<const uint32 *>(src), (uint32_t *)dest, srcwidth, srcheight, xbrz::ColorFormat::ABGR);
 		return;
+#endif
 	case HQ4X_ENHANCEMENT:
 		hq4x_8888((uint8*)src, (uint8*)dest, srcwidth, srcheight, srcwidth, (srcwidth << 4));
 	return;
