@@ -3118,9 +3118,9 @@ static void blk_save(void)
 
 /* Once a frame (VI interrupt, between blocks): up to 512 listed blocks checked against RAM, the matching ones queued.
  * Early compiles only fill an idle queue (2026-11-10): at most 8 a frame and only while fewer than 4 compiles wait, so
- * a block the game needs now never waits behind them. Queued in bursts of 64 a frame, 1400+ of them held Cruis'n
- * USA's own new code in the interpreter long enough to change its timing, and it hung on a black screen on the Flip
- * (1055 listed blocks fine, 1406 black, the same either half of the list). */
+ * a block the game needs now never waits behind them. (Cruis'n USA's black screen on the Flip, first put down to
+ * 1400+ early compiles changing its timing, came from one early-compiled block in RDRAM page 0: see blk_page0. Its
+ * full list is fine without those, so the queue limits here are only so the game's own new blocks come first.) */
 void new_dynarec_blocklist_tick(void)
 {
   if (blk_on < 0) blk_init();
