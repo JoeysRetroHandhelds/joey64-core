@@ -1,3 +1,20 @@
+# joey64-core
+
+The N64 core of [Joey64](https://github.com/JoeysRetroHandhelds/joey64), an N64 emulator for Android handhelds:
+a fork of [libretro/mupen64plus-libretro-nx](https://github.com/libretro/mupen64plus-libretro-nx) (Mupen64Plus-Next)
+with changes for Joey64's host: per-port Transfer Paks, netplay, parallel-RDP
+updates and Mali/Adreno fixes, and fixes for games and dumps upstream doesn't boot.
+
+- Branches: the release branches (`rel1`, `rel2`, `rel3`, ...) are what Joey64 bundles; the app's
+  `core-version.txt` names the exact commit. Other branches are work in progress.
+- Build for Android (arm64): `ndk-build` in `libretro/jni` (output `libretro/libs/arm64-v8a/libretro.so`).
+- Licence: GPLv2 or later, as upstream; GNU lightning (parallel-RSP's JIT) is LGPLv3+. angrylion-rdp-plus is
+  not part of this fork (removed 2026-11-07).
+
+Upstream's README follows.
+
+---
+
 # Mupen64Plus-Next
 
 Mupen64Plus-Next is a N64 emulation library for the [libretro API](http://www.libretro.com/), based on Mupen64Plus (see below).
@@ -26,7 +43,7 @@ The following projects have been incorporated into this repository:
 - [GLideN64](https://github.com/gonetz/GLideN64)
 - [cxd4](https://github.com/cxd4/rsp)
 - [parallel-rsp](https://github.com/Themaister/parallel-rsp)
-- [angrylion-rdp-plus](https://github.com/ata4/angrylion-rdp-plus) (Currently based on it's [ParaLLel](https://github.com/libretro/parallel-n64/) variant): removed from Joey64's core (2026-11-07), its old MAME licence is non-commercial
+- [angrylion-rdp-plus](https://github.com/ata4/angrylion-rdp-plus) (Currently based on it's [ParaLLel](https://github.com/libretro/parallel-n64/) variant) (upstream; not in joey64-core): removed from Joey64's core (2026-11-07), its old MAME licence is non-commercial
 
 #### Acknowledgments
 
