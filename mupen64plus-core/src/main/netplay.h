@@ -41,6 +41,7 @@ struct controller_input_compat;
 
 m64p_error netplay_start(const char* host, int port);
 m64p_error netplay_stop();
+int netplay_check_rom(const char *md5);
 uint8_t netplay_register_player(uint8_t player, uint8_t plugin, uint8_t rawdata, uint32_t reg_id);
 int netplay_lag();
 void netplay_set_controller(uint8_t player);
@@ -65,6 +66,11 @@ static osal_inline m64p_error netplay_start(const char* host, int port)
 static osal_inline m64p_error netplay_stop()
 {
     return M64ERR_INCOMPATIBLE;
+}
+
+static osal_inline int netplay_check_rom(const char *md5)
+{
+    return 1;
 }
 
 static osal_inline uint8_t netplay_register_player(uint8_t player, uint8_t plugin, uint8_t rawdata, uint32_t reg_id)

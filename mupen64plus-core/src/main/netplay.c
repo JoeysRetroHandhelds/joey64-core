@@ -31,25 +31,127 @@
 #include "netplay.h"
 
 #include <mupen64plus-next_common.h>
+#include <libretro_private.h>
 
-#include <SDL2/SDL_net.h>
-#if !defined(WIN32)
+/* Joey64 (2026-11-10): POSIX sockets instead of SDL_net, and no SDL threads, so the libretro core can
+ * build netplay in. The wire format is the mupen64plus netplay protocol as before. */
 #include <sys/socket.h>
-#endif
-
-#ifndef HAVE_LIBNX
-#include <netinet/ip.h>
-#else
-#include <switch.h>
+#include <sys/types.h>
 #include <netinet/in.h>
-#endif // HAVE_LIBNX
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <poll.h>
+#include <time.h>
+#include <errno.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct { int len; uint8_t data[512]; } np_packet;
+
+static int l_udpChannel;
+static int np_udp = -1, np_tcp = -1;
+
+static void np_w32(void *p, uint32_t v)
+{
+    uint8_t *b = (uint8_t *)p;
+    b[0] = (uint8_t)(v >> 24); b[1] = (uint8_t)(v >> 16); b[2] = (uint8_t)(v >> 8); b[3] = (uint8_t)v;
+}
+static uint32_t np_r32(const void *p)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
+}
+static uint32_t np_ticks(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
+}
+
+static uint64_t np_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+//Joey64 (2026-11-10): connection numbers, logged every 5 s in a room so a session log shows a bad connection:
+//round trip of input requests (sent to the server's answer), the waits for input (a frame that couldn't go on),
+//input events heard, copies heard again (resends and gratuitous ones), requests sent, and the server's lag.
+static struct {
+    uint64_t req_at[4];          // when the oldest unanswered request for that player went out (us), 0 = none
+    uint64_t rtt_sum, rtt_max;   // us
+    uint32_t rtt_n;
+    uint32_t waits, wait_ms, wait_max;
+    uint32_t heard, dup, sent_req, packets;
+    uint32_t since;
+} l_ns;
+static void np_udp_send(np_packet *p)
+{
+    if (np_udp >= 0) send(np_udp, p->data, p->len, 0);
+}
+static int np_udp_recv(np_packet *p)
+{
+    if (np_udp < 0) return 0;
+    ssize_t n = recv(np_udp, p->data, sizeof(p->data), MSG_DONTWAIT);
+    if (n < 0) return 0;
+    p->len = (int)n;
+    return 1;
+}
+static int np_tcp_send(const void *d, int n)
+{
+    const char *c = (const char *)d; int done = 0;
+    while (np_tcp >= 0 && done < n) {
+        ssize_t k = send(np_tcp, c + done, n - done, MSG_NOSIGNAL);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) { log_cb(RETRO_LOG_ERROR, "Netplay: TCP send failed\n"); l_udpChannel = -1; break; }
+        done += (int)k;
+    }
+    return done;
+}
+/* The callers loop until they have n bytes; on a closed or failed connection the rest is zeros and
+ * the connection counts as lost (the next input wait stops the game). */
+static int np_tcp_recv(void *d, int n)
+{
+    char *c = (char *)d;
+    while (np_tcp >= 0) {
+        ssize_t k = recv(np_tcp, c, n, 0);
+        if (k < 0 && errno == EINTR) continue;
+        if (k > 0) return (int)k;
+        break;
+    }
+    log_cb(RETRO_LOG_ERROR, "Netplay: TCP connection lost\n");
+    l_udpChannel = -1;
+    memset(c, 0, n);
+    return n;
+}
+
+/* Joey64 (2026-11-10): the app is leaving while the core waits on the room (the ROM check, registration until
+ * every player is in, settings, input). Shutting the TCP socket ends a blocked recv at once and the connection
+ * counts as lost, so the game stops instead of waiting up to the room's 30 s (or for ever on a room that never
+ * answers). Called from the app's thread; the emulation thread closes the sockets as before. */
+__attribute__((visibility("default"))) void joey64_netplay_abort(void)
+{
+    int t = np_tcp;
+    l_udpChannel = -1;
+    if (t >= 0)
+        shutdown(t, SHUT_RDWR);
+}
+#define SDLNet_Write32(v, p) np_w32((p), (uint32_t)(v))
+#define SDLNet_Read32(p) np_r32(p)
+#define SDLNet_UDP_Send(s, ch, p) np_udp_send(p)
+#define SDLNet_UDP_Recv(s, p) np_udp_recv(p)
+#define SDLNet_TCP_Send(s, d, n) np_tcp_send((d), (n))
+#define SDLNet_TCP_Recv(s, d, n) np_tcp_recv((d), (n))
 
 static int l_canFF;
 static int l_netplay_controller;
 static int l_netplay_control[4];
-static UDPsocket l_udpSocket;
-static TCPsocket l_tcpSocket;
-static int l_udpChannel;
+static int l_udpSocket = -1;
+static int l_tcpSocket = -1;
 static int l_spectator;
 static int l_netplay_is_init = 0;
 static uint32_t l_vi_counter;
@@ -59,12 +161,22 @@ static struct controller_input_compat *l_cin_compats;
 static uint8_t l_plugin[4];
 static uint8_t l_buffer_target;
 static uint8_t l_player_lag[4];
+//Joey64: when the server last sent us anything (see netplay_ensure_valid)
+static uint32_t l_last_heard;
+//Joey64: our last inputs, sent again (see netplay_send_input). More than a Joey64 room's largest input delay (12):
+//an input lost on the way is needed delay frames later, and only the last NP_RESEND are ever sent again.
+#define NP_RESEND 20
+//Joey64 (2026-11-10): [8, player, n, n x (count32, keys32, plugin)], several inputs in one packet (Joey64 rooms)
+#define UDP_JOEY_KEY_BATCH 8
+static struct { uint32_t count, keys; uint8_t plugin; } l_sent[4][NP_RESEND];
+static uint8_t l_sent_n[4], l_sent_pos[4];
 
 //UDP packets
-static UDPpacket *l_request_input_packet;
-static UDPpacket *l_send_input_packet;
-static UDPpacket *l_process_packet;
-static UDPpacket *l_check_sync_packet;
+static np_packet l_packets[4];
+static np_packet *l_request_input_packet;
+static np_packet *l_send_input_packet;
+static np_packet *l_process_packet;
+static np_packet *l_check_sync_packet;
 static const int32_t l_check_sync_packet_size = (CP0_REGS_COUNT * 4) + 5;
 
 //UDP packet formats
@@ -82,86 +194,71 @@ static const int32_t l_check_sync_packet_size = (CP0_REGS_COUNT * 4) + 5;
 #define TCP_REGISTER_PLAYER 5
 #define TCP_GET_REGISTRATION 6
 #define TCP_DISCONNECT_NOTICE 7
-
-struct __UDPSocket {
-    int ready;
-    int channel;
-};
+/* Joey64 (2026-11-10): [0x40, the ROM's MD5 as 32 hex characters]; the room answers 2 when it is the host's
+ * ROM, 1 when not. The host's own (it joins from this device, 127.0.0.1) is the one the others must have. */
+#define TCP_JOEY_ROM_CHECK 0x40
 
 #define CS4 32
 
 m64p_error netplay_start(const char* host, int port)
 {
-    if (SDLNet_Init() < 0)
+    struct addrinfo hints, *res = NULL;
+    char portstr[16];
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || res == NULL)
     {
-        log_cb(RETRO_LOG_INFO, "Netplay: Could not initialize SDL Net library\n");
+        log_cb(RETRO_LOG_ERROR, "Netplay: could not resolve %s\n", host);
         return M64ERR_SYSTEM_FAIL;
     }
-
-    l_udpSocket = SDLNet_UDP_Open(0);
-    if (l_udpSocket == NULL)
+    np_udp = socket(res->ai_family, SOCK_DGRAM, 0);
+    if (np_udp < 0 || connect(np_udp, res->ai_addr, res->ai_addrlen) != 0)
     {
-        log_cb(RETRO_LOG_INFO, "Netplay: UDP socket creation failed\n");
+        log_cb(RETRO_LOG_ERROR, "Netplay: UDP socket to %s:%d failed\n", host, port);
+        if (np_udp >= 0) close(np_udp);
+        np_udp = -1;
+        freeaddrinfo(res);
         return M64ERR_SYSTEM_FAIL;
     }
-
-#if !defined(WIN32)
-    const char tos_local = CS4 << 2;
-    struct __UDPSocket* socket = (struct __UDPSocket*) l_udpSocket;
-    setsockopt(socket->channel, IPPROTO_IP, IP_TOS, &tos_local, sizeof(tos_local));
-#endif
-
-    IPaddress dest;
-    SDLNet_ResolveHost(&dest, host, port);
-
-    l_udpChannel = SDLNet_UDP_Bind(l_udpSocket, -1, &dest);
-    if (l_udpChannel < 0)
     {
-        log_cb(RETRO_LOG_INFO, "Netplay: could not bind to UDP socket\n");
-        SDLNet_UDP_Close(l_udpSocket);
-        l_udpSocket = NULL;
+        const int tos_local = CS4 << 2;
+        setsockopt(np_udp, IPPROTO_IP, IP_TOS, &tos_local, sizeof(tos_local));
+    }
+    np_tcp = socket(res->ai_family, SOCK_STREAM, 0);
+    if (np_tcp < 0 || connect(np_tcp, res->ai_addr, res->ai_addrlen) != 0)
+    {
+        log_cb(RETRO_LOG_ERROR, "Netplay: TCP connection to %s:%d failed\n", host, port);
+        if (np_tcp >= 0) close(np_tcp);
+        close(np_udp);
+        np_tcp = np_udp = -1;
+        freeaddrinfo(res);
         return M64ERR_SYSTEM_FAIL;
     }
-
-    l_tcpSocket = SDLNet_TCP_Open(&dest);
-    if (l_tcpSocket == NULL)
     {
-        log_cb(RETRO_LOG_INFO, "Netplay: could not bind to TCP socket\n");
-        SDLNet_UDP_Close(l_udpSocket);
-        l_udpSocket = NULL;
-        return M64ERR_SYSTEM_FAIL;
+        const int one = 1;
+        setsockopt(np_tcp, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     }
-
-    l_request_input_packet = SDLNet_AllocPacket(12);
-    l_send_input_packet = SDLNet_AllocPacket(11);
-    l_process_packet = SDLNet_AllocPacket(512);
-    l_check_sync_packet = SDLNet_AllocPacket(l_check_sync_packet_size);
-    if (l_request_input_packet == NULL ||
-        l_send_input_packet == NULL ||
-        l_process_packet == NULL ||
-        l_check_sync_packet == NULL)
-    {
-        DebugMessage(M64MSG_ERROR, "Netplay: could not allocate UDP packets");
-        SDLNet_UDP_Close(l_udpSocket);
-        l_udpSocket = NULL;
-        SDLNet_TCP_Close(l_tcpSocket);
-        l_tcpSocket = NULL;
-        SDLNet_FreePacket(l_request_input_packet);
-        l_request_input_packet = NULL;
-        SDLNet_FreePacket(l_send_input_packet);
-        l_send_input_packet = NULL;
-        SDLNet_FreePacket(l_process_packet);
-        l_process_packet = NULL;
-        SDLNet_FreePacket(l_check_sync_packet);
-        l_check_sync_packet = NULL;
-        return M64ERR_NO_MEMORY;
-    }
+    freeaddrinfo(res);
+    l_udpSocket = np_udp;
+    l_tcpSocket = np_tcp;
+    l_udpChannel = 0;
+    memset(l_packets, 0, sizeof(l_packets));
+    l_request_input_packet = &l_packets[0];
+    l_send_input_packet = &l_packets[1];
+    l_process_packet = &l_packets[2];
+    l_check_sync_packet = &l_packets[3];
+    log_cb(RETRO_LOG_INFO, "Netplay: connected to %s:%d\n", host, port);
 
     for (int i = 0; i < 4; ++i)
     {
         l_netplay_control[i] = -1;
         l_plugin[i] = 0;
         l_player_lag[i] = 0;
+        l_sent_n[i] = 0;
+        l_sent_pos[i] = 0;
+        memset(&l_ns, 0, sizeof l_ns);
     }
 
     l_canFF = 0;
@@ -177,7 +274,7 @@ m64p_error netplay_start(const char* host, int port)
 
 m64p_error netplay_stop()
 {
-    if (l_udpSocket == NULL)
+    if (l_udpSocket < 0)
         return M64ERR_INVALID_STATE;
     else
     {
@@ -201,24 +298,18 @@ m64p_error netplay_stop()
         SDLNet_Write32(l_reg_id, &output_data[1]);
         SDLNet_TCP_Send(l_tcpSocket, &output_data[0], 5);
 
-        SDLNet_UDP_Unbind(l_udpSocket, l_udpChannel);
-        SDLNet_UDP_Close(l_udpSocket);
-        SDLNet_TCP_Close(l_tcpSocket);
-        l_tcpSocket = NULL;
-        l_udpSocket = NULL;
+        close(np_udp);
+        close(np_tcp);
+        np_udp = np_tcp = -1;
+        l_tcpSocket = -1;
+        l_udpSocket = -1;
         l_udpChannel = -1;
-
-        SDLNet_FreePacket(l_request_input_packet);
-        SDLNet_FreePacket(l_send_input_packet);
-        SDLNet_FreePacket(l_process_packet);
-        SDLNet_FreePacket(l_check_sync_packet);
         l_request_input_packet = NULL;
         l_send_input_packet = NULL;
         l_process_packet = NULL;
         l_check_sync_packet = NULL;
-    
+
         l_netplay_is_init = 0;
-        SDLNet_Quit();
         return M64ERR_SUCCESS;
     }
 }
@@ -241,7 +332,7 @@ static uint8_t buffer_size(uint8_t control_id)
     return counter;
 }
 
-static int netplay_packet_has_data(const UDPpacket* packet, size_t offset, size_t size)
+static int netplay_packet_has_data(const np_packet* packet, size_t offset, size_t size)
 {
     return packet->len >= 0 && offset <= (size_t) packet->len
         && size <= (size_t) packet->len - offset;
@@ -269,6 +360,8 @@ static void netplay_request_input(uint8_t control_id)
     l_request_input_packet->data[11] = buffer_size(control_id); //our local buffer size
     l_request_input_packet->len = 12;
     SDLNet_UDP_Send(l_udpSocket, l_udpChannel, l_request_input_packet);
+    if (!l_ns.req_at[control_id]) l_ns.req_at[control_id] = np_us();
+    ++l_ns.sent_req;
 }
 
 static int check_valid(uint8_t control_id, uint32_t count)
@@ -284,27 +377,6 @@ static int check_valid(uint8_t control_id, uint32_t count)
     return 0;
 }
 
-static int netplay_require_response(void* opaque)
-{
-    //This function runs inside a thread.
-    //It runs if our local buffer size is 0 (we need to execute a key event, but we don't have the data we need).
-    //We basically beg the server for input data.
-    //After 10 seconds a timeout occurs, we assume we have lost connection to the server.
-    uint8_t control_id = *(uint8_t*)opaque;
-    uint32_t timeout = SDL_GetTicks() + 10000;
-    while (!check_valid(control_id, l_cin_compats[control_id].netplay_count))
-    {
-        if (SDL_GetTicks() > timeout)
-        {
-            l_udpChannel = -1;
-            return 0;
-        }
-        netplay_request_input(control_id);
-        SDL_Delay(5);
-    }
-    return 1;
-}
-
 static void netplay_process()
 {
     //In this function we process data we have received from the server
@@ -312,6 +384,7 @@ static void netplay_process()
     uint8_t plugin, player, current_status;
     while (SDLNet_UDP_Recv(l_udpSocket, l_process_packet) == 1)
     {
+        l_last_heard = np_ticks();
         if (!netplay_packet_has_data(l_process_packet, 0, 5))
         {
             DebugMessage(M64MSG_ERROR, "Netplay: received truncated message from server");
@@ -337,8 +410,18 @@ static void netplay_process()
                 //current_status is a status update from the server
                 //it will let us know if another player has disconnected, or the games have desynced
                 current_status = l_process_packet->data[2];
+                ++l_ns.packets;
                 if (l_process_packet->data[0] == UDP_RECEIVE_KEY_INFO)
+                {
                     l_player_lag[player] = l_process_packet->data[3];
+                    if (l_ns.req_at[player])
+                    {
+                        uint64_t rtt = np_us() - l_ns.req_at[player];
+                        l_ns.rtt_sum += rtt; ++l_ns.rtt_n;
+                        if (rtt > l_ns.rtt_max) l_ns.rtt_max = rtt;
+                        l_ns.req_at[player] = 0;
+                    }
+                }
                 if (current_status != l_status)
                 {
                     if (((current_status & 0x1) ^ (l_status & 0x1)) != 0)
@@ -347,6 +430,15 @@ static void netplay_process()
                     {
                         if (((current_status & (0x1 << dis)) ^ (l_status & (0x1 << dis))) != 0)
                             log_cb(RETRO_LOG_INFO, "Netplay: player %u has disconnected\n", dis);
+                    }
+                    //Joey64 (2026-11-10): Joey64's room puts the paused player (1-4, 0 = none) in bits 5-7;
+                    //other servers leave them 0. The app shows who paused from these lines.
+                    if (((current_status ^ l_status) & 0xE0) != 0)
+                    {
+                        if (current_status >> 5)
+                            log_cb(RETRO_LOG_INFO, "Netplay: player %u paused\n", current_status >> 5);
+                        else
+                            log_cb(RETRO_LOG_INFO, "Netplay: nobody is paused\n");
                     }
                     l_status = current_status;
                 }
@@ -360,6 +452,7 @@ static void netplay_process()
 
                     if (((count - l_cin_compats[player].netplay_count) > (UINT32_MAX / 2)) || (check_valid(player, count))) //event doesn't need to be recorded
                     {
+                        ++l_ns.dup;
                         curr += 5;
                         continue;
                     }
@@ -383,6 +476,7 @@ static void netplay_process()
                         break;
                     }
                     new_event->count = count;
+                    ++l_ns.heard;
                     new_event->buttons = keys;
                     new_event->plugin = plugin;
                     new_event->next = l_cin_compats[player].event_first;
@@ -396,6 +490,8 @@ static void netplay_process()
     }
 }
 
+static void netplay_resend_inputs(void);
+
 static int netplay_ensure_valid(uint8_t control_id)
 {
     //This function makes sure we have data for a certain event
@@ -406,13 +502,45 @@ static int netplay_ensure_valid(uint8_t control_id)
     if (l_udpChannel == -1)
         return 0;
 
-    SDL_Thread* thread = SDL_CreateThread(netplay_require_response, "Netplay key request", &control_id);
-
-    while (!check_valid(control_id, l_cin_compats[control_id].netplay_count) && l_udpChannel != -1)
+    //We need this event's input and don't have it: ask the server every 5 ms while reading what it sends.
+    //Joey64 (2026-11-10): the connection counts as lost only when the server has sent nothing for 10 s (or its TCP
+    //connection closed). While it still answers, the input is late because that player is paused or slow (a pause
+    //menu, a call, the screen off), so we keep waiting: before, 10 s of any wait dropped every other player.
+    const uint32_t start = np_ticks();
+    uint32_t asked = start;
+    int said = 0;
+    l_last_heard = start;
+    while (!check_valid(control_id, l_cin_compats[control_id].netplay_count))
+    {
+        const uint32_t now = np_ticks();
+        if (l_udpChannel == -1 || now - l_last_heard > 10000)
+        {
+            l_udpChannel = -1;
+            return 0;
+        }
+        if (!said && now - start > 1000)
+        {
+            log_cb(RETRO_LOG_INFO, "Netplay: waiting for player %u\n", control_id + 1);
+            said = 1;
+        }
+        if (now - asked >= 5)
+        {
+            netplay_resend_inputs();
+            netplay_request_input(control_id);
+            asked = now;
+        }
+        struct pollfd pfd = { np_udp, POLLIN, 0 };
+        poll(&pfd, 1, 1);
         netplay_process();
-    int success;
-    SDL_WaitThread(thread, &success);
-    return success;
+    }
+    if (said)
+        log_cb(RETRO_LOG_INFO, "Netplay: player %u is back after %u ms\n", control_id + 1, np_ticks() - start);
+    {
+        uint32_t waited = np_ticks() - start;
+        ++l_ns.waits; l_ns.wait_ms += waited;
+        if (waited > l_ns.wait_max) l_ns.wait_max = waited;
+    }
+    return 1;
 }
 
 static void netplay_delete_event(struct netplay_event* current, uint8_t control_id)
@@ -433,10 +561,29 @@ static void netplay_delete_event(struct netplay_event* current, uint8_t control_
     free(current);
 }
 
+static void netplay_log_stats(void)
+{
+    uint32_t now = np_ticks();
+    if (!l_ns.since) { l_ns.since = now; return; }
+    if (now - l_ns.since < 5000) return;
+    //(no round trip here: we read replies once a frame, so it would time the game loop; the app pings the room itself)
+    log_cb(RETRO_LOG_INFO, "Netplay: net: %u waits for input (%u ms, worst %u ms), "
+           "%u inputs heard, %u copies, %u requests, %u packets in %.1f s, lag %u/%u/%u/%u\n",
+           l_ns.waits, l_ns.wait_ms, l_ns.wait_max, l_ns.heard, l_ns.dup, l_ns.sent_req, l_ns.packets,
+           (now - l_ns.since) / 1000.0, l_player_lag[0], l_player_lag[1], l_player_lag[2], l_player_lag[3]);
+    uint64_t keep[4];
+    memcpy(keep, l_ns.req_at, sizeof keep);
+    memset(&l_ns, 0, sizeof l_ns);
+    memcpy(l_ns.req_at, keep, sizeof keep);
+    l_ns.since = now;
+}
+
 static uint32_t netplay_get_input(uint8_t control_id)
 {
     uint32_t keys;
     struct retro_fastforwarding_override ff_override;
+
+    netplay_log_stats();
 
     netplay_process();
     netplay_request_input(control_id);
@@ -490,15 +637,78 @@ static uint32_t netplay_get_input(uint8_t control_id)
     return keys;
 }
 
-static void netplay_send_input(uint8_t control_id, uint32_t keys)
+//Joey64 (2026-11-10): each input went out once, so one UDP packet lost on Wi-Fi left every player waiting
+//for it until the connection counted as lost. Our last NP_RESEND inputs are kept and sent again: the one
+//before with each new one, and all of them while we wait for input (servers keep the first copy of a count).
+
+static void np_send_key(uint8_t control_id, uint32_t count, uint32_t keys, uint8_t plugin)
 {
     l_send_input_packet->data[0] = UDP_SEND_KEY_INFO;
     l_send_input_packet->data[1] = control_id; //player number
-    SDLNet_Write32(l_cin_compats[control_id].netplay_count, &l_send_input_packet->data[2]); // current event count
+    SDLNet_Write32(count, &l_send_input_packet->data[2]); // event count
     SDLNet_Write32(keys, &l_send_input_packet->data[6]); //key data
-    l_send_input_packet->data[10] = l_plugin[control_id]; //current plugin
+    l_send_input_packet->data[10] = plugin; //current plugin
     l_send_input_packet->len = 11;
     SDLNet_UDP_Send(l_udpSocket, l_udpChannel, l_send_input_packet);
+}
+
+static void netplay_resend_inputs(void)
+{
+    //all of a player's kept inputs in one packet (a Joey64 room; the join's ROM check made sure it is one)
+    for (uint8_t id = 0; id < 4; ++id)
+    {
+        if (!l_sent_n[id])
+            continue;
+        uint8_t *d = l_send_input_packet->data;
+        d[0] = UDP_JOEY_KEY_BATCH;
+        d[1] = id;
+        d[2] = l_sent_n[id];
+        int k = 3;
+        for (uint8_t i = 0; i < l_sent_n[id]; ++i)
+        {
+            SDLNet_Write32(l_sent[id][i].count, &d[k]);
+            SDLNet_Write32(l_sent[id][i].keys, &d[k + 4]);
+            d[k + 8] = l_sent[id][i].plugin;
+            k += 9;
+        }
+        l_send_input_packet->len = k;
+        SDLNet_UDP_Send(l_udpSocket, l_udpChannel, l_send_input_packet);
+    }
+}
+
+static void netplay_send_input(uint8_t control_id, uint32_t keys)
+{
+    uint8_t pos = l_sent_pos[control_id];
+    l_sent[control_id][pos].count = l_cin_compats[control_id].netplay_count;
+    l_sent[control_id][pos].keys = keys;
+    l_sent[control_id][pos].plugin = l_plugin[control_id];
+    l_sent_pos[control_id] = (uint8_t)((pos + 1) % NP_RESEND);
+    if (l_sent_n[control_id] < NP_RESEND) ++l_sent_n[control_id];
+    np_send_key(control_id, l_cin_compats[control_id].netplay_count, keys, l_plugin[control_id]);
+    if (l_sent_n[control_id] > 1)
+    {
+        uint8_t prev = (uint8_t)((pos + NP_RESEND - 1) % NP_RESEND);
+        np_send_key(control_id, l_sent[control_id][prev].count, l_sent[control_id][prev].keys, l_sent[control_id][prev].plugin);
+    }
+}
+
+/* 1 = the host's ROM, 0 = another one, -1 = no answer (the room closed the connection: not a Joey64 room) */
+int netplay_check_rom(const char *md5)
+{
+    char out[33];
+    uint8_t answer = 0;
+    out[0] = TCP_JOEY_ROM_CHECK;
+    for (int i = 0; i < 32; i++)
+    {
+        char ch = md5 && md5[i] ? md5[i] : '0';
+        out[1 + i] = (ch >= 'a' && ch <= 'f') ? (char)(ch - 'a' + 'A') : ch;
+        if (md5 && !md5[i]) md5 = NULL;
+    }
+    SDLNet_TCP_Send(l_tcpSocket, out, 33);
+    SDLNet_TCP_Recv(l_tcpSocket, &answer, 1);
+    log_cb(RETRO_LOG_INFO, "Netplay: ROM check %.32s: %s\n", out + 1,
+           answer == 2 ? "same as the host's" : answer == 1 ? "not the host's" : "no answer");
+    return answer == 2 ? 1 : answer == 1 ? 0 : -1;
 }
 
 uint8_t netplay_register_player(uint8_t player, uint8_t plugin, uint8_t rawdata, uint32_t reg_id)
