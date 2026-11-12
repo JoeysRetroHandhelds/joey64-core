@@ -9670,7 +9670,10 @@ static int new_recompile_block_impl(int addr)
   else {
     //DebugMessage(M64MSG_VERBOSE, "Compile at bogus memory address: %x ", (int)addr);
     DebugMessage(M64MSG_ERROR, "Compile at bogus memory address: %x", (int)addr);
-    exit(1);
+    /* Joey64 (README Full-run fixes (b)/(e), 2026-11-12): exit(1) here closed the whole app (Featherlight v1.1, the 64DD
+     * modem cart). Handled as an unmapped page instead: the caller raises the TLB exception, and the frontend, which
+     * sees this line, ends the game with its Problem screen. */
+    return 1;
   }
 #if NEW_DYNAREC == NEW_DYNAREC_ARM64
   if (drc_in_worker_async) source = drc_snap; /* N64_DRC_THREAD: the snapshot taken when it was queued (RDRAM only) */
