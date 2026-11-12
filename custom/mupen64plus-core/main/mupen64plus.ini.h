@@ -18356,6 +18356,7 @@ char inifile[] =
 "\n"
 "[9F797A9C704B5EBD04D6A2B036309AF2]\n"
 "GoodName=Nihon Pro Golf Tour 64 (J)\n"
+"CountPerOp=1\n"
 "\n"
 "[E8EB810D996E12CD6C47445F87A94C72]\n"
 "GoodName=Kyojin no Doshin 1 (J)\n"
