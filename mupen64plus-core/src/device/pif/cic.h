@@ -22,6 +22,8 @@
 #ifndef M64P_DEVICE_SI_CIC_H
 #define M64P_DEVICE_SI_CIC_H
 
+#include <stddef.h>
+
 enum cic_version
 {
     CIC_X101,
@@ -44,5 +46,9 @@ struct cic
 };
 
 void init_cic_using_ipl3(struct cic* cic, const void* ipl3);
+
+/* Joey64: when the boot code's checksum of ROM 0x1000-0x101000 differs from the header's CRC1/CRC2, write the computed
+ * one into the loaded ROM's header (rom: the cartridge ROM as the core keeps it, 32-bit words; size in bytes). */
+void fix_boot_checksum(void* rom, size_t size);
 
 #endif

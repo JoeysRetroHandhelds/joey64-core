@@ -321,6 +321,10 @@ void init_device(struct device* dev,
         ? MM_DD_ROM
         : MM_CART_ROM;
 
+    /* Joey64: dumps whose header CRCs don't match their code (Wii VC copies) boot with the computed ones (cic.c). */
+    if (rom_base == MM_CART_ROM && rom_size > 0)
+        fix_boot_checksum(mem_base_u32(base, MM_CART_ROM), rom_size);
+
     init_pif(&dev->pif,
         (uint8_t*)mem_base_u32(base, MM_PIF_MEM),
         jbds, ijbds,
