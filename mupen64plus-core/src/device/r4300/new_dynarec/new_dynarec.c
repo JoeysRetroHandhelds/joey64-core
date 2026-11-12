@@ -9702,6 +9702,9 @@ static int new_recompile_block_impl(int addr)
     bt[i]=0;likely[i]=0;ooo[i]=0;op2=0;
     minimum_free_regs[i]=0;
     opcode[i]=op=source[i]>>26;
+    /* Joey64 (2026-11-12): 0x7C000000, a Wii Virtual Console hook word (reserved on an R4300), runs as a NOP: its other
+     * fields are all zero, so as opcode 0 it decodes as SLL r0,r0,0 (see r4300_get_idec). */
+    if(source[i]==0x7C000000) opcode[i]=op=0;
     switch(op)
     {
       case 0x00: assem_strcpy(insn[i],"special"); type=NI;

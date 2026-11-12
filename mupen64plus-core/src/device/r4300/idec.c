@@ -539,8 +539,10 @@ static const struct r4300_op_escape r4300_escapes_table[] = {
 const struct r4300_idec* r4300_get_idec(uint32_t iw) {
 	const struct r4300_op_escape* escape;
 
-	/* handle NOP pseudo instruction */
-	if (iw == 0) {
+	/* handle NOP pseudo instruction. 0x7C000000 too (Joey64, 2026-11-12): Wii Virtual Console dumps carry it as a hook
+	 * for the Wii's own emulator (Mario Tennis VC inserts it before its boot jump); on an R4300 it is a reserved opcode,
+	 * whose exception hangs them before their first frame. */
+	if (iw == 0 || iw == UINT32_C(0x7C000000)) {
 		return &r4300_op_table[336];
 	}
 
