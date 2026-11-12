@@ -2311,7 +2311,7 @@ extern int g_at_frame_edge;
 keeps outside the core's state (its registers) and the task flags go into ra_side, which the next such load puts
 back. Before, those frames went without run-ahead (about 5% in SM64: a repeated picture, then a jump). Every
 run-ahead state carries them, so the extra frames' RSP register changes don't stay either. N64_RA_RSP=0: the old
-way (no state while a task runs). */
+way (no state while a task runs); on parallel-RDP no run-ahead state at all (ra_rdp_unprotected). */
 #ifdef HAVE_PARALLEL_RSP
 size_t parallel_rsp_state_size(void);
 void parallel_rsp_state_save(void *out);
@@ -2338,6 +2338,24 @@ static bool ra_same_instance(void)
    }
    return on && current_rsp_type == RSP_PLUGIN_PARALLEL
        && environ_cb(RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT, &ctx) && ctx == RETRO_SAVESTATE_CONTEXT_RUNAHEAD_SAME_INSTANCE;
+}
+
+/* audit 3 part 6b L4 (2026-11-11): a run-ahead state on parallel-RDP needs the RDP wait (savestates_rdp_settle) and
+ * the RDP's own state kept and put back (parallel_ra_state), and both come with ra_same_instance: parallel-RSP,
+ * N64_RA_RSP not 0, and its state fitting ra_side.rsp. Without them the extra frames' late GPU copy-back and the RDP
+ * registers, TMEM and noise seed they changed would stay in the real frame, so retro_serialize takes no run-ahead
+ * state then: the frontend runs that frame without run-ahead, as with an RSP task running. The app always pairs
+ * parallel-RDP with parallel-RSP; this is for N64_RA_RSP=0 and a parallel-RSP state that outgrows ra_side.rsp. */
+static bool ra_rdp_unprotected(void)
+{
+#if !defined(_WIN32)
+   int ctx = 0;
+   if (current_rdp_type != RDP_PLUGIN_PARALLEL || ra_same_instance())
+      return false;
+   return environ_cb(RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT, &ctx) && ctx == RETRO_SAVESTATE_CONTEXT_RUNAHEAD_SAME_INSTANCE;
+#else
+   return false;
+#endif
 }
 
 /* The HLE audio lists' state (hle_ra_state_*), for any RSP: HLE audio under parallel-RSP, and the HLE RSP that
@@ -2404,6 +2422,14 @@ bool retro_serialize(void *data, size_t size)
    /* both ways below write the whole state into data (audit 3 L3: a guard, the host always passes this size) */
    if (!data || size < retro_serialize_size())
       return false;
+   if (ra_rdp_unprotected())
+   {
+      static int logged;
+      if (!logged++)
+         log_cb(RETRO_LOG_WARN, CORE_NAME ": no run-ahead states on parallel-RDP without parallel-RSP's run-ahead state (RSP plugin %d, N64_RA_RSP, its state %u bytes for %u)\n",
+                (int)current_rsp_type, (unsigned)parallel_rsp_state_size(), (unsigned)sizeof(ra_side.rsp));
+      return false;
+   }
 
    if (state_direct(0))
    {

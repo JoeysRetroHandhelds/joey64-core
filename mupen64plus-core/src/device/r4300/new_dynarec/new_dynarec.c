@@ -261,6 +261,24 @@ static void ensure_dynarec_cache_alignment(void)
 #define MAXBLOCK 4096
 #define MAX_OUTPUT_BLOCK_SIZE 262144
 #define DRC_WRAP_MARGIN (2*1024*1024) /* Joey64: see the wrap in new_recompile_block */
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+/* Joey64 (audit 3 part 6b L3, 2026-11-11): a block's code stays under DRC_BLOCK_LIMIT. Over 1 MB its conditional
+ * branches and adr (+/-1 MB on arm64, the range asserts are compiled out) would be encoded wrong, and over
+ * DRC_WRAP_MARGIN it would write over the jump table at the cache's end. A block that would pass it is thrown away
+ * before pass 9 (drc_drop_big) and compiled again with fewer instructions (drc_cap). Pass 9 adds at most
+ * DRC_LINK_MAX a link (b + movz/movk/adr/b, 20 bytes) and DRC_ENTRY_MAX an entry point (dirty stub, 58 register
+ * loads, literal: about 520 bytes). The biggest block seen was 606 KB (4096 instructions). */
+#define DRC_BLOCK_LIMIT (1024*1024 - 65536)
+#define DRC_LINK_MAX 64
+#define DRC_ENTRY_MAX 1024
+#define DRC_TOO_BIG 0x7778
+static int drc_cap = MAXBLOCK, drc_big_slen, drc_nocheck;
+static unsigned drc_stat_big;
+/* list entries added in pass 8 (pagespan_ds, pagespan_assemble's links), so a dropped block can take them out */
+static __thread int drc_rec, drc_rec_n;
+static __thread struct ll_entry **drc_rec_list[8];
+static __thread struct ll_entry *drc_rec_entry[8];
+#endif
 #define CLOCK_DIVIDER g_dev.r4300.cp0.count_per_op
 
 struct regstat
@@ -2533,6 +2551,12 @@ static struct ll_entry *ll_add_32(struct ll_entry **head,int vaddr,u_int reg32,v
   new_entry->length=length;
   new_entry->next=*head;
   *head=new_entry;
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  if (drc_rec) { /* pass 8 (see drc_drop_big); more than 8 can't happen, and then nothing is dropped */
+    if (drc_rec_n < 8) { drc_rec_list[drc_rec_n] = head; drc_rec_entry[drc_rec_n] = new_entry; }
+    drc_rec_n++;
+  }
+#endif
   return new_entry;
 }
 
@@ -3051,6 +3075,13 @@ static int blk_n, blk_on = -1, blk_rr;
 static char blk_path[512];
 static double blk_last_poll, blk_last_save;
 static unsigned blk_loaded, blk_queued, blk_saves;
+/* The file is written only when the list grew (blk_saved_n: blk_n the file holds), and on a writer thread, so the
+ * emulation thread only puts the text together (audit 3 part 6b L2: every 10 s it wrote the whole file inside a frame,
+ * changed or not). blk_wr_* belong to the emulation thread except blk_wr_busy (atomic) and blk_wr_ok (read after the
+ * join). */
+static int blk_saved_n;
+static pthread_t blk_wr_th;
+static int blk_wr_started, blk_wr_busy, blk_wr_ok;
 
 /* Joey64 (2026-11-11): never a block in RDRAM's first 4 KB page (the exception vectors and the boot code libultra puts
  * after them). Cruis'n USA on the Flip looped on a black screen whenever its list held one there and it was compiled
@@ -3100,6 +3131,7 @@ static void blk_init(void)
       if (drc_in_rdram(a) && !blk_page0(a) && l >= 4 && l <= MAXBLOCK * 4 && blk_find(a, s, 1, l, 0) >= 0) blk_loaded++;
     fclose(f);
   }
+  blk_saved_n = blk_n; /* the file already holds these */
   blk_last_poll = blk_last_save = drc_ms();
   blk_on = 1;
   DebugMessage(M64MSG_INFO, "dynarec: block list %s: %u blocks to compile early when their code is in RAM", blk_path, blk_loaded);
@@ -3118,15 +3150,64 @@ static void blk_collect(void)
   }
 }
 
-static void blk_save(void)
+/* The list as the file's text: one "address length checksum" line per block (at most 27 characters each). */
+static char *blk_text(size_t *len)
+{
+  size_t cap = (size_t)blk_n * 27 + 1, n = 0;
+  char *s = (char *)malloc(cap);
+  int i;
+  if (!s) return NULL;
+  s[0] = 0;
+  for (i = 0; i < blk_n; i++)
+    n += (size_t)snprintf(s + n, cap - n, "%x %x %x\n", blk_tab[i].vaddr, blk_tab[i].len, blk_tab[i].sum);
+  *len = n;
+  return s;
+}
+
+/* <file>.part, then renamed over the file. blk_path doesn't change while a writer runs (blk_end joins it first). */
+static int blk_write_file(const char *text, size_t len)
 {
   char tmp[520];
-  int i;
   snprintf(tmp, sizeof(tmp), "%s.part", blk_path);
   FILE *f = fopen(tmp, "w");
-  if (!f) return;
-  for (i = 0; i < blk_n; i++) fprintf(f, "%x %x %x\n", blk_tab[i].vaddr, blk_tab[i].len, blk_tab[i].sum);
-  if (fclose(f) == 0 && rename(tmp, blk_path) == 0) blk_saves++;
+  if (!f) return 0;
+  size_t w = fwrite(text, 1, len, f);
+  if (fclose(f) != 0 || w != len) { remove(tmp); return 0; }
+  if (rename(tmp, blk_path) != 0) return 0;
+  __atomic_add_fetch(&blk_saves, 1, __ATOMIC_RELAXED);
+  return 1;
+}
+
+static void *blk_writer(void *arg)
+{
+  char *text = (char *)arg;
+  blk_wr_ok = blk_write_file(text, strlen(text));
+  free(text);
+  __atomic_store_n(&blk_wr_busy, 0, __ATOMIC_RELEASE);
+  return NULL;
+}
+
+/* Writes the list if it grew since the last write: on a writer thread, or here at the end (wait) or when no thread
+ * starts. A writer still busy from last time: this time is skipped. */
+static void blk_save(int wait)
+{
+  if (blk_wr_started && (wait || !__atomic_load_n(&blk_wr_busy, __ATOMIC_ACQUIRE))) {
+    pthread_join(blk_wr_th, NULL);
+    blk_wr_started = 0;
+    if (!blk_wr_ok) blk_saved_n = -1; /* that write failed: write again */
+  }
+  if (blk_wr_started || blk_n == blk_saved_n) return;
+  size_t len;
+  char *text = blk_text(&len);
+  if (!text) return;
+  blk_saved_n = blk_n;
+  if (!wait) {
+    __atomic_store_n(&blk_wr_busy, 1, __ATOMIC_RELAXED);
+    if (pthread_create(&blk_wr_th, NULL, blk_writer, text) == 0) { blk_wr_started = 1; return; }
+    __atomic_store_n(&blk_wr_busy, 0, __ATOMIC_RELAXED);
+  }
+  if (!blk_write_file(text, len)) blk_saved_n = -1;
+  free(text);
 }
 
 /* Once a frame (VI interrupt, between blocks): up to 512 listed blocks checked against RAM, the matching ones queued.
@@ -3140,8 +3221,10 @@ void new_dynarec_blocklist_tick(void)
   if (blk_on <= 0) return;
   double now = drc_ms();
   if (now - blk_last_save > 10000) {
-    blk_collect(); blk_save(); blk_last_save = now;
-    DebugMessage(M64MSG_INFO, "dynarec: block list: %d blocks known (%u from the file), %u queued early so far", blk_n, blk_loaded, blk_queued);
+    int before = blk_saved_n;
+    blk_collect(); blk_save(0); blk_last_save = now;
+    if (blk_saved_n != before)
+      DebugMessage(M64MSG_INFO, "dynarec: block list: %d blocks known (%u from the file), %u queued early so far", blk_n, blk_loaded, blk_queued);
   }
   int checked, queued = 0;
   for (checked = 0; checked < 512 && blk_n > 0 && queued < 8 && ((drc_qt - drc_qh) & 4095) < 4; checked++) {
@@ -3150,7 +3233,8 @@ void new_dynarec_blocklist_tick(void)
     if (b->done) continue;
     u_int off = b->vaddr & 0x7FFFFF;
     if (off + b->len > 0x800000) { b->done = 1; continue; }
-    if (blk_sum((const u_int *)((uintptr_t)g_dev.rdram.dram + off), b->len) != b->sum) continue;
+    /* through the mapping smart sync never locks (audit 3 part 6b L1): a locked page here made the CPU wait for the GPU */
+    if (blk_sum((const u_int *)((const u_char *)drc_rdram_ro() + off), b->len) != b->sum) continue;
     unsigned char *q = &drc_queued[((b->vaddr >> 2) ^ (b->vaddr >> 18)) & 0xFFFF];
     if (*q) continue;
     if (((drc_qt + 1) & 4095) == drc_qh) break; /* queue full: next frame */
@@ -3166,8 +3250,9 @@ void new_dynarec_blocklist_tick(void)
 static void blk_end(void)
 {
   if (blk_on > 0) {
-    blk_collect(); blk_save();
-    DebugMessage(M64MSG_INFO, "dynarec: block list: %d blocks saved to %s, %u were queued early", blk_n, blk_path, blk_queued);
+    blk_collect(); blk_save(1); /* waits for a writer still running first */
+    DebugMessage(M64MSG_INFO, "dynarec: block list: %d blocks in %s (%u writes), %u were queued early", blk_n, blk_path,
+      __atomic_load_n(&blk_saves, __ATOMIC_RELAXED), blk_queued);
   }
   free(blk_tab); free(blk_hash); blk_tab = NULL; blk_hash = NULL; blk_n = 0;
   blk_on = -1;
@@ -9615,7 +9700,70 @@ int new_recompile_block_worker(int addr)
   return new_recompile_block_impl(addr);
 }
 
+static int new_recompile_block_once(int addr);
+
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+/* Joey64 (audit 3 part 6b L3): would the block's code, with what pass 9 adds for its links and entry points, pass
+ * DRC_BLOCK_LIMIT? */
+static uintptr_t drc_block_limit(void)
+{
+  static uintptr_t lim;
+  if (!lim) { /* dev: N64_DRC_BLOCK_LIMIT=<KB> lowers it (never raises it), to try the drop and retry on real games */
+    const char *e = getenv("N64_DRC_BLOCK_LIMIT");
+    long kb = e ? atol(e) : 0;
+    lim = kb >= 4 && (uintptr_t)kb * 1024 < DRC_BLOCK_LIMIT ? (uintptr_t)kb * 1024 : DRC_BLOCK_LIMIT;
+  }
+  return lim;
+}
+
+static int drc_block_over(uintptr_t begin, int links, int entries)
+{
+  if (drc_nocheck || drc_rec_n > 8) return 0;
+  return (uintptr_t)out - begin + (uintptr_t)links * DRC_LINK_MAX + (uintptr_t)entries * DRC_ENTRY_MAX > drc_block_limit();
+}
+
+/* Throws the block away before pass 9 links it anywhere: the list entries pass 8 added come out again, out goes back,
+ * and new_recompile_block_impl compiles it again with fewer instructions. */
+static int drc_drop_big(uintptr_t begin)
+{
+  int k;
+  for (k = drc_rec_n - 1; k >= 0; k--) {
+    struct ll_entry **p = drc_rec_list[k];
+    while (*p && *p != drc_rec_entry[k]) p = &(*p)->next;
+    if (*p) { *p = drc_rec_entry[k]->next; free(drc_rec_entry[k]); }
+  }
+  drc_rec = drc_rec_n = 0;
+  if (drc_stat_big++ < 8)
+    DebugMessage(M64MSG_WARNING, "dynarec: block %x (%d instructions) would pass %d KB of code: compiled again as a shorter block",
+      start, slen, (int)(drc_block_limit() / 1024));
+  out = (u_char *)begin;
+  literalcount = 0; /* only dirty stubs add literals, and before pass 9 only pagespan_ds's, whose code is gone */
+  free(copy); copy = NULL; copy_size -= slen*4+4;
+  drc_big_slen = slen;
+  return DRC_TOO_BIG;
+}
+#endif
+
 static int new_recompile_block_impl(int addr)
+{
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  /* a block that came out too big: again with half its instructions until it fits (2 can't be too big) */
+  int r;
+  drc_cap = MAXBLOCK; drc_nocheck = 0; drc_rec = drc_rec_n = 0;
+  r = new_recompile_block_once(addr);
+  while (r == DRC_TOO_BIG) {
+    if (drc_big_slen <= 2) drc_nocheck = 1;
+    drc_cap = drc_big_slen / 2 > 2 ? drc_big_slen / 2 : 2;
+    r = new_recompile_block_once(addr);
+  }
+  drc_cap = MAXBLOCK; drc_nocheck = 0;
+  return r;
+#else
+  return new_recompile_block_once(addr);
+#endif
+}
+
+static int new_recompile_block_once(int addr)
 {
 #if defined(RECOMPILER_DEBUG) && !defined(RECOMP_DBG)
   recomp_dbg_block(addr);
@@ -10224,6 +10372,10 @@ static int new_recompile_block_impl(int addr)
     if(start+i*4==pagelimit-4) done=1;
     assert(start+i*4<pagelimit);
     if (i==MAXBLOCK-1) done=1;
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+    /* Joey64 (audit 3 part 6b L3): the shorter block of a retry (drc_cap), never between a branch and its delay slot */
+    if (i>=drc_cap-1&&itype[i]!=UJUMP&&itype[i]!=CJUMP&&itype[i]!=SJUMP&&itype[i]!=RJUMP&&itype[i]!=FJUMP) done=1;
+#endif
     // Stop if we're compiling junk
     if(itype[i]==NI&&opcode[i]==0x11) {
       done=stop_after_jal=1;
@@ -12370,12 +12522,18 @@ static int new_recompile_block_impl(int addr)
 #if !defined(NDEBUG) || NEW_DYNAREC >= NEW_DYNAREC_ARM
   uintptr_t beginning=(uintptr_t)out;
 #endif
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  drc_rec = 1; drc_rec_n = 0; /* see drc_drop_big */
+#endif
   if((u_int)addr&1) {
     ds=1;
     pagespan_ds();
   }
   for(i=0;i<slen;i++)
   {
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+    if (drc_block_over(beginning, 0, 0)) return drc_drop_big(beginning); /* audit 3 part 6b L3 */
+#endif
 #if ASSEM_DEBUG
     disassemble_inst(i);
 #endif
@@ -12542,6 +12700,9 @@ static int new_recompile_block_impl(int addr)
   // Stubs
   for(i=0;i<stubcount;i++)
   {
+#if NEW_DYNAREC == NEW_DYNAREC_ARM64
+    if (drc_block_over(beginning, 0, 0)) return drc_drop_big(beginning); /* audit 3 part 6b L3 */
+#endif
     switch(stubs[i][0])
     {
       case LOADB_STUB:
@@ -12575,6 +12736,13 @@ static int new_recompile_block_impl(int addr)
   }
 
 #if NEW_DYNAREC == NEW_DYNAREC_ARM64
+  /* audit 3 part 6b L3: with what pass 9 will add, still under DRC_BLOCK_LIMIT? (last point a block can be dropped) */
+  {
+    int k, entries = 0;
+    for (k = 0; k < slen; k++) if ((bt[k] || k == 0) && instr_addr[k]) entries++;
+    if (drc_block_over(beginning, linkcount, entries)) return drc_drop_big(beginning);
+    drc_rec = 0;
+  }
   /* N64_DRC_THREAD: a queued compile finishes only while the emulation thread waits at a lookup */
   if (drc_in_worker_async && drc_front_done()) { out=(u_char *)beginning; return DRC_DROPPED; }
 #endif

@@ -782,8 +782,22 @@ void Renderer::ra_state(bool restore)
 		ra_saved_cpu.static_raster_state = stream.static_raster_state;
 		ra_saved_cpu.depth_blend_state = stream.depth_blend_state;
 		make(ra_saved.hidden_rdram, *hidden_rdram);
-		ra_copy(*ra_saved.hidden_rdram, *hidden_rdram);
 		make(ra_saved.tmem, *tmem);
+		// audit 3 part 6b L5 (2026-11-11): out of GPU memory: no copies, and the renderer puts nothing back for this
+		// state (it crashed on the empty handle). The CommandProcessor's registers still go back; what the extra
+		// frames left in the renderer (hidden bits, TMEM, noise seed, tiles) stays.
+		if (!ra_saved.hidden_rdram || !ra_saved.tmem)
+		{
+			static bool logged;
+			if (!logged)
+			{
+				logged = true;
+				LOGE("Run-ahead: no GPU memory for the RDP's run-ahead copies, the RDP's hidden bits and TMEM aren't put back.\n");
+			}
+			ra_saved.valid = false;
+			return;
+		}
+		ra_copy(*ra_saved.hidden_rdram, *hidden_rdram);
 		ra_copy(*ra_saved.tmem, *tmem);
 		// Not the upscaled copy (64 MB at 4x, two copies a frame cost a quarter of the frame rate on the Thor):
 		// it only feeds the picture, and update_upscaled_domain_pre rewrites its samples from the 1x RDRAM and
@@ -3132,6 +3146,21 @@ void Renderer::resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd)
 			const size_t size = size_t(c.second) * ImplementationConstants::IncoherentPageSize;
 			if (void *dst = cmd.update_buffer(*rdram, offset, size))
 				memcpy(dst, incoherent.host_rdram + offset, size);
+			else
+			{
+				// audit 3 part 6b L5 (2026-11-11): no scratch memory for the copy. The pages go straight in as
+				// without run-ahead (maybe under GPU work still in flight) rather than being left stale: their write
+				// mask is cleared anyway, so they'd never be uploaded again until the game wrote them.
+				static bool logged;
+				if (!logged)
+				{
+					logged = true;
+					LOGE("Run-ahead: no scratch memory for an ordered RDRAM upload, pages written directly.\n");
+				}
+				auto *mapped = device->map_host_buffer(*rdram, Vulkan::MEMORY_ACCESS_WRITE_BIT, offset, size);
+				memcpy(mapped, incoherent.host_rdram + offset, size);
+				device->unmap_host_buffer(*rdram, Vulkan::MEMORY_ACCESS_WRITE_BIT, offset, size);
+			}
 		}
 		cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
 		            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
