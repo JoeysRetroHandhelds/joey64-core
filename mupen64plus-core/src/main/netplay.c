@@ -87,6 +87,7 @@ static struct {
     uint32_t rtt_n;
     uint32_t waits, wait_ms, wait_max;
     uint32_t heard, dup, sent_req, packets;
+    uint32_t own;                // our own inputs placed at once (UDP_JOEY_OWN_PLAN)
     uint32_t since;
 } l_ns;
 static void np_udp_send(np_packet *p)
@@ -170,6 +171,16 @@ static uint32_t l_last_heard;
 #define UDP_JOEY_KEY_BATCH 8
 static struct { uint32_t count, keys; uint8_t plugin; } l_sent[4][NP_RESEND];
 static uint8_t l_sent_n[4], l_sent_pos[4];
+//Joey64 (2026-11-13): [9, player, R32, offset at R, H32, n, n x (count32, change int8)], from a Joey64 room to the
+//game playing that player after each of its inputs: where they go. An input sent at count c goes to slot c + its
+//offset, the offset at R plus every change at a count after R up to c; a change of +a at X also fills the a slots
+//after count X - 1's with copies of it, one of -1 at X drops count X's input. The room plans no change below H, so
+//for R <= c < H we place our own input in our own list as we send it: it no longer waits a round trip through the
+//room (the joiner's own inputs were the ones that set the room's delay). N64_NETPLAY_LOCAL=0 turns it off.
+#define UDP_JOEY_OWN_PLAN 9
+static struct { int have; uint32_t r, h; int off_r; uint8_t n; uint32_t at[12]; int8_t ch[12]; } l_plan[4];
+static int l_own_local = 1;
+static int np_after(uint32_t a, uint32_t b) { return (int32_t)(a - b) > 0; }
 
 //UDP packets
 static np_packet l_packets[4];
@@ -259,6 +270,12 @@ m64p_error netplay_start(const char* host, int port)
         l_sent_n[i] = 0;
         l_sent_pos[i] = 0;
         memset(&l_ns, 0, sizeof l_ns);
+    }
+    memset(l_plan, 0, sizeof l_plan);
+    {
+        const char *e = getenv("N64_NETPLAY_LOCAL");
+        l_own_local = !(e && e[0] == '0');
+        log_cb(RETRO_LOG_INFO, "Netplay: own inputs %s\n", l_own_local ? "used at once where the room says they go" : "through the room (N64_NETPLAY_LOCAL=0)");
     }
 
     l_canFF = 0;
@@ -483,6 +500,28 @@ static void netplay_process()
                     l_cin_compats[player].event_first = new_event;
                 }
                 break;
+            case UDP_JOEY_OWN_PLAN:
+            {
+                const uint8_t *d = l_process_packet->data;
+                if (!netplay_packet_has_data(l_process_packet, 0, 12) || d[1] >= 4 || d[11] > 12 ||
+                    !netplay_packet_has_data(l_process_packet, 12, (size_t)d[11] * 5))
+                    break;
+                player = d[1];
+                uint32_t h = SDLNet_Read32(&d[7]);
+                if (l_plan[player].have && !np_after(h, l_plan[player].h))
+                    break; // an older one, come late
+                l_plan[player].r = SDLNet_Read32(&d[2]);
+                l_plan[player].off_r = d[6];
+                l_plan[player].h = h;
+                l_plan[player].n = d[11];
+                for (uint8_t i = 0; i < d[11]; ++i)
+                {
+                    l_plan[player].at[i] = SDLNet_Read32(&d[12 + i * 5]);
+                    l_plan[player].ch[i] = (int8_t)d[12 + i * 5 + 4];
+                }
+                l_plan[player].have = 1;
+                break;
+            }
             default:
                 log_cb(RETRO_LOG_INFO, "Netplay: received unknown message from server\n");
                 break;
@@ -568,8 +607,8 @@ static void netplay_log_stats(void)
     if (now - l_ns.since < 5000) return;
     //(no round trip here: we read replies once a frame, so it would time the game loop; the app pings the room itself)
     log_cb(RETRO_LOG_INFO, "Netplay: net: %u waits for input (%u ms, worst %u ms), "
-           "%u inputs heard, %u copies, %u requests, %u packets in %.1f s, lag %u/%u/%u/%u\n",
-           l_ns.waits, l_ns.wait_ms, l_ns.wait_max, l_ns.heard, l_ns.dup, l_ns.sent_req, l_ns.packets,
+           "%u inputs heard, %u copies, %u requests, %u packets, %u own placed in %.1f s, lag %u/%u/%u/%u\n",
+           l_ns.waits, l_ns.wait_ms, l_ns.wait_max, l_ns.heard, l_ns.dup, l_ns.sent_req, l_ns.packets, l_ns.own,
            (now - l_ns.since) / 1000.0, l_player_lag[0], l_player_lag[1], l_player_lag[2], l_player_lag[3]);
     uint64_t keep[4];
     memcpy(keep, l_ns.req_at, sizeof keep);
@@ -676,6 +715,47 @@ static void netplay_resend_inputs(void)
     }
 }
 
+static void np_add_event(uint8_t id, uint32_t slot, uint32_t keys, uint8_t plugin)
+{
+    if (np_after(l_cin_compats[id].netplay_count, slot) || check_valid(id, slot) || buffer_size(id) >= NETPLAY_MAX_PENDING_EVENTS)
+        return;
+    struct netplay_event* e = (struct netplay_event*)malloc(sizeof(struct netplay_event));
+    if (e == NULL)
+        return;
+    e->count = slot;
+    e->buttons = keys;
+    e->plugin = plugin;
+    e->next = l_cin_compats[id].event_first;
+    l_cin_compats[id].event_first = e;
+    ++l_ns.own;
+}
+
+//Joey64 (2026-11-13): our input sent at count c, into our own list where the room puts it (UDP_JOEY_OWN_PLAN)
+static void np_place_own(uint8_t id, uint32_t c, uint32_t keys, uint8_t plugin)
+{
+    if (!l_own_local || !l_plan[id].have)
+        return;
+    const uint32_t r = l_plan[id].r, h = l_plan[id].h;
+    if (np_after(r, c) || !np_after(h, c))
+        return; // outside what the room promised
+    int off = l_plan[id].off_r, raise = 0;
+    for (uint8_t i = 0; i < l_plan[id].n; ++i)
+    {
+        const uint32_t at = l_plan[id].at[i];
+        const int ch = l_plan[id].ch[i];
+        if (!np_after(at, c))
+            off += ch;
+        if (at == c && ch < 0)
+            return; // a frame taken away here: the room drops this input
+        if (at == c + 1 && ch > 0)
+            raise = ch;
+    }
+    const uint32_t slot = c + (uint32_t)off;
+    np_add_event(id, slot, keys, plugin);
+    for (int k = 1; k <= raise; ++k)
+        np_add_event(id, slot + (uint32_t)k, keys, plugin);
+}
+
 static void netplay_send_input(uint8_t control_id, uint32_t keys)
 {
     uint8_t pos = l_sent_pos[control_id];
@@ -685,6 +765,7 @@ static void netplay_send_input(uint8_t control_id, uint32_t keys)
     l_sent_pos[control_id] = (uint8_t)((pos + 1) % NP_RESEND);
     if (l_sent_n[control_id] < NP_RESEND) ++l_sent_n[control_id];
     np_send_key(control_id, l_cin_compats[control_id].netplay_count, keys, l_plugin[control_id]);
+    np_place_own(control_id, l_cin_compats[control_id].netplay_count, keys, l_plugin[control_id]);
     if (l_sent_n[control_id] > 1)
     {
         uint8_t prev = (uint8_t)((pos + NP_RESEND - 1) % NP_RESEND);
