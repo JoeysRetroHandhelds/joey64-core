@@ -22,6 +22,7 @@ RSP::JIT::CPU cpu;
 #endif
 short MFC0_count[32];
 int SP_STATUS_TIMEOUT;
+unsigned DMA_poll_count; // the same DMA bringing nothing new, in a row (rsp/cp0.cpp)
 } // namespace RSP
 
 extern "C"
@@ -113,6 +114,7 @@ extern "C"
 
 		for (auto &count : RSP::MFC0_count)
 			count = 0;
+		RSP::DMA_poll_count = 0;
 
 		while (!(*RSP::rsp.SP_STATUS_REG & SP_STATUS_HALT))
 		{

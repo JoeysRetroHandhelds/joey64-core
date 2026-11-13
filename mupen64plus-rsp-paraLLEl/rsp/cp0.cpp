@@ -8,6 +8,7 @@ namespace RSP
 extern RSP_INFO rsp;
 extern short MFC0_count[32];
 extern int SP_STATUS_TIMEOUT;
+extern unsigned DMA_poll_count;
 } // namespace RSP
 #endif
 
@@ -125,6 +126,13 @@ extern "C"
 		unsigned i = 0;
 		uint32_t source = *rsp->cp0.cr[CP0_REGISTER_DMA_DRAM];
 		uint32_t dest = *rsp->cp0.cr[CP0_REGISTER_DMA_CACHE];
+		// Joey64 (2026-11-13): an RSP program that never halts and waits for the CPU by reading the same RDRAM again
+		// and again (Thornmarked's microcode) held the emulation thread for good: the core runs a task until it halts,
+		// and only an SP_STATUS polling loop gave the CPU its turn (MFC0_count).
+		// DMAs that bring nothing new, 256 in a row (whatever their addresses: it may read a few places in turn), are
+		// that loop: stop here as the SP_STATUS timeout does, and the core carries the task on after the CPU has run
+		// (rsp_task_locked, SP_INT).
+		bool changed = false;
 
 #ifdef INTENSE_DEBUG
 		fprintf(stderr, "DMA READ: (0x%x <- 0x%x) len %u, count %u, skip %u\n", dest & 0x1ffc, source & 0x7ffffc,
@@ -146,10 +154,14 @@ extern "C"
 					unsigned block = (dest_addr & 0xfff) / CODE_BLOCK_SIZE;
 					rsp->dirty_blocks |= (0x3 << block) >> 1;
 					//rsp->dirty_blocks = ~0u;
+					changed |= rsp->imem[(dest_addr & 0xfff) >> 2] != word;
 					rsp->imem[(dest_addr & 0xfff) >> 2] = word;
 				}
 				else
+				{
+					changed |= rsp->dmem[dest_addr >> 2] != word;
 					rsp->dmem[dest_addr >> 2] = word;
+				}
 
 				j += 4;
 			} while (j < length);
@@ -165,6 +177,17 @@ extern "C"
 #ifdef INTENSE_DEBUG
 		log_rsp_mem_parallel();
 #endif
+		if (!changed)
+		{
+			if (++RSP::DMA_poll_count >= 256)
+			{
+				RSP::DMA_poll_count = 0;
+				*RSP::rsp.SP_STATUS_REG |= SP_STATUS_HALT;
+				return MODE_CHECK_FLAGS;
+			}
+		}
+		else
+			RSP::DMA_poll_count = 0;
 		return rsp->dirty_blocks ? MODE_CHECK_FLAGS : MODE_CONTINUE;
 	}
 
