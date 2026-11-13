@@ -227,6 +227,18 @@ void init_device(struct device* dev,
     size_t dd_rom_size,
     void* dd_disk, const struct storage_backend_interface* dd_idisk)
 {
+    /* Joey64 (2026-11-13): a dump cut short of its chip (a size that is no whole number of MB: the Turok kiosk demo
+     * from E3 1997 is 10,019,568 bytes) reads as zeros up to the chip size a cart of it would have (the next power
+     * of two), as the PI DMA past its end already did. CPU reads there were open bus (the address), and the demo
+     * hung before its first frame; padded with zeros it reaches its title screen. Whole-MB dumps keep open bus. */
+    size_t rom_map_size = rom_size;
+    if (rom_size & 0xfffff)
+    {
+        rom_map_size = 0x100000;
+        while (rom_map_size < rom_size)
+            rom_map_size <<= 1;
+    }
+
     struct interrupt_handler interrupt_handlers[] = {
         { &dev->vi,        vi_vertical_interrupt_event }, /* VI */
         { &dev->r4300,     compare_int_handler         }, /* COMPARE */
@@ -272,7 +284,7 @@ void init_device(struct device* dev,
         { A(MM_DD_ROM, 0x1ffffff), M64P_MEM_NOTHING, { NULL, RW(open_bus) }, { NULL, 0x1ffffff, 0 } },
         { A(MM_DOM2_ADDR2, 0x1ffff), M64P_MEM_FLASHRAMSTAT, { &dev->cart, RW(cart_dom2) }, { NULL, 0x1ffff, 0} },
         { A(MM_IS_VIEWER, 0xfff), M64P_MEM_NOTHING, { &dev->is, RW(is_viewer) }, { NULL, 0xfff, 0 } },
-        { A(MM_CART_ROM, min(rom_size-1, 0xfbfffff)), M64P_MEM_ROM, { &dev->cart.cart_rom, RW(cart_rom) }, { NULL, rom_size-1, RETRO_MEMDESC_CONST } },
+        { A(MM_CART_ROM, min(rom_map_size-1, 0xfbfffff)), M64P_MEM_ROM, { &dev->cart.cart_rom, RW(cart_rom) }, { NULL, rom_size-1, RETRO_MEMDESC_CONST } },
         { A(MM_PIF_MEM, 0xffff), M64P_MEM_PIF, { &dev->pif, RW(pif_mem) }, { NULL, 0xffff, 0 } }
     };
 
