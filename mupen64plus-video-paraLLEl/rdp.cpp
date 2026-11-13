@@ -357,6 +357,9 @@ bool interlacing = true, super_sampled_read_back = false, super_sampled_dither =
 // skipping, one retro_run can end two refreshes, a new one and then a repeat, and the repeat must not hide the new
 // image (Banjo-Kazooie/Tooie on the Duo kept showing stale and black frames with the app skipping repeats).
 bool frame_valid = true;
+// Joey64: the trim of the border around the game's picture (joey_note_vi_area).
+static std::atomic<int> joey_vi_trim[4];
+static int joey_vi_seen[4], joey_vi_held;
 
 // Smart sync (replaces synchronous mode when the synchronous option is on; env N64_RDP_SMART=0 gives plain
 // synchronous mode again; with the option off parallel-RDP is plain async): run asynchronously, but remember
@@ -2379,6 +2382,9 @@ bool init()
 	// a pipeline cache save still running holds the old Device (audit 3 L5): deinit joins it, but an init without a
 	// deinit before it would free the Device under that thread
 	wait_pipeline_cache_saver();
+	for (auto &t : joey_vi_trim) t.store(0);
+	memset(joey_vi_seen, 0, sizeof(joey_vi_seen));
+	joey_vi_held = 0;
 	if (!context || !vulkan)
 		return false;
 
@@ -2606,6 +2612,52 @@ bool take_frame_valid()
 	return v;
 }
 
+// Joey64: the part of the N64's picture the game draws in (its VI H_START/V_START), so the app can trim the
+// black border a game leaves around it (Banjo-Kazooie) without cutting any of the game's own pixels. In ten
+// thousandths of the full picture: left, top, right, bottom. A new area counts once it held for 20 pictures.
+
+static void joey_note_vi_area(uint32_t h_start_reg, uint32_t v_start_reg, uint32_t v_sync_reg)
+{
+	const bool pal = (v_sync_reg & 0x3ff) > VI_V_SYNC_NTSC + 25;
+	const int full_w = VI_SCANOUT_WIDTH, full_h = pal ? VI_V_RES_PAL : VI_V_RES_NTSC;
+	int hs = int((h_start_reg >> 16) & 0x3ff) - int(pal ? VI_H_OFFSET_PAL : VI_H_OFFSET_NTSC);
+	int he = int(h_start_reg & 0x3ff) - int(pal ? VI_H_OFFSET_PAL : VI_H_OFFSET_NTSC);
+	// Inside the full width the VI also leaves its guard band black: 8 pixels at the start, 7 at the end
+	// (video_interface.cpp analyze_line's h_start_clamp / h_end_clamp).
+	hs = hs < 0 ? 0 : hs + 8;
+	he = he > full_w ? full_w : he - 7;
+	// Lines as decode_vi_registers counts them (the picture has full_h / 2 per field): the first is
+	// (VStart - offset) / 2 rounded towards zero, the count (VEnd - VStart) / 2.
+	const int lines = full_h / 2, v_end_max = int(pal ? VI_V_END_PAL : VI_V_END_NTSC);
+	int v0 = std::min(int((v_start_reg >> 16) & 0x3ff), v_end_max);
+	int v1 = std::min(int(v_start_reg & 0x3ff), v_end_max);
+	int vs = (v0 - int(pal ? VI_V_OFFSET_PAL : VI_V_OFFSET_NTSC)) / 2;
+	int vn = (v1 - v0) >> 1;
+	vs = std::max(vs, 0);
+	int ve = std::min(vs + vn, lines);
+	int t[4] = { 0, 0, 0, 0 };
+	// Nothing drawn or under half the picture either way (a blank or odd frame): no trim.
+	if (he - hs >= full_w / 2 && ve - vs >= lines / 2)
+	{
+		t[0] = hs * 10000 / full_w;
+		t[1] = vs * 10000 / lines;
+		t[2] = (full_w - he) * 10000 / full_w;
+		t[3] = (lines - ve) * 10000 / lines;
+	}
+	if (memcmp(t, joey_vi_seen, sizeof(t)) != 0)
+	{
+		memcpy(joey_vi_seen, t, sizeof(t));
+		joey_vi_held = 0;
+		if (log_cb)
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: VI area H %u..%u V %u..%u (sync %u): trim %d %d %d %d\n",
+			       (h_start_reg >> 16) & 0x3ff, h_start_reg & 0x3ff, (v_start_reg >> 16) & 0x3ff, v_start_reg & 0x3ff,
+			       v_sync_reg & 0x3ff, t[0], t[1], t[2], t[3]);
+	}
+	if (joey_vi_held < 20 && ++joey_vi_held == 20)
+		for (int i = 0; i < 4; i++)
+			joey_vi_trim[i].store(t[i]);
+}
+
 void complete_frame()
 {
 	if (!frontend)
@@ -2711,6 +2763,8 @@ void complete_frame()
 	frontend->set_vi_register(VIRegister::VBurst, *GET_GFX_INFO(VI_V_BURST_REG));
 	frontend->set_vi_register(VIRegister::XScale, *GET_GFX_INFO(VI_X_SCALE_REG));
 	frontend->set_vi_register(VIRegister::YScale, *GET_GFX_INFO(VI_Y_SCALE_REG));
+
+	joey_note_vi_area(*GET_GFX_INFO(VI_H_START_REG), *GET_GFX_INFO(VI_V_START_REG), *GET_GFX_INFO(VI_V_SYNC_REG));
 
 	ScanoutOptions opts;
 	opts.persist_frame_on_invalid_input = true;
@@ -2876,3 +2930,10 @@ const VkApplicationInfo *parallel_get_application_info(void)
 	return &parallel_app_info;
 }
 
+// Joey64: the black border the game leaves around its picture (VI H_START/V_START), for the app to trim:
+// left, top, right, bottom in ten thousandths of the full picture. All 0 when there is none (or on GLideN64).
+extern "C" __attribute__((visibility("default"))) void joey64_vi_trim(int *out)
+{
+	for (int i = 0; i < 4; i++)
+		out[i] = RDP::joey_vi_trim[i].load();
+}
