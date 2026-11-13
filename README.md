@@ -1,15 +1,59 @@
 # joey64-core
 
 The N64 core of [Joey64](https://github.com/JoeysRetroHandhelds/joey64), an N64 emulator for Android handhelds:
-a fork of [libretro/mupen64plus-libretro-nx](https://github.com/libretro/mupen64plus-libretro-nx) (Mupen64Plus-Next)
-with changes for Joey64's host: per-port Transfer Paks, netplay, parallel-RDP
-updates and Mali/Adreno fixes, and fixes for games and dumps upstream doesn't boot.
+a fork of [libretro/mupen64plus-libretro-nx](https://github.com/libretro/mupen64plus-libretro-nx) (Mupen64Plus-Next),
+changed for Joey64's host and for Android handhelds' GPUs (Adreno and Mali).
 
-- Branches: `main` is the core Joey64 bundles; each Joey64 release is tagged (`v0.2.0`, ...), and the app's
-  `core-version.txt` names the exact commit (0.2.0's still says its old branch name, `rel3`: the same commit, f6ce435).
-- Build for Android (arm64): `ndk-build` in `libretro/jni` (output `libretro/libs/arm64-v8a/libretro.so`).
-- Licence: GPLv2 or later, as upstream; GNU lightning (parallel-RSP's JIT) is LGPLv3+. angrylion-rdp-plus is
-  not part of this fork (removed 2026-11-07).
+**AI disclosure:** AI was used for all of this fork's changes. They are written with Anthropic's Claude through
+Claude Code, which also runs most of the device testing. I decide what goes in and play it on real handhelds.
+
+## What's changed from upstream
+
+- **Lower lag:** the frame is scanned out at the start of the active picture, not at the vertical interrupt,
+  so each frame reaches the screen about one frame (~16 ms) sooner.
+- **parallel-RDP:**
+  - updated to parallel-rdp-standalone master;
+  - repeat frames skipped (the VI shows the same picture again);
+  - "smart sync": async, with RDRAM pages the RDP drew into page-protected, so the CPU waits for the GPU only
+    when it reads them (Pokémon Snap, Resident Evil 2 and Cruis'n USA draw right without full synchronous mode);
+  - a lock-free command ring with lazy waking, pipeline cache kept between runs and saved off the emulation
+    thread, upscaling changeable while running, and fixes for Adreno and Mali drivers (Vulkan 1.1 loaders,
+    host query reset on the Retroid Pocket Duo);
+  - reports the game's own border so the host can trim it.
+- **parallel-RSP:** HLE audio with LLE graphics by default, AArch64 fast paths for vector multiplies and loads,
+  and a stop for RSP programs that only poll RDRAM.
+- **Recompiler (new_dynarec, arm64):** a jump cache, an optional compile thread, a per-game block list, code
+  in cartridge ROM compiled, and a bad address raising an exception instead of `exit(1)`.
+- **GLideN64:** updated to gonetz master, Pokémon Snap's photo check fixed on GLES, NEON math and ARMv8 CRC32 on
+  Android. xBRZ is built out.
+- **Netplay without SDL:** mupen64plus netplay on POSIX sockets, with Joey64's room additions (input resends,
+  ROM check, keyed places, placing inputs where the room says, leaving a room at once).
+- **Transfer Pak:** each port its own Game Boy game and save; cartridge banks mirrored and the MBC3 clock
+  started at power on, as on hardware.
+- **64DD:** disk-only start, disk saves next to the other saves, the IPL BIOS looked up by the disk's region.
+- **Games and dumps upstream doesn't boot:** save type from the header for ROMs not in the database, PI DMA
+  alignment as M64Plus FZ does (SM64 hacks), boot checksums computed for headers that don't carry them (Wii
+  Virtual Console copies, prototypes), short dumps reading zeros past their end, a VI that runs with VI
+  interrupts off (libdragon homebrew), and per-game CountPerOp entries.
+- **Save states:** retro_serialize and retro_unserialize return at once instead of running a frame, and
+  refuse states that are cut short or from another ROM.
+- **Experiments, off unless the host turns them on:** run-ahead states, texture packs on parallel-RDP.
+- angrylion-rdp-plus is removed (its old MAME licence is non-commercial).
+
+## Branches and releases
+
+`main` is the core Joey64 bundles. Each Joey64 release is tagged (`v0.2.0`, ...) at the core it shipped; the
+app's `core-version.txt` names the exact commit (0.2.0's still says its old branch name, `rel3`: the same commit,
+f6ce435).
+
+## Building for Android (arm64)
+
+`ndk-build` in `libretro/jni` (output `libretro/libs/arm64-v8a/libretro.so`); Joey64's `devtools/bundle-core.sh`
+copies it into the app.
+
+## Licence
+
+GPLv2 or later, as upstream. GNU lightning (parallel-RSP's JIT) is LGPLv3+.
 
 Upstream's README follows.
 
