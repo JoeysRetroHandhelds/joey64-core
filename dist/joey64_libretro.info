@@ -1,0 +1,53 @@
+# Joey64's core for RetroArch: our fork of Mupen64Plus-Next (libretro/mupen64plus-libretro-nx).
+# Install: put joey64_libretro_android.so and this file where RetroArch reads cores and core info,
+# or use Load Core > Install or Restore a Core for the .so.
+
+# Software Information
+display_name = "Nintendo - Nintendo 64 (Joey64)"
+authors = "Joey64|Mupen64Plus Team|m4xw|Gillou68310|loganmc10|Rosalie241|GLideN64 Team|Themaister"
+supported_extensions = "n64|v64|z64|bin|u1|ndd"
+corename = "Joey64"
+categories = "Emulator"
+license = "GPLv3+|GPLv2|MIT|Apache"
+permissions = ""
+display_version = "rel3"
+
+# Hardware Information
+manufacturer = "Nintendo"
+systemname = "Nintendo 64"
+systemid = "nintendo_64"
+
+# Libretro Features
+database = "Nintendo - Nintendo 64|Nintendo - Nintendo 64DD"
+supports_no_game = "false"
+savestate = "true"
+savestate_features = "serialized"
+cheats = "true"
+input_descriptors = "true"
+memory_descriptors = "true"
+libretro_saves = "true"
+core_options = "true"
+core_options_version = "2.0"
+load_subsystem = "true"
+hw_render = "true"
+required_hw_api = "Vulkan >= 1.1 | OpenGL Core >= 3.3 | OpenGL ES >= 3.0"
+needs_fullpath = "false"
+disk_control = "false"
+is_experimental = "false"
+
+firmware_count = 4
+firmware0_desc = "IPL.n64 (64DD IPL, any region)"
+firmware0_path = "Mupen64plus/IPL.n64"
+firmware0_opt = "true"
+firmware1_desc = "IPL_JPN.n64 (64DD IPL, Japan)"
+firmware1_path = "Mupen64plus/IPL_JPN.n64"
+firmware1_opt = "true"
+firmware2_desc = "IPL_USA.n64 (64DD IPL, USA)"
+firmware2_path = "Mupen64plus/IPL_USA.n64"
+firmware2_opt = "true"
+firmware3_desc = "IPL_DEV.n64 (64DD IPL, development)"
+firmware3_path = "Mupen64plus/IPL_DEV.n64"
+firmware3_opt = "true"
+notes = "(!) 64DD: put the IPL BIOS in system/Mupen64plus/.|Joey64's fixes in the core: smart parallel-RDP sync, repeat frames skipped, display one frame sooner, save states return at once, 64DD fixes, save types for ROM hacks."
+
+description = "Joey64's N64 core: Mupen64Plus-Next with the fixes made for the Joey64 app (handheld speed, display lag, 64DD, ROM hacks). Renderers: parallel-RDP (Vulkan) and GLideN64."
