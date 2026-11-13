@@ -5,8 +5,8 @@ a fork of [libretro/mupen64plus-libretro-nx](https://github.com/libretro/mupen64
 with changes for Joey64's host: per-port Transfer Paks, netplay, parallel-RDP
 updates and Mali/Adreno fixes, and fixes for games and dumps upstream doesn't boot.
 
-- Branches: the release branches (`rel1`, `rel2`, `rel3`, ...) are what Joey64 bundles; the app's
-  `core-version.txt` names the exact commit. Other branches are work in progress.
+- Branches: `main` is the core Joey64 bundles; each Joey64 release is tagged (`v0.2.0`, ...), and the app's
+  `core-version.txt` names the exact commit (0.2.0's still says its old branch name, `rel3`: the same commit, f6ce435).
 - Build for Android (arm64): `ndk-build` in `libretro/jni` (output `libretro/libs/arm64-v8a/libretro.so`).
 - Licence: GPLv2 or later, as upstream; GNU lightning (parallel-RSP's JIT) is LGPLv3+. angrylion-rdp-plus is
   not part of this fork (removed 2026-11-07).
