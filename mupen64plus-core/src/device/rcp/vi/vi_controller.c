@@ -63,9 +63,14 @@ unsigned int vi_expected_refresh_rate_from_tv_standard(m64p_system_type tv_stand
     }
 }
 
+/* Joey64 (2026-11-13): the VI's field event runs whenever the VI has its timing (V_SYNC set), also with V_INTR at or
+ * past V_SYNC: the console's VI keeps scanning then, only its interrupt never comes (vi_vertical_interrupt_event
+ * raises it only below V_SYNC). It used to run only with the interrupt on, so a game that turns VI interrupts off
+ * (libdragon sets V_INTR to 0x3ff: Tic Tac Toe 64) had no VI_CURRENT (read 0 for ever; libdragon waits for line 2)
+ * and no frame end, and never drew. */
 void set_vi_vertical_interrupt(struct vi_controller* vi)
 {
-    if (!get_event(&vi->mi->r4300->cp0.q, VI_INT) && (vi->regs[VI_V_INTR_REG] < vi->regs[VI_V_SYNC_REG]))
+    if (!get_event(&vi->mi->r4300->cp0.q, VI_INT) && vi->regs[VI_V_SYNC_REG] != 0 && vi->delay != 0)
     {
         cp0_update_count(vi->mi->r4300);
         add_interrupt_event(&vi->mi->r4300->cp0, VI_INT, vi->delay);
@@ -103,7 +108,17 @@ void read_vi_regs(void* opaque, uint32_t address, uint32_t* value)
     if (reg == VI_CURRENT_REG)
     {
         uint32_t* next_vi = get_event(&vi->mi->r4300->cp0.q, VI_INT);
-        if (next_vi != NULL) {
+        if (next_vi == NULL && vi->regs[VI_V_SYNC_REG] == 0 && vi->clock != 0 && vi->expected_refresh_rate != 0) {
+            /* Joey64 (2026-11-13): before the game sets V_SYNC the core has no VI timing and VI_CURRENT read 0 for
+             * ever, but the console's VI counts lines from power-on. A game that waits for a line before setting the
+             * VI up (libdragon's display_init: Tic Tac Toe 64) waited for good. Count NTSC's 525 half-lines at the
+             * refresh rate from CP0 count until the game sets V_SYNC. */
+            cp0_update_count(vi->mi->r4300);
+            uint32_t per_line = (vi->clock / vi->expected_refresh_rate) / 525;
+            if (per_line != 0)
+                vi->regs[VI_CURRENT_REG] = (cp0_regs[CP0_COUNT_REG] / per_line) % 525;
+        }
+        else if (next_vi != NULL) {
             cp0_update_count(vi->mi->r4300);
             vi->regs[VI_CURRENT_REG] = (vi->delay - (*next_vi - cp0_regs[CP0_COUNT_REG])) / vi->count_per_scanline;
 
@@ -259,7 +274,8 @@ void vi_vertical_interrupt_event(void* opaque)
     remove_event(&vi->mi->r4300->cp0.q, VI_INT);
     add_interrupt_event_count(&vi->mi->r4300->cp0, VI_INT, next_vi);
 
-    /* trigger interrupt */
-    raise_rcp_interrupt(vi->mi, MI_INTR_VI);
+    /* trigger interrupt (none while V_INTR is at or past V_SYNC: the line is never reached; set_vi_vertical_interrupt) */
+    if (vi->regs[VI_V_INTR_REG] < vi->regs[VI_V_SYNC_REG])
+        raise_rcp_interrupt(vi->mi, MI_INTR_VI);
 }
 
