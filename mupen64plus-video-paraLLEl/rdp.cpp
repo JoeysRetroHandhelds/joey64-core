@@ -65,6 +65,15 @@ static QueryPoolHandle begin_ts, end_ts;
 static string pipeline_cache_path;
 static std::atomic<size_t> pipeline_cache_saved_size;
 static unsigned frames_since_cache_check;
+// Per-frame GPU memory (command buffers, staging, sync objects) is only recycled when a frame context begins, once
+// per finished frame. A game that floods the RDP without finishing frames (OoT's 2003 GameCube debug dumps going into
+// ZELDA MAP SELECT: ~10,000 driver allocations a second until Android's 65,530 mapping limit kills the app) never gets
+// there, so after this many full syncs or command words since the last frame context, start one early.
+static unsigned syncs_since_frame_context;
+static uint64_t words_since_frame_context;
+static unsigned early_frame_contexts;
+static const unsigned EARLY_CONTEXT_SYNCS = 256;
+static const uint64_t EARLY_CONTEXT_WORDS = 1u << 20;
 // Save only when the game created pipelines since the last save, and space saves out (10 s, doubling to 80 s at
 // 60 fps) as a game keeps adding a few (Goemon adds ~10 per 10 s standing still); shutdown always saves. Each save
 // reads the whole driver cache (~230 ms of a core on the Flip at 19-22 MB). N64_RDP_CACHE_EVERY=1 checks every
@@ -273,6 +282,9 @@ static void load_pipeline_cache()
 	device->init_pipeline_cache(data.empty() ? nullptr : data.data(), data.size());
 	pipeline_cache_saved_size = data.size();
 	frames_since_cache_check = 0;
+	syncs_since_frame_context = 0;
+	words_since_frame_context = 0;
+	early_frame_contexts = 0;
 	cache_check_interval = 600;
 	pipelines_at_last_save = 0;
 	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: pipeline cache %u bytes from %s.\n",
@@ -2313,7 +2325,10 @@ void process_commands()
 		if (TexKeys::enabled)
 			TexKeys::track(RDP::Op(command), &cmd_data[2 * cmd_cur]);
 		if (command >= 8 && frontend)
+		{
 			frontend->enqueue_command(cmd_length * 2, &cmd_data[2 * cmd_cur]);
+			words_since_frame_context += cmd_length * 2;
+		}
 		if (Smart::enabled && synchronous)
 			Smart::track(RDP::Op(command), w1, cmd_data[2 * cmd_cur + 1]);
 		if (Dup::enabled)
@@ -2328,6 +2343,18 @@ void process_commands()
 				frontend->wait_for_timeline(frontend->signal_timeline());
 			*gfx_info.MI_INTR_REG |= DP_INTERRUPT;
 			gfx_info.CheckInterrupts();
+			syncs_since_frame_context++;
+		}
+
+		if (frontend && (syncs_since_frame_context >= EARLY_CONTEXT_SYNCS || words_since_frame_context >= EARLY_CONTEXT_WORDS))
+		{
+			if (log_cb && (early_frame_contexts < 3 || (early_frame_contexts & 1023) == 0))
+				log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: %u full syncs and %llu command words without a finished frame: new frame context early (%u so far).\n",
+				       syncs_since_frame_context, (unsigned long long)words_since_frame_context, early_frame_contexts + 1);
+			early_frame_contexts++;
+			frontend->begin_frame_context();
+			syncs_since_frame_context = 0;
+			words_since_frame_context = 0;
 		}
 
 		cmd_cur += cmd_length;
@@ -2857,6 +2884,8 @@ void complete_frame()
 	apply_upscaling_change();
 	if (frontend)
 		frontend->begin_frame_context();
+	syncs_since_frame_context = 0;
+	words_since_frame_context = 0;
 }
 }
 
