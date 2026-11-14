@@ -1585,6 +1585,8 @@ static void emit_andimm(int rs,int imm,int rt)
   u_int armval;
   if(imm==0) {
     emit_zeroreg(rt);
+  }else if(imm==-1) { // all ones can't be a logical immediate (LDL/LDR keep a whole word this way)
+    if(rs!=rt) emit_mov(rs,rt);
   }else if(genimm((uint64_t)imm,32,&armval)) {
     assem_debug("and %s,%s,#%d",regname[rt],regname[rs],imm);
     output_w32(0x12000000|armval<<10|rs<<5|rt);
@@ -3517,13 +3519,13 @@ static void loadlr_assemble_arm64(int i,struct regstat *i_regs)
 
         if(shift) {
           emit_readdword_indexed_tlb(0,temp2,map,temp2h,temp2);
-          if (opcode[i]==0x1B) {
-            emit_shrdimm(temp2h,temp2,shift,temp2h);
-            emit_shrimm(temp2,shift,temp2);
-          } else {
-            emit_shldimm(temp2h,temp2,shift,temp2h);
-            emit_shlimm(temp2,shift,temp2);
-          }
+          // Joey64: shift the doubleword as one 64-bit register and split it again. The 32-bit halves can't take
+          // shifts of 32-56 (address & 7 >= 4 for LDL, < 4 for LDR): those emitted invalid instructions (SIGILL in
+          // the Evil Australians demo), and LDR moved the low word's bits into the high word instead of the reverse.
+          emit_orrshlimm64(temp2h,32,temp2); // the low word's load cleared the register's upper half
+          if (opcode[i]==0x1B) emit_shrimm64(temp2,shift,temp2); // LDR
+          else emit_shlimm64(temp2,shift,temp2); // LDL
+          emit_shrimm64(temp2,32,temp2h);
           emit_andimm(tl,~mask,tl);
           emit_andimm(th,~mask>>32,th);
           emit_or(temp2,tl,tl);
