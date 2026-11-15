@@ -397,6 +397,8 @@ static volatile uint64_t sync_signal;
 static struct sigaction old_action;
 static bool handler_installed;
 static unsigned faults, sync_count;
+// Every CPU wait on the GPU since the game started (faults is reset for its log), for the app (joey64_rdp_waits).
+static std::atomic<unsigned> faults_total{0};
 // N64_RDP_SMART_DEBUG=1: what the waits hit (page kind 1 = color, 2 = depth, 3 = both) and who touched it
 static bool debug;
 static unsigned faults_kind[4];
@@ -810,6 +812,8 @@ static void handler(int sig, siginfo_t *info, void *uc)
 			unlock_all();
 		}
 		faults++;
+		faults_total.fetch_add(1, std::memory_order_relaxed);
+		::RDP::native_first_flush_request.store(true, std::memory_order_relaxed);
 		return; // the access is retried, now with the RDP's results in RDRAM
 	}
 	// Not ours: hand it on.
@@ -912,6 +916,7 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 		handler_installed = true;
 	}
 	enabled = true;
+	::RDP::native_first_allowed.store(true, std::memory_order_relaxed);
 	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync on (%ld-byte pages%s%s).\n", ps, precise ? ", precise" : "",
 	       stamped ? (split_on ? ", per-SyncFull waits, split waits" : ", per-SyncFull waits") : "");
 }
@@ -3146,6 +3151,13 @@ const VkApplicationInfo *parallel_get_application_info(void)
 	const char *v11 = getenv("N64_VK11");
 	parallel_app_info.apiVersion = (v11 && *v11 == '1') ? VK_API_VERSION_1_1 : VK_API_VERSION_1_2;
 	return &parallel_app_info;
+}
+
+// Joey64: smart sync's CPU waits on the GPU so far (read-backs such as Paper Mario's), for the app's GPU clock hold
+// while a game waits (N64_GPU_TURBO=3).
+extern "C" __attribute__((visibility("default"))) unsigned joey64_rdp_waits()
+{
+	return RDP::Smart::faults_total.load(std::memory_order_relaxed);
 }
 
 // Joey64: the black border the game leaves around its picture (VI H_START/V_START), for the app to trim:

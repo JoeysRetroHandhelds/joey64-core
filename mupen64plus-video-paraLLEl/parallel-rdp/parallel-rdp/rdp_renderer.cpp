@@ -86,8 +86,18 @@ void Renderer::set_shader_bank(const ShaderBank *bank)
 	shader_bank = bank;
 }
 
+std::atomic<bool> native_first_allowed{false};
+std::atomic<bool> native_first_flush_request{false};
+
 bool Renderer::init_renderer(const RendererOptions &options)
 {
+	{
+		const char *nf = getenv("N64_RDP_NATIVE_FIRST");
+		defer_upscaled = nf && nf[0] == '1';
+		deferred_upscaled.clear();
+		if (defer_upscaled)
+			LOGI("native-first: upscaled passes may wait behind later 1x passes.\n");
+	}
 	if (options.upscaling_factor == 0)
 		return false;
 	if (options.upscaling_factor == 1 && options.super_sampled_readback)
@@ -127,7 +137,8 @@ bool Renderer::init_renderer(const RendererOptions &options)
 	{
 		Vulkan::BufferCreateInfo info = {};
 		info.size = Limits::MaxTMEMInstances * 0x1000;
-		info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		// Transfer source: native-first copies what a held-back upscaled pass samples.
+		info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 		info.domain = Vulkan::BufferDomain::Device;
 		info.misc = Vulkan::BUFFER_MISC_ZERO_INITIALIZE_BIT;
 		tmem_instances = device->create_buffer(info);
@@ -728,11 +739,29 @@ void Renderer::flush_and_signal()
 	assert(!stream.cmd);
 }
 
+void Renderer::flush_and_signal_all()
+{
+	flush_queues();
+	flush_deferred_upscaled();
+	static unsigned pictures;
+	if (defer_upscaled && ++pictures % 600 == 0)
+	{
+		LOGI("native-first: %u upscaled passes held back in the last 600 flushes; recorded early %u times for a CPU wait, %u for an overlap.\n",
+		     deferred_count, deferred_flushes_request, deferred_flushes_conflict);
+		deferred_count = deferred_flushes_request = deferred_flushes_conflict = 0;
+	}
+	submit_to_queue();
+	assert(!stream.cmd);
+}
+
 void Renderer::set_skip_upscaled(bool skip)
 {
 	// A pass already queued keeps the setting it was recorded under.
 	if (skip != skip_upscaled)
+	{
 		flush_queues();
+		flush_deferred_upscaled();
+	}
 	skip_upscaled = skip;
 }
 
@@ -757,6 +786,7 @@ void Renderer::ra_state(bool restore)
 		return;
 	// Everything queued so far goes to the GPU first, so the copies see (or replace) all of it.
 	flush_queues();
+	flush_deferred_upscaled();
 	submit_to_queue();
 
 	auto make = [&](Vulkan::BufferHandle &h, const Vulkan::Buffer &like) {
@@ -1846,7 +1876,7 @@ void Renderer::submit_span_setup_jobs(Vulkan::CommandBuffer &cmd, bool upscale)
 	Vulkan::QueryPoolHandle begin_ts, end_ts;
 	if (caps.timestamp >= 2)
 		begin_ts = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-	cmd.dispatch(stream.span_info_jobs.size(), 1, 1);
+	cmd.dispatch(num_span_jobs(), 1, 1);
 	if (caps.timestamp >= 2)
 	{
 		end_ts = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -1948,13 +1978,13 @@ void Renderer::submit_rasterization(Vulkan::CommandBuffer &cmd, Vulkan::Buffer &
 
 	uint32_t scale_log2_bit = (upscaling ? Util::trailing_zeroes(caps.upscaling) : 0u) << RASTERIZATION_UPSCALING_LOG2_BIT_OFFSET;
 
-	for (size_t i = 0; i < stream.static_raster_state_cache.size(); i++)
+	for (size_t i = 0; i < num_raster_states(); i++)
 	{
 		cmd.set_storage_buffer(1, 0, *tile_work_list,
 		                       i * sizeof(TileRasterWork) * caps.max_num_tile_instances,
 		                       sizeof(TileRasterWork) * caps.max_num_tile_instances);
 
-		auto &state = stream.static_raster_state_cache.data()[i];
+		auto &state = raster_states()[i];
 		cmd.set_specialization_constant(2, state.flags | RASTERIZATION_USE_SPECIALIZATION_CONSTANT_BIT | scale_log2_bit);
 		cmd.set_specialization_constant(3, state.combiner[0].rgb);
 		cmd.set_specialization_constant(4, state.combiner[0].alpha);
@@ -2024,7 +2054,7 @@ void Renderer::submit_tile_binning_combined(Vulkan::CommandBuffer &cmd, bool ups
 		push.height *= caps.upscaling;
 	}
 
-	push.num_primitives = uint32_t(stream.triangle_setup.size());
+	push.num_primitives = uint32_t(num_triangles());
 	unsigned num_primitives_32 = (push.num_primitives + 31) / 32;
 
 	cmd.push_constants(&push, 0, sizeof(push));
@@ -2323,7 +2353,7 @@ void Renderer::submit_depth_blend(Vulkan::CommandBuffer &cmd, Vulkan::Buffer &tm
 	global_fb_info->base_primitive_index = base_primitive_index;
 
 	push.depth_addr_index = fb.depth_addr >> 1;
-	unsigned num_primitives_32 = (stream.triangle_setup.size() + 31) / 32;
+	unsigned num_primitives_32 = (num_triangles() + 31) / 32;
 	push.group_mask = (1u << num_primitives_32) - 1;
 	cmd.push_constants(&push, 0, sizeof(push));
 
@@ -2436,7 +2466,7 @@ void Renderer::submit_render_pass(Vulkan::CommandBuffer &cmd)
 	}
 }
 
-void Renderer::submit_render_pass_upscaled(Vulkan::CommandBuffer &cmd)
+void Renderer::submit_render_pass_upscaled(Vulkan::CommandBuffer &cmd, Vulkan::Buffer *tmem_override)
 {
 	cmd.begin_region("render-pass-upscaled");
 	Vulkan::QueryPoolHandle start_ts, end_ts;
@@ -2463,14 +2493,14 @@ void Renderer::submit_render_pass_upscaled(Vulkan::CommandBuffer &cmd)
 
 	if (!caps.ubershader)
 	{
-		submit_rasterization(cmd, need_tmem_upload ? *tmem_instances : *tmem, true);
+		submit_rasterization(cmd, tmem_override ? *tmem_override : need_tmem_upload ? *tmem_instances : *tmem, true);
 		cmd.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
 		            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		            VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 	}
 
-	submit_depth_blend(cmd, need_tmem_upload ? *tmem_instances : *tmem, true, caps.super_sample_readback);
+	submit_depth_blend(cmd, tmem_override ? *tmem_override : need_tmem_upload ? *tmem_instances : *tmem, true, caps.super_sample_readback);
 	if (!caps.ubershader)
 		clear_indirect_buffer(cmd);
 
@@ -2641,6 +2671,14 @@ void Renderer::reset_context()
 void Renderer::begin_new_context()
 {
 	buffer_instance = (buffer_instance + 1) % Limits::NumSyncStates;
+	for (auto &d : deferred_upscaled)
+	{
+		if (d.instance == buffer_instance)
+		{
+			flush_deferred_upscaled();
+			break;
+		}
+	}
 	reset_context();
 	bind_stream_instance();
 }
@@ -3199,6 +3237,13 @@ void Renderer::resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd)
 
 void Renderer::flush_queues()
 {
+	// Native-first: the CPU waited on drawn pages, so it may write them next; the held-back upscaled passes go
+	// first, before a later pass's upscaled-domain update can see that write.
+	if (native_first_flush_request.exchange(false, std::memory_order_acq_rel) && !deferred_upscaled.empty())
+	{
+		deferred_flushes_request++;
+		flush_deferred_upscaled();
+	}
 	if (stream.tmem_upload_infos.empty() && stream.span_info_jobs.empty())
 	{
 		base_primitive_index += stream.triangle_setup.size();
@@ -3214,6 +3259,24 @@ void Renderer::flush_queues()
 		// We're going to write to these pages, so lock them down.
 		lock_pages_for_gpu_write(fb.addr, get_byte_size_for_bound_color_framebuffer());
 		lock_pages_for_gpu_write(fb.depth_addr, get_byte_size_for_bound_depth_framebuffer());
+	}
+
+	// Native-first: a 1x-only pass may go ahead of a held-back upscaled pass drawing in the same place (its own
+	// domain update finds nothing to copy: the held pass's 1x half already updated the reference). The next
+	// upscaled pass's update would copy the 1x-only pass's drawing up, so the held passes are recorded before it.
+	if (!deferred_upscaled.empty())
+	{
+		if (render_pass_is_upscaled())
+		{
+			if (deferred_dirty)
+			{
+				deferred_flushes_conflict++;
+				flush_deferred_upscaled();
+			}
+		}
+		else if (deferred_overlaps(fb.addr, fb.addr + get_byte_size_for_bound_color_framebuffer()) ||
+		         deferred_overlaps(fb.depth_addr, fb.depth_addr + get_byte_size_for_bound_depth_framebuffer()))
+			deferred_dirty = true;
 	}
 
 	// bind_stream_instance already waited for this instance's last use.
@@ -3237,8 +3300,19 @@ void Renderer::flush_queues()
 		pending_render_passes++;
 	}
 
-	if (render_pass_is_upscaled())
+	if (render_pass_is_upscaled() && has_single_sampled_render_pass && native_first_on())
 	{
+		ensure_command_buffer();
+		defer_upscaled_pass(!stream.tmem_upload_infos.empty());
+	}
+	else if (render_pass_is_upscaled())
+	{
+		// The held-back upscaled passes first, so upscaled passes keep their order.
+		if (!deferred_upscaled.empty())
+		{
+			ensure_command_buffer();
+			flush_deferred_upscaled();
+		}
 		if (has_single_sampled_render_pass)
 		{
 			// Joey64 (2026-11-10): N64_RDP_SPLIT_UPSCALED=1 always submits the 1x pass on its own here, so the fence
@@ -3266,6 +3340,101 @@ void Renderer::flush_queues()
 
 	begin_new_context();
 	maintain_queues();
+}
+
+bool Renderer::native_first_on() const
+{
+	return defer_upscaled && !caps.super_sample_readback && deferred_upscaled.size() < 16 &&
+	       native_first_allowed.load(std::memory_order_relaxed);
+}
+
+bool Renderer::deferred_overlaps(uint32_t begin, uint32_t end) const
+{
+	for (auto &d : deferred_upscaled)
+		if ((begin < d.color_end && d.color_begin < end) || (begin < d.depth_end && d.depth_begin < end))
+			return true;
+	return false;
+}
+
+void Renderer::defer_upscaled_pass(bool need_tmem_upload)
+{
+	DeferredUpscaled d;
+	d.instance = buffer_instance;
+	d.base_primitive_index = base_primitive_index;
+	d.fb_state = fb;
+	d.num_spans = uint32_t(stream.span_info_jobs.size());
+	d.num_triangles = uint32_t(stream.triangle_setup.size());
+	d.raster_states.assign(stream.static_raster_state_cache.data(),
+	                       stream.static_raster_state_cache.data() + stream.static_raster_state_cache.size());
+	d.color_begin = fb.addr;
+	d.color_end = fb.addr + get_byte_size_for_bound_color_framebuffer();
+	d.depth_begin = fb.depth_addr;
+	d.depth_end = fb.depth_addr + get_byte_size_for_bound_depth_framebuffer();
+
+	if (!deferred_tmem_pool.empty())
+	{
+		d.tmem_copy = std::move(deferred_tmem_pool.back());
+		deferred_tmem_pool.pop_back();
+	}
+	else
+	{
+		Vulkan::BufferCreateInfo info = {};
+		info.size = Limits::MaxTMEMInstances * 0x1000;
+		info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		info.domain = Vulkan::BufferDomain::Device;
+		d.tmem_copy = device->create_buffer(info);
+		device->set_name(*d.tmem_copy, "deferred-tmem");
+	}
+
+	// The TMEM it samples: the instances this pass made, or the TMEM as it stands.
+	auto &cmd = *stream.cmd;
+	VkDeviceSize size = need_tmem_upload ?
+	                    std::min<VkDeviceSize>((stream.tmem_upload_infos.size() + 1) * 0x1000, tmem_instances->get_create_info().size) :
+	                    tmem->get_create_info().size;
+	cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+	            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+	            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+	cmd.copy_buffer(*d.tmem_copy, 0, need_tmem_upload ? *tmem_instances : *tmem, 0, size);
+	cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT,
+	            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+	            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+	deferred_upscaled.push_back(std::move(d));
+	deferred_count++;
+}
+
+void Renderer::flush_deferred_upscaled()
+{
+	if (deferred_upscaled.empty())
+		return;
+	ensure_command_buffer();
+	auto &cmd = *stream.cmd;
+	const auto saved_fb = fb;
+	const unsigned saved_instance = buffer_instance;
+	const uint32_t saved_base = base_primitive_index;
+	for (auto &d : deferred_upscaled)
+	{
+		fb = d.fb_state;
+		buffer_instance = d.instance;
+		base_primitive_index = d.base_primitive_index;
+		recording_deferred = &d;
+		cmd.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+		            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+		submit_render_pass_upscaled(cmd, d.tmem_copy.get());
+		cmd.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+		            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+		recording_deferred = nullptr;
+		sync_indices_needs_flush |= 1u << d.instance;
+		pending_render_passes_upscaled++;
+		pending_primitives_upscaled += d.num_triangles;
+		deferred_tmem_pool.push_back(std::move(d.tmem_copy));
+	}
+	fb = saved_fb;
+	buffer_instance = saved_instance;
+	base_primitive_index = saved_base;
+	deferred_upscaled.clear();
+	deferred_dirty = false;
 }
 
 bool Renderer::render_pass_is_upscaled() const

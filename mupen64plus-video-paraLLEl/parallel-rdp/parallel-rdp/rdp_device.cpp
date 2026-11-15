@@ -1064,7 +1064,7 @@ void CommandProcessor::enqueue_command_direct(unsigned, const uint32_t *words)
 
 	case Op::MetaFlush:
 	{
-		renderer.flush_and_signal();
+		renderer.flush_and_signal_all();
 		break;
 	}
 
@@ -1307,7 +1307,7 @@ Vulkan::ImageHandle CommandProcessor::scanout(const ScanoutOptions &opts, VkImag
 	// Block idle callbacks triggering while we're doing this.
 	renderer.lock_command_processing();
 	{
-		renderer.flush_and_signal();
+		renderer.flush_and_signal_all();
 		if (!is_host_coherent)
 		{
 			unsigned offset, length;

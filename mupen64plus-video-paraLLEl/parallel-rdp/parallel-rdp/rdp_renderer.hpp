@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "rdp_data_structures.hpp"
 #include "device.hpp"
 #include "rdp_common.hpp"
@@ -32,6 +33,11 @@
 
 namespace RDP
 {
+// Joey64 native-first (N64_RDP_NATIVE_FIRST=1): smart sync allows it (synchronous parallel-RDP with page faults),
+// and a CPU wait on drawn pages asks for the held-back upscaled passes to be recorded before anything else.
+extern std::atomic<bool> native_first_allowed;
+extern std::atomic<bool> native_first_flush_request;
+
 struct CoherencyOperation;
 
 struct SyncObject
@@ -159,6 +165,10 @@ public:
 	// This is useful so we don't needlessly queue up work when we might as well kick it to the GPU.
 	void notify_idle_command_thread();
 	void flush_and_signal();
+	// flush_and_signal with the held-back upscaled passes too (native-first): before the picture is read.
+	void flush_and_signal_all();
+	// Records the upscaled passes native-first held back, in order.
+	void flush_deferred_upscaled();
 	// Joey64 run-ahead: no upscaled pass while set (the frame's picture is never shown); the native pass still runs.
 	void set_skip_upscaled(bool skip);
 	// Joey64 run-ahead: keep the RDP's own state (CommandProcessor::ra_state) or put it back.
@@ -359,6 +369,36 @@ private:
 	unsigned buffer_instance = 0;
 	void bind_stream_instance();
 	uint32_t base_primitive_index = 0;
+
+	// Joey64 native-first (Paper Mario, 2026-11-14): an upscaled pass is held back and recorded after the 1x passes
+	// that follow it, so a CPU wait on those (a read-back) doesn't wait for the upscaled work queued before them.
+	// What the held pass reads is kept: its buffer instance (not reused until it is recorded), the framebuffer, its
+	// counts and raster states, and a copy of the TMEM it sampled.
+	struct DeferredUpscaled
+	{
+		unsigned instance = 0;
+		uint32_t base_primitive_index = 0;
+		decltype(fb) fb_state;
+		uint32_t num_spans = 0, num_triangles = 0;
+		std::vector<StaticRasterizationState> raster_states;
+		Vulkan::BufferHandle tmem_copy;
+		uint32_t color_begin = 0, color_end = 0, depth_begin = 0, depth_end = 0;
+	};
+	std::vector<DeferredUpscaled> deferred_upscaled;
+	std::vector<Vulkan::BufferHandle> deferred_tmem_pool;
+	bool defer_upscaled = false;
+	// A 1x-only pass drew where a held-back pass draws: the next upscaled pass's domain update would copy that
+	// up before the held pass draws, so the held passes go first then.
+	bool deferred_dirty = false;
+	unsigned deferred_count = 0, deferred_flushes_conflict = 0, deferred_flushes_request = 0;
+	const DeferredUpscaled *recording_deferred = nullptr;
+	bool native_first_on() const;
+	void defer_upscaled_pass(bool need_tmem_upload);
+	bool deferred_overlaps(uint32_t begin, uint32_t end) const;
+	size_t num_span_jobs() const { return recording_deferred ? recording_deferred->num_spans : stream.span_info_jobs.size(); }
+	size_t num_triangles() const { return recording_deferred ? recording_deferred->num_triangles : stream.triangle_setup.size(); }
+	size_t num_raster_states() const { return recording_deferred ? recording_deferred->raster_states.size() : stream.static_raster_state_cache.size(); }
+	const StaticRasterizationState *raster_states() const { return recording_deferred ? recording_deferred->raster_states.data() : stream.static_raster_state_cache.data(); }
 	struct RaSaved
 	{
 		bool valid = false;
@@ -379,7 +419,7 @@ private:
 
 	void flush_queues();
 	void submit_render_pass(Vulkan::CommandBuffer &cmd);
-	void submit_render_pass_upscaled(Vulkan::CommandBuffer &cmd);
+	void submit_render_pass_upscaled(Vulkan::CommandBuffer &cmd, Vulkan::Buffer *tmem_override = nullptr);
 	void submit_render_pass_end(Vulkan::CommandBuffer &cmd);
 	void submit_to_queue();
 	void begin_new_context();
