@@ -543,8 +543,9 @@ static uint32_t deduce_acquire_release_family_index(Device &device, const Image 
 			return VK_QUEUE_FAMILY_IGNORED;
 	}
 
+	// The transfer queue's family, not compute's (libretro parallel-n64 b1213d1).
 	if (image.get_create_info().misc & IMAGE_MISC_CONCURRENT_QUEUE_ASYNC_TRANSFER_BIT)
-		if (queue_info.family_indices[QUEUE_INDEX_COMPUTE] != family)
+		if (queue_info.family_indices[QUEUE_INDEX_TRANSFER] != family)
 			return VK_QUEUE_FAMILY_IGNORED;
 
 	return family;

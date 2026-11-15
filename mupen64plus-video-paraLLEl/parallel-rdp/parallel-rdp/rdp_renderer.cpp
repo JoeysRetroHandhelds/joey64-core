@@ -1135,7 +1135,9 @@ static int32_t clamp_int32(int64_t v)
 static std::pair<int32_t, int32_t> interpolate_x(const TriangleSetup &setup, int y, bool flip, int scaling)
 {
 	// Interpolate in 64-bit so we are guaranteed to catch any overflow scenario.
-	int64_t yh_interpolation_base = setup.yh & ~(SUBPIXELS_Y - 1);
+	// Signed: through unsigned arithmetic a negative YH (top edge above the screen) became a large positive base line,
+	// so X came out wrong and the tile count could be 0 (libretro parallel-n64 5c3fd3b).
+	int64_t yh_interpolation_base = int(setup.yh) & ~int(SUBPIXELS_Y - 1);
 	int64_t ym_interpolation_base = setup.ym;
 	yh_interpolation_base *= scaling;
 	ym_interpolation_base *= scaling;
@@ -1949,7 +1951,9 @@ void Renderer::submit_rasterization(Vulkan::CommandBuffer &cmd, Vulkan::Buffer &
 
 	case FBFormat::RGBA8888:
 		global_fb_info->fb_size = 4;
-		global_fb_info->dx_shift = ~1u;
+		// Was dx_shift = ~1u, so a copy-mode primitive on a 32-bit framebuffer read whatever the constant ring held
+		// as its mask (libretro parallel-n64 79cf993).
+		global_fb_info->dx_mask = ~1u;
 		global_fb_info->dx_shift = 1;
 		break;
 	}
@@ -3525,8 +3529,10 @@ bool Renderer::tmem_upload_needs_flush(uint32_t addr) const
 
 		switch (fb.fmt)
 		{
+		// IA88 is 2 bytes a pixel, I8 one: they were the other way round, so a load from the second half of an IA88
+		// framebuffer's pending pixels read RDRAM before the draws there (libretro parallel-n64 a08bedc).
 		case FBFormat::RGBA5551:
-		case FBFormat::I8:
+		case FBFormat::IA88:
 			offset >>= 1;
 			break;
 
