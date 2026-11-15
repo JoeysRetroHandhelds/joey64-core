@@ -408,7 +408,28 @@ static uintptr_t last_fault_pc;
 // may run on into the drawn bytes of the same page after its first fault, so it always waits: letting those
 // through left Cruis'n USA's RSP looping forever on its boot screen.
 static bool precise;
-static vector<pair<uint32_t, uint32_t>> drawn, locked_ranges;
+static vector<pair<uint32_t, uint32_t>> drawn;
+// Locked byte ranges with the timeline value of the SyncFull that locked them.
+struct StampedRange { uint32_t start, end; uint64_t stamp; };
+static vector<StampedRange> locked_ranges;
+// Per-page stamps (gopher64's idea, its RdramTracker): the timeline value of the newest SyncFull that locked each
+// page. A wait is only for that SyncFull, not the newest one, and unlocks only the pages it covers. Paper Mario at
+// 4x in Boo's Mansion reads an off-screen picture drawn before the frame's second SyncFull: waiting for the newest
+// one waited for the whole 4x scene too (Portal: 10.7 ms a wait against 1.6 at 1x). N64_RDP_SMART_STAMP=0: the
+// old way (wait for the newest SyncFull, unlock everything).
+static vector<uint64_t> page_stamp;
+static bool stamped = true;
+static unsigned waits_earlier;
+// Split waits (N64_RDP_SMART_SPLIT=0 turns it off): pages the CPU has waited on (readback) mark the images drawn
+// there; when the RDP moves on from such an image to another, the timeline is signalled right away, and what was
+// drawn so far gets that value (drawn_split, split_stamp) instead of the next SyncFull's. A read of it then waits
+// only for the work up to that point. Paper Mario in Boo's Mansion draws two 32x65 pictures in the middle of the
+// 4x main scene and reads one after the SyncFull: the wait covered the main scene's later 4x passes too.
+static bool split_on = true, pending_split;
+static vector<uint8_t> readback, since_split;
+static vector<uint64_t> split_stamp;
+static vector<StampedRange> drawn_split;
+static unsigned splits;
 static unsigned faults_inside, faults_outside, faults_copy;
 // A page opened that way is locked again ~0.5 ms later by a helper thread (relock_main), so a later read of its
 // drawn part faults and waits again instead of seeing stale RDRAM until the next SyncFull (on Turnip/Adreno
@@ -447,9 +468,21 @@ static void add_range(vector<pair<uint32_t, uint32_t>> &ranges, uint32_t start, 
 static bool touches_locked_range(uint32_t start, uint32_t end)
 {
 	for (auto &r : locked_ranges)
-		if (start < r.second && end > r.first)
+		if (start < r.end && end > r.start)
 			return true;
 	return false;
+}
+
+static void add_locked_range(uint32_t start, uint32_t end, uint64_t stamp)
+{
+	for (auto &r : locked_ranges)
+		if (r.stamp == stamp && start <= r.end && end >= r.start)
+		{
+			r.start = min(r.start, start);
+			r.end = max(r.end, end);
+			return;
+		}
+	locked_ranges.push_back({ start, end, stamp });
 }
 
 static bool from_dynarec(void *uc)
@@ -474,11 +507,50 @@ static void set_pages(uint32_t start, uint32_t end, uint8_t kind)
 	if (precise || debug)
 		add_range(drawn, start, end);
 	for (size_t p = start >> page_shift; p <= ((end - 1) >> page_shift); p++)
+	{
 		dirty[p] |= kind;
+		since_split[p] = 1;
+		if (readback[p])
+			pending_split = true;
+	}
+}
+
+// N64_RDP_SMART_DEBUG: the color images drawn since the last report (address, width, size, draws, rows, and in
+// which half of the SyncFull pair the last draw was), to see what the CPU reads back.
+struct FbSeen { uint32_t addr, width, size, draws, rows, last_sync; };
+static FbSeen fb_seen[8];
+static unsigned fault_parity[2];
+// N64_RDP_SMART_DEBUG: the order of color images, draws, SyncFulls and waits over a few SyncFulls once (syncs 1200-1204).
+static char trace_buf[1200];
+static int trace_len;
+static uint32_t trace_last_addr;
+static void trace(const char *fmt, uint32_t v)
+{
+	if (!debug || sync_count < 1200 || sync_count > 1204 || trace_len > int(sizeof(trace_buf)) - 24)
+		return;
+	trace_len += snprintf(trace_buf + trace_len, sizeof(trace_buf) - trace_len, fmt, v);
+}
+static void note_fb()
+{
+	if (color_addr != trace_last_addr)
+	{
+		trace(" D%06x", color_addr);
+		trace_last_addr = color_addr;
+	}
+	for (auto &f : fb_seen)
+		if (!f.draws || (f.addr == color_addr && f.width == color_width))
+		{
+			f.addr = color_addr; f.width = color_width; f.size = color_size; f.draws++;
+			f.rows = max(f.rows, scissor_yl + 1);
+			f.last_sync = sync_count;
+			return;
+		}
 }
 
 static void mark_draw(bool zbuffered)
 {
+	if (debug)
+		note_fb();
 	uint32_t stride = color_size ? (color_width << (color_size - 1)) : (color_width >> 1);
 	uint32_t y0 = scissor_yh, y1 = scissor_yl + 1;
 	if (!stride || y1 <= y0)
@@ -520,6 +592,43 @@ static void unlock_all()
 	locked_ranges.clear();
 }
 
+// Unlocks the pages (and ranges) locked by SyncFulls up to stamp, which the GPU has reached.
+static void unlock_upto(uint64_t stamp)
+{
+	Guard g;
+	if (any_opened)
+	{
+		bool still = false;
+		for (size_t p = 0; p < opened.size(); p++)
+			if (opened[p])
+			{
+				if (page_stamp[p] <= stamp)
+					opened[p] = 0;
+				else
+					still = true;
+			}
+		any_opened = still;
+	}
+	if (!any_locked)
+		return;
+	protect_runs([stamp](size_t p) { return locked[p] != 0 && page_stamp[p] <= stamp; }, PROT_READ | PROT_WRITE);
+	bool still = false;
+	for (size_t p = 0; p < locked.size(); p++)
+		if (locked[p])
+		{
+			if (page_stamp[p] <= stamp)
+				locked[p] = 0;
+			else
+				still = true;
+		}
+	any_locked = still;
+	size_t n = 0;
+	for (auto &r : locked_ranges)
+		if (r.stamp > stamp)
+			locked_ranges[n++] = r;
+	locked_ranges.resize(n);
+}
+
 static void *relock_main(void *)
 {
 	for (;;)
@@ -545,9 +654,32 @@ static void *relock_main(void *)
 	return nullptr;
 }
 
+static void split_now()
+{
+	pending_split = false;
+	uint64_t v = frontend->signal_timeline();
+	splits++;
+	for (auto &r : drawn)
+		drawn_split.push_back({ r.first, r.second, v });
+	drawn.clear();
+	for (size_t p = 0; p < dirty.size(); p++)
+		if (dirty[p] && since_split[p])
+		{
+			split_stamp[p] = v;
+			since_split[p] = 0;
+		}
+}
+
 static void on_sync_full()
 {
 	sync_signal = frontend->signal_timeline();
+	trace(" |S%u|", sync_count + 1);
+	trace_last_addr = 0;
+	if (debug && sync_count == 1205 && trace_len)
+	{
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart trace:%s\n", trace_buf);
+		trace_len = 0;
+	}
 	if (++sync_count % 600 == 0)
 	{
 		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync: %u CPU waits in the last 600 SyncFulls.\n", faults);
@@ -567,19 +699,40 @@ static void on_sync_full()
 			pages[n] = 0;
 			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart debug: %u faults inside drawn bytes, %u copies starting outside them, %u dynarec accesses only on a shared page;%s\n",
 			       faults_inside, faults_copy, faults_outside, pages);
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart debug: %u waits for an earlier SyncFull than the newest (stamps %s), %u splits\n",
+			       waits_earlier, stamped ? "on" : "off", splits);
+			splits = 0;
+			char fbs[400];
+			int m = 0;
+			for (auto &f : fb_seen)
+				if (f.draws && m < int(sizeof(fbs)) - 60)
+					m += snprintf(fbs + m, sizeof(fbs) - m, " 0x%06x w%u s%u rows %u draws %u%s;", f.addr, f.width, f.size,
+					              f.rows, f.draws, (f.last_sync & 1) ? " odd" : " even");
+			fbs[m] = 0;
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart debug: waits after an even SyncFull %u, odd %u; images:%s\n", fault_parity[0], fault_parity[1], fbs);
+			fault_parity[0] = fault_parity[1] = 0;
+			memset(fb_seen, 0, sizeof(fb_seen));
 			faults_inside = faults_outside = faults_copy = 0;
+			waits_earlier = 0;
 			memset(outside_count, 0, sizeof(outside_count));
 		}
 	}
 	Guard g;
 	for (auto &r : drawn)
-		add_range(locked_ranges, r.first, r.second);
+		add_locked_range(r.first, r.second, sync_signal);
 	drawn.clear();
+	for (auto &r : drawn_split)
+		add_locked_range(r.start, r.end, r.stamp);
+	drawn_split.clear();
+	pending_split = false;
 	protect_runs([](size_t p) { return dirty[p] && !locked[p]; }, PROT_NONE);
 	for (size_t p = 0; p < dirty.size(); p++)
 		if (dirty[p])
 		{
 			locked[p] |= dirty[p];
+			page_stamp[p] = (since_split[p] || !split_stamp[p]) ? sync_signal : split_stamp[p];
+			split_stamp[p] = 0;
+			since_split[p] = 0;
 			dirty[p] = 0;
 			any_locked = true;
 		}
@@ -597,6 +750,8 @@ static void handler(int sig, siginfo_t *info, void *uc)
 		{
 			faults_kind[locked[size_t(addr - rdram) >> page_shift] & 3]++;
 			last_fault_offset = uint32_t(addr - rdram);
+			fault_parity[sync_count & 1]++;
+			trace(" W%06x", uint32_t(addr - rdram));
 #if defined(__aarch64__)
 			last_fault_pc = static_cast<ucontext_t *>(uc)->uc_mcontext.pc;
 #endif
@@ -637,8 +792,23 @@ static void handler(int sig, siginfo_t *info, void *uc)
 			sem_post(&relock_sem); // async-signal-safe
 			return;
 		}
-		frontend->wait_for_timeline(sync_signal);
-		unlock_all();
+		if (stamped)
+		{
+			uint64_t stamp = page_stamp[offset >> page_shift];
+			if (!stamp || stamp > sync_signal)
+				stamp = sync_signal;
+			if (split_on)
+				readback[offset >> page_shift] = 1;
+			if (debug && stamp < sync_signal)
+				waits_earlier++;
+			frontend->wait_for_timeline(stamp);
+			unlock_upto(stamp);
+		}
+		else
+		{
+			frontend->wait_for_timeline(sync_signal);
+			unlock_all();
+		}
 		faults++;
 		return; // the access is retried, now with the RDP's results in RDRAM
 	}
@@ -666,6 +836,10 @@ static void reset_after_drain()
 	unlock_all();
 	fill(dirty.begin(), dirty.end(), 0);
 	drawn.clear();
+	drawn_split.clear();
+	fill(since_split.begin(), since_split.end(), 0);
+	fill(split_stamp.begin(), split_stamp.end(), 0);
+	pending_split = false;
 	sync_signal = 0;
 }
 
@@ -691,6 +865,14 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	debug = dbg && dbg[0] == '1';
 	const char *pre = getenv("N64_RDP_SMART_PRECISE");
 	precise = !(pre && pre[0] == '0');
+	const char *stp = getenv("N64_RDP_SMART_STAMP");
+	stamped = !(stp && stp[0] == '0');
+	const char *spl = getenv("N64_RDP_SMART_SPLIT");
+	split_on = stamped && !(spl && spl[0] == '0');
+	waits_earlier = 0;
+	splits = 0;
+	pending_split = false;
+	drawn_split.clear();
 	drawn.clear();
 	locked_ranges.clear();
 	long ps = sysconf(_SC_PAGESIZE);
@@ -701,6 +883,10 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	rdram_size = size;
 	dirty.assign(size >> page_shift, 0);
 	locked.assign(size >> page_shift, 0);
+	page_stamp.assign(size >> page_shift, 0);
+	readback.assign(size >> page_shift, 0);
+	since_split.assign(size >> page_shift, 0);
+	split_stamp.assign(size >> page_shift, 0);
 	opened.assign(size >> page_shift, 0);
 	any_opened = false;
 	if (precise && !relock_started)
@@ -726,7 +912,8 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 		handler_installed = true;
 	}
 	enabled = true;
-	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync on (%ld-byte pages%s).\n", ps, precise ? ", precise" : "");
+	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync on (%ld-byte pages%s%s).\n", ps, precise ? ", precise" : "",
+	       stamped ? (split_on ? ", per-SyncFull waits, split waits" : ", per-SyncFull waits") : "");
 }
 
 static void deinit()
@@ -741,6 +928,8 @@ static void track(RDP::Op op, uint32_t w1, uint32_t w2)
 	switch (op)
 	{
 	case RDP::Op::SetColorImage:
+		if (pending_split && (w2 & 0x00FFFFFF) != color_addr)
+			split_now();
 		color_addr = w2 & 0x00FFFFFF;
 		color_size = (w1 >> 19) & 3;
 		color_width = (w1 & 0x3FF) + 1;
