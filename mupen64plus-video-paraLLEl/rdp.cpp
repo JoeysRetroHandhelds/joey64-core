@@ -615,6 +615,19 @@ static bool from_dynarec(void *uc)
 #endif
 }
 
+// parallel-RDP's ranges (N64_RDP_SMART_PRDP_RANGES=0 turns it off, 2026-11-15): each render pass copies back the bound
+// colour image from row 0 and the depth image (width x rows x 2 at the mask image) whether the pass writes z or not,
+// masked to bytes the GPU has written there since that page's last plain upload. A page whose upload was masked (a
+// copy-back for it was still on its way) keeps its old mask, so the copy-back writes the GPU's old bytes again. RE2
+// at 4x: non-z draws elsewhere with the mask image at 0x189a00 (a 512 x 150 colour image drawn earlier) copied a whole
+// stale picture back over data the CPU had put there since, and the overlay unpacked from it was junk (blank end, 2-4
+// of 8 runs; N64_RDP_SMART_STAMP=0, which waits for everything, 0 of 16). These rows and depth ranges are tracked
+// too, but only on pages the GPU has drawn on before (gpu_wrote), so pages it never wrote (page 0's OS globals under
+// a mask image left at 0) stay open.
+static bool prdp_ranges = true;
+static vector<uint8_t> gpu_wrote;
+static unsigned prdp_pages;
+static void set_pages_written(uint32_t start, uint32_t end, uint8_t kind);
 static void set_pages(uint32_t start, uint32_t end, uint8_t kind)
 {
 	if (start >= rdram_size)
@@ -638,6 +651,26 @@ static void set_pages(uint32_t start, uint32_t end, uint8_t kind)
 		}
 		if (readback[p])
 			pending_split = true;
+		gpu_wrote[p] = 1;
+	}
+}
+
+static void set_pages_written(uint32_t start, uint32_t end, uint8_t kind)
+{
+	if (start >= rdram_size || end <= start)
+		return;
+	if (end > rdram_size)
+		end = rdram_size;
+	size_t p0 = start >> page_shift, p1 = ((end - 1) >> page_shift) + 1;
+	for (size_t p = p0; p < p1;)
+	{
+		if (!gpu_wrote[p] || (dirty[p] & kind)) { p++; continue; }
+		size_t q = p;
+		while (q < p1 && gpu_wrote[q] && !(dirty[q] & kind))
+			q++;
+		prdp_pages += unsigned(q - p);
+		set_pages(uint32_t(max<size_t>(start, p << page_shift)), uint32_t(min<size_t>(end, q << page_shift)), kind);
+		p = q;
 	}
 }
 
@@ -684,6 +717,18 @@ static void mark_draw(bool zbuffered)
 	set_pages(color_addr + y0 * stride, color_addr + y1 * stride, 1);
 	if (zbuffered && depth_write)
 		set_pages(depth_addr + y0 * color_width * 2, depth_addr + y1 * color_width * 2, 2);
+	if (prdp_ranges)
+	{
+		if (y0)
+			set_pages_written(color_addr, color_addr + y0 * stride, 1);
+		if (zbuffered && depth_write)
+		{
+			if (y0)
+				set_pages_written(depth_addr, depth_addr + y0 * color_width * 2, 2);
+		}
+		else
+			set_pages_written(depth_addr, depth_addr + y1 * color_width * 2, 2);
+	}
 }
 
 // Coalesced mprotect over runs of pages where pick(p) is set.
@@ -847,6 +892,11 @@ static void on_sync_full()
 			faults_early = 0;
 		}
 		faults = 0;
+		if (prdp_ranges)
+		{
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart ranges: %u pages beside the drawn rows (rows above the scissor, depth of non-z draws)\n", prdp_pages);
+			prdp_pages = 0;
+		}
 		if (split_on && split_writes_full)
 		{
 			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart split: %u writes waited for the whole SyncFull, %u on read-only pages, %u stores through the alias\n",
@@ -1112,10 +1162,14 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	page_stamp.assign(size >> page_shift, 0);
 	readback.assign(size >> page_shift, 0);
 	since_split.assign(size >> page_shift, 0);
+	gpu_wrote.assign(size >> page_shift, 0);
 	stamp_split.assign(size >> page_shift, 0);
 	page_full.assign(size >> page_shift, 0);
 	split_readonly_waits = 0;
 	{
+		const char *ppr = getenv("N64_RDP_SMART_PRDP_RANGES");
+		prdp_ranges = !(ppr && ppr[0] == '0');
+		prdp_pages = 0;
 		const char *swf = getenv("N64_RDP_SPLIT_WRITES_FULL");
 		split_writes_full = !(swf && swf[0] == '0');
 		split_promoted = 0;
