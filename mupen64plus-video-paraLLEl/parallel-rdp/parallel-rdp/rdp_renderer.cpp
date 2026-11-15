@@ -93,7 +93,8 @@ bool Renderer::init_renderer(const RendererOptions &options)
 {
 	{
 		const char *nf = getenv("N64_RDP_NATIVE_FIRST");
-		defer_upscaled = nf && nf[0] == '1';
+		defer_upscaled = nf && (nf[0] == '1' || nf[0] == '2');
+		native_first_always = nf && nf[0] == '2';
 		deferred_upscaled.clear();
 		if (defer_upscaled)
 			LOGI("native-first: upscaled passes may wait behind later 1x passes.\n");
@@ -3239,11 +3240,17 @@ void Renderer::flush_queues()
 {
 	// Native-first: the CPU waited on drawn pages, so it may write them next; the held-back upscaled passes go
 	// first, before a later pass's upscaled-domain update can see that write.
-	if (native_first_flush_request.exchange(false, std::memory_order_acq_rel) && !deferred_upscaled.empty())
+	if (native_first_flush_request.exchange(false, std::memory_order_acq_rel))
 	{
-		deferred_flushes_request++;
-		flush_deferred_upscaled();
+		native_first_live = 600;
+		if (!deferred_upscaled.empty())
+		{
+			deferred_flushes_request++;
+			flush_deferred_upscaled();
+		}
 	}
+	else if (native_first_live)
+		native_first_live--;
 	if (stream.tmem_upload_infos.empty() && stream.span_info_jobs.empty())
 	{
 		base_primitive_index += stream.triangle_setup.size();
@@ -3344,7 +3351,8 @@ void Renderer::flush_queues()
 
 bool Renderer::native_first_on() const
 {
-	return defer_upscaled && !caps.super_sample_readback && deferred_upscaled.size() < 16 &&
+	return defer_upscaled && (native_first_live || native_first_always) && !caps.super_sample_readback &&
+	       deferred_upscaled.size() < 16 &&
 	       native_first_allowed.load(std::memory_order_relaxed);
 }
 

@@ -390,6 +390,11 @@ private:
 	// A 1x-only pass drew where a held-back pass draws: the next upscaled pass's domain update would copy that
 	// up before the held pass draws, so the held passes go first then.
 	bool deferred_dirty = false;
+	// Flushes left in which passes are held back: 600 again at each CPU wait. A game that never waits on the GPU
+	// gains nothing from holding back and pays its TMEM copies (GoldenEye 2.39 -> 3.53 ms at 4x, Odin 2 Portal).
+	// N64_RDP_NATIVE_FIRST=2 holds back always.
+	unsigned native_first_live = 0;
+	bool native_first_always = false;
 	unsigned deferred_count = 0, deferred_flushes_conflict = 0, deferred_flushes_request = 0;
 	const DeferredUpscaled *recording_deferred = nullptr;
 	bool native_first_on() const;
