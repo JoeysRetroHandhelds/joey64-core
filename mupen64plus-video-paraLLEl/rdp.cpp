@@ -431,6 +431,20 @@ static bool split_on = true, pending_split;
 static vector<uint8_t> readback, since_split;
 static vector<uint64_t> split_stamp;
 static vector<StampedRange> drawn_split;
+// Split stamps only for dynarec loads (N64_RDP_SPLIT_WRITES_FULL=0 turns it off, 2026-11-15): a page whose stamp is
+// a split's (stamp_split) holds the image the CPU reads mid-frame, but the RDP may draw there after the split too.
+// A write (a DMA, a copy, a dynarec store) that waits only for the split and unlocks the page is then overwritten by
+// the later work's copy-back. Cruis'n USA at 4x: the game DMAs code to 0x480, inside the depth buffer's first page,
+// after each frame; the copy-back put depth values over it about 1 run in 2 (N64_RDP_SMART_SPLIT=0: 0 of 6).
+static bool split_writes_full = true;
+static vector<uint8_t> stamp_split;
+// The whole SyncFull's signal for a page with a split stamp. A wait for a split stamp opens such a page read-only
+// (locked bit 8) while its SyncFull's work isn't done: RDP work after the split can still land on it (Cruis'n USA:
+// a dynarec read on another page waited for the split, unlocked page 0, and the next code DMA there went through
+// without a fault, under the depth copy-back still to come). A write then faults and waits for page_full.
+static vector<uint64_t> page_full;
+static unsigned split_readonly_waits, split_ro_stores;
+static unsigned split_promoted;
 static unsigned splits;
 static unsigned faults_inside, faults_outside, faults_copy;
 // A page opened that way is locked again ~0.5 ms later by a helper thread (relock_main), so a later read of its
@@ -449,6 +463,19 @@ struct Guard
 };
 static uint32_t outside_page[8];
 static unsigned outside_count[8];
+// N64_RDP_SMART_EARLY=1 (experiment): pages drawn since the last SyncFull are protected at once (locked bit 4), and a
+// CPU access to one flushes the RDP work so far and waits for it. Without it those pages are open until the SyncFull,
+// so a DMA that writes them meanwhile is overwritten when the GPU's (late) results are copied back. Cruis'n USA at 4x
+// (2026-11-14): the depth buffer at 0x480 shares memory with code loaded on Start; it crashed into 0x800004b8.
+static bool early;
+static unsigned faults_early;
+static uint32_t early_last;
+// N64_RDP_SMART_EMULATE=1 (experiment, 2026-11-15): a dynarec load or store whose bytes miss what the RDP drew is done
+// here through g_rdram_alias and skipped, so the page stays locked and nothing waits. Precise mode opens the page for
+// 0.5 ms instead (a hole Cruis'n USA's RSP falls into); page level waits for the whole frame (Thor: a CPU variable at
+// 0x1657a0 shares its page with the framebuffer at 0x165900, 555 waits per 600 SyncFulls at 4x).
+static bool emulate;
+static unsigned faults_emulated;
 
 // RDP state that decides where draws land
 static uint32_t color_addr, color_width, color_size, depth_addr;
@@ -487,6 +514,95 @@ static void add_locked_range(uint32_t start, uint32_t end, uint64_t stamp)
 	locked_ranges.push_back({ start, end, stamp });
 }
 
+// Does the faulting AArch64 load or store at the PC for [offset, offset + size) through the alias and steps past it.
+// Only LDR/STR (and LDRS*) with an unsigned immediate, a register offset or an unscaled immediate, general registers,
+// no writeback, and an access aligned to its size (so it can't run into the next page). Anything else: false.
+static bool emulate_access(void *uc, uint32_t offset)
+{
+#if defined(__aarch64__)
+	auto &mc = static_cast<ucontext_t *>(uc)->uc_mcontext;
+	if (!g_rdram_alias)
+		return false;
+	uint32_t insn = *reinterpret_cast<const uint32_t *>(mc.pc);
+	if (((insn >> 27) & 7) != 7 || ((insn >> 26) & 1))
+		return false;
+	uint32_t kind = (insn >> 24) & 3;
+	if (kind == 0)
+	{
+		uint32_t mode = (insn >> 10) & 3;
+		bool regoff = ((insn >> 21) & 1) && mode == 2;
+		bool unscaled = !((insn >> 21) & 1) && mode == 0;
+		if (!regoff && !unscaled)
+			return false;
+	}
+	else if (kind != 1)
+		return false;
+	uint32_t size = insn >> 30, opc = (insn >> 22) & 3, rt = insn & 31;
+	uint32_t bytes = 1u << size;
+	if ((offset & (bytes - 1)) || offset + bytes > rdram_size)
+		return false;
+	if (size == 3 && opc >= 2)
+		return false; // PRFM and the like
+	if (size == 2 && opc == 3)
+		return false;
+	if (touches_locked_range(offset, offset + bytes))
+		return false;
+	uint8_t *mem = static_cast<uint8_t *>(g_rdram_alias) + offset;
+	if (opc == 0)
+	{
+		uint64_t v = rt == 31 ? 0 : mc.regs[rt];
+		switch (bytes)
+		{
+		case 1: *reinterpret_cast<volatile uint8_t *>(mem) = uint8_t(v); break;
+		case 2: *reinterpret_cast<volatile uint16_t *>(mem) = uint16_t(v); break;
+		case 4: *reinterpret_cast<volatile uint32_t *>(mem) = uint32_t(v); break;
+		default: *reinterpret_cast<volatile uint64_t *>(mem) = v; break;
+		}
+	}
+	else
+	{
+		uint64_t v;
+		switch (bytes)
+		{
+		case 1: v = *reinterpret_cast<volatile uint8_t *>(mem); break;
+		case 2: v = *reinterpret_cast<volatile uint16_t *>(mem); break;
+		case 4: v = *reinterpret_cast<volatile uint32_t *>(mem); break;
+		default: v = *reinterpret_cast<volatile uint64_t *>(mem); break;
+		}
+		if (opc >= 2)
+		{
+			unsigned sh = 64 - 8 * bytes;
+			v = uint64_t(int64_t(v << sh) >> sh);
+			if (opc == 3)
+				v &= 0xffffffffu;
+		}
+		if (rt != 31)
+			mc.regs[rt] = v;
+	}
+	mc.pc += 4;
+	return true;
+#else
+	(void)uc; (void)offset;
+	return false;
+#endif
+}
+
+static bool from_dynarec(void *uc);
+static bool dynarec_load(void *uc)
+{
+#if defined(__aarch64__)
+	if (!from_dynarec(uc))
+		return false;
+	uint32_t insn = *reinterpret_cast<const uint32_t *>(static_cast<ucontext_t *>(uc)->uc_mcontext.pc);
+	if (((insn >> 27) & 7) != 7 || ((insn >> 26) & 1) || ((insn >> 24) & 3) == 2 || ((insn >> 24) & 3) == 3)
+		return false;
+	return ((insn >> 22) & 3) != 0;
+#else
+	(void)uc;
+	return false;
+#endif
+}
+
 static bool from_dynarec(void *uc)
 {
 #if defined(__aarch64__)
@@ -506,12 +622,20 @@ static void set_pages(uint32_t start, uint32_t end, uint8_t kind)
 	if (end > rdram_size)
 		end = rdram_size;
 	ra_cow_drawn(start, end); // before the GPU gets the draw: run-ahead keeps these pages' bytes first
-	if (precise || debug)
+	if (precise || debug || emulate)
 		add_range(drawn, start, end);
 	for (size_t p = start >> page_shift; p <= ((end - 1) >> page_shift); p++)
 	{
 		dirty[p] |= kind;
 		since_split[p] = 1;
+		if (early && !(locked[p] & 4))
+		{
+			Guard g;
+			if (!locked[p])
+				mprotect(rdram + (p << page_shift), size_t(1) << page_shift, PROT_NONE);
+			locked[p] |= 4;
+			any_locked = true;
+		}
 		if (readback[p])
 			pending_split = true;
 	}
@@ -613,13 +737,44 @@ static void unlock_upto(uint64_t stamp)
 	}
 	if (!any_locked)
 		return;
-	protect_runs([stamp](size_t p) { return locked[p] != 0 && page_stamp[p] <= stamp; }, PROT_READ | PROT_WRITE);
+	auto ro = [stamp](size_t p) { return split_writes_full && stamp_split[p] && page_full[p] > stamp; };
+	protect_runs([stamp, &ro](size_t p) {
+		if (!locked[p] || (locked[p] & 4))
+			return false;
+		if (locked[p] & 8)
+			return page_full[p] <= stamp;
+		return page_stamp[p] <= stamp && !ro(p);
+	}, PROT_READ | PROT_WRITE);
+	protect_runs([stamp, &ro](size_t p) {
+		return locked[p] && !(locked[p] & (4 | 8)) && page_stamp[p] <= stamp && ro(p);
+	}, PROT_READ);
 	bool still = false;
 	for (size_t p = 0; p < locked.size(); p++)
 		if (locked[p])
 		{
-			if (page_stamp[p] <= stamp)
-				locked[p] = 0;
+			if (locked[p] & 4)
+			{
+				if (page_stamp[p] <= stamp)
+					locked[p] = 4;
+				still = true;
+			}
+			else if (locked[p] & 8)
+			{
+				if (page_full[p] <= stamp)
+					locked[p] = 0;
+				else
+					still = true;
+			}
+			else if (page_stamp[p] <= stamp)
+			{
+				if (ro(p))
+				{
+					locked[p] = 8;
+					still = true;
+				}
+				else
+					locked[p] = 0;
+			}
 			else
 				still = true;
 		}
@@ -685,7 +840,26 @@ static void on_sync_full()
 	if (++sync_count % 600 == 0)
 	{
 		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync: %u CPU waits in the last 600 SyncFulls.\n", faults);
+		if (early)
+		{
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart early: %u waits on pages drawn before their SyncFull, last at 0x%06x\n",
+			       faults_early, early_last);
+			faults_early = 0;
+		}
 		faults = 0;
+		if (split_on && split_writes_full)
+		{
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart split: %u writes waited for the whole SyncFull, %u on read-only pages, %u stores through the alias\n",
+			       split_promoted, split_readonly_waits, split_ro_stores);
+			split_ro_stores = 0;
+			split_promoted = 0;
+			split_readonly_waits = 0;
+		}
+		if (emulate)
+		{
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart emulate: %u accesses done through the alias\n", faults_emulated);
+			faults_emulated = 0;
+		}
 		if (debug)
 		{
 			Dl_info info = {};
@@ -727,12 +901,14 @@ static void on_sync_full()
 		add_locked_range(r.start, r.end, r.stamp);
 	drawn_split.clear();
 	pending_split = false;
-	protect_runs([](size_t p) { return dirty[p] && !locked[p]; }, PROT_NONE);
+	protect_runs([](size_t p) { return dirty[p] && (!locked[p] || (locked[p] & 8)); }, PROT_NONE);
 	for (size_t p = 0; p < dirty.size(); p++)
 		if (dirty[p])
 		{
-			locked[p] |= dirty[p];
+			locked[p] = (locked[p] & 3) | dirty[p];
 			page_stamp[p] = (since_split[p] || !split_stamp[p]) ? sync_signal : split_stamp[p];
+			stamp_split[p] = page_stamp[p] != sync_signal;
+			page_full[p] = sync_signal;
 			split_stamp[p] = 0;
 			since_split[p] = 0;
 			dirty[p] = 0;
@@ -759,8 +935,31 @@ static void handler(int sig, siginfo_t *info, void *uc)
 #endif
 		}
 		uint32_t offset = uint32_t(addr - rdram);
-		bool inside = !(precise || debug) || touches_locked_range(offset, offset + 8);
-		bool single = (precise || debug) && from_dynarec(uc);
+		if (locked[offset >> page_shift] & 8)
+		{
+			// A dynarec store goes through the alias and the page stays read-only (Paper Mario in Boo's Mansion
+			// writes next to the picture it just read, every frame: waiting took 3.4 -> 8.9 ms at 4x). Copies and
+			// DMAs (Cruis'n USA's code load) wait for the whole SyncFull.
+			if (from_dynarec(uc) && emulate_access(uc, offset))
+			{
+				split_ro_stores++;
+				return;
+			}
+			uint64_t full = page_full[offset >> page_shift];
+			frontend->wait_for_timeline(full);
+			unlock_upto(full);
+			split_readonly_waits++;
+			faults++;
+			faults_total.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		bool inside = !(precise || debug || emulate) || touches_locked_range(offset, offset + 8);
+		bool single = (precise || debug || emulate) && from_dynarec(uc);
+		if (emulate && !inside && single && emulate_access(uc, offset))
+		{
+			faults_emulated++;
+			return;
+		}
 		if (debug)
 		{
 			if (inside)
@@ -779,6 +978,18 @@ static void handler(int sig, siginfo_t *info, void *uc)
 						break;
 					}
 			}
+		}
+		if (early && (locked[offset >> page_shift] & 4))
+		{
+			// Drawn since the last SyncFull: flush what the RDP has so far and wait for all of it.
+			uint64_t v = frontend->signal_timeline();
+			frontend->wait_for_timeline(v);
+			faults_early++;
+			early_last = offset;
+			unlock_all();
+			faults++;
+			faults_total.fetch_add(1, std::memory_order_relaxed);
+			return;
 		}
 		if (precise && !inside && single)
 		{
@@ -799,6 +1010,11 @@ static void handler(int sig, siginfo_t *info, void *uc)
 			uint64_t stamp = page_stamp[offset >> page_shift];
 			if (!stamp || stamp > sync_signal)
 				stamp = sync_signal;
+			if (split_writes_full && stamp < sync_signal && stamp_split[offset >> page_shift] && !dynarec_load(uc))
+			{
+				stamp = sync_signal;
+				split_promoted++;
+			}
 			if (split_on)
 				readback[offset >> page_shift] = 1;
 			if (debug && stamp < sync_signal)
@@ -869,6 +1085,12 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	debug = dbg && dbg[0] == '1';
 	const char *pre = getenv("N64_RDP_SMART_PRECISE");
 	precise = !(pre && pre[0] == '0');
+	const char *ear = getenv("N64_RDP_SMART_EARLY");
+	early = ear && ear[0] == '1';
+	faults_early = 0;
+	const char *emu = getenv("N64_RDP_SMART_EMULATE");
+	emulate = emu && emu[0] == '1' && g_rdram_alias;
+	faults_emulated = 0;
 	const char *stp = getenv("N64_RDP_SMART_STAMP");
 	stamped = !(stp && stp[0] == '0');
 	const char *spl = getenv("N64_RDP_SMART_SPLIT");
@@ -890,6 +1112,14 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	page_stamp.assign(size >> page_shift, 0);
 	readback.assign(size >> page_shift, 0);
 	since_split.assign(size >> page_shift, 0);
+	stamp_split.assign(size >> page_shift, 0);
+	page_full.assign(size >> page_shift, 0);
+	split_readonly_waits = 0;
+	{
+		const char *swf = getenv("N64_RDP_SPLIT_WRITES_FULL");
+		split_writes_full = !(swf && swf[0] == '0');
+		split_promoted = 0;
+	}
 	split_stamp.assign(size >> page_shift, 0);
 	opened.assign(size >> page_shift, 0);
 	any_opened = false;
