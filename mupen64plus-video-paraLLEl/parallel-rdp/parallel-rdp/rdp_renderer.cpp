@@ -3006,9 +3006,14 @@ void Renderer::resolve_coherency_host_to_gpu(Vulkan::CommandBuffer &cmd)
 	// in flight: after a put back, the next frame's uploads of the put-back (older) RDRAM went under the shown extra
 	// frame's VI fetch, which rewrote the upscaled picture from them (Paper Mario at 4x on the Thor showed a frame of
 	// the other scene about 300 times a minute). In stream order the copies come after that fetch.
-	// N64_RDP_ORDERED_UPLOAD=0: never, 1: always, default: after the first run-ahead state.
+	// Smart sync and async mode hit the same: the CPU no longer waits for the GPU at a SyncFull, so these memcpys
+	// landed under the frame still being drawn into those pages. Star Wars Racer at 4x (Odin 3 Portal, Joey's Thor
+	// state) showed ~20 half-drawn frames in 30 s (walls and floor, no pod, track or HUD), Turnip and the stock driver
+	// alike; in stream order: none, at the same speed (6.1 ms a frame). Full sync waits for the GPU first, so it never
+	// needed this.
+	// N64_RDP_ORDERED_UPLOAD=0: never (the old default: only after the first run-ahead state), 1 or unset: always.
 	static const int ordered_env = getenv("N64_RDP_ORDERED_UPLOAD") ? atoi(getenv("N64_RDP_ORDERED_UPLOAD")) : -1;
-	const bool ordered = ordered_env == 1 || (ordered_env < 0 && ra_saved.valid);
+	const bool ordered = ordered_env != 0 || ra_saved.valid;
 	Util::SmallVector<std::pair<unsigned, unsigned>, 64> ordered_copies; // first page, page count
 
 	// If we're able to map RDRAM directly, we can just memcpy straight into RDRAM if we have an unmasked copy.
