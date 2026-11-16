@@ -476,6 +476,15 @@ static uint32_t early_last;
 // 0x1657a0 shares its page with the framebuffer at 0x165900, 555 waits per 600 SyncFulls at 4x).
 static bool emulate;
 static unsigned faults_emulated;
+// Precise mode without the open window (Joey 2026-11-16, "close it"; N64_RDP_SMART_OPEN=1 gives the old way): a dynarec
+// access that misses the drawn bytes unlocks the page for real when the GPU work it was locked for is already done (no
+// wait, nothing stale), else is done through the alias (emulate_access) with the page left locked, else (an
+// instruction emulate_access can't do) waits. The open window let anything read the page's drawn bytes for 0.5 ms
+// before the GPU's results were in: Cruis'n USA's RSP looped forever in that race (2026-11-13). Cost against the open
+// window (Odin 3 / Odin 2 Portal, 7 games): OoT 10-13% more CPU time a frame (its faults themselves; capping alias
+// accesses a page or waiting instead made no difference), Paper Mario 12-15% less, the rest the same, geomean 0.996.
+static bool open_window;
+static unsigned precise_done, precise_emulated, precise_waited;
 
 // RDP state that decides where draws land
 static uint32_t color_addr, color_width, color_size, depth_addr;
@@ -910,6 +919,12 @@ static void on_sync_full()
 			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart emulate: %u accesses done through the alias\n", faults_emulated);
 			faults_emulated = 0;
 		}
+		if (precise && !open_window)
+		{
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart precise: beside the drawn bytes %u found the GPU done, %u went through the alias, %u waited\n",
+			       precise_done, precise_emulated, precise_waited);
+			precise_done = precise_emulated = precise_waited = 0;
+		}
 		if (debug)
 		{
 			Dl_info info = {};
@@ -1041,7 +1056,36 @@ static void handler(int sig, siginfo_t *info, void *uc)
 			faults_total.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
-		if (precise && !inside && single)
+		if (precise && !inside && single && !open_window)
+		{
+			// Only shares a page with the drawing. GPU work for the page done: unlock it as a wait would, without the
+			// wait. Not done: do this one access through the alias and keep the page locked.
+			uint64_t stamp = sync_signal;
+			if (stamped)
+			{
+				stamp = page_stamp[offset >> page_shift];
+				if (!stamp || stamp > sync_signal)
+					stamp = sync_signal;
+				if (split_writes_full && stamp < sync_signal && stamp_split[offset >> page_shift] && !dynarec_load(uc))
+					stamp = sync_signal;
+			}
+			if (frontend->timeline_reached(stamp))
+			{
+				if (stamped)
+					unlock_upto(stamp);
+				else
+					unlock_all();
+				precise_done++;
+				return; // retried on the unlocked page
+			}
+			if (emulate_access(uc, offset))
+			{
+				precise_emulated++;
+				return;
+			}
+			precise_waited++; // and on to the wait below
+		}
+		if (precise && !inside && single && open_window)
 		{
 			// Only shares a page with the drawing: let this access through without waiting for the GPU.
 			size_t p = offset >> page_shift;
@@ -1141,6 +1185,9 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	const char *emu = getenv("N64_RDP_SMART_EMULATE");
 	emulate = emu && emu[0] == '1' && g_rdram_alias;
 	faults_emulated = 0;
+	const char *opw = getenv("N64_RDP_SMART_OPEN");
+	open_window = opw && opw[0] == '1';
+	precise_done = precise_emulated = precise_waited = 0;
 	const char *stp = getenv("N64_RDP_SMART_STAMP");
 	stamped = !(stp && stp[0] == '0');
 	const char *spl = getenv("N64_RDP_SMART_SPLIT");
@@ -1177,7 +1224,7 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	split_stamp.assign(size >> page_shift, 0);
 	opened.assign(size >> page_shift, 0);
 	any_opened = false;
-	if (precise && !relock_started)
+	if (precise && open_window && !relock_started)
 	{
 		pthread_t t;
 		sem_init(&relock_sem, 0, 0);
@@ -1201,7 +1248,7 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	}
 	enabled = true;
 	::RDP::native_first_allowed.store(true, std::memory_order_relaxed);
-	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync on (%ld-byte pages%s%s).\n", ps, precise ? ", precise" : "",
+	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync on (%ld-byte pages%s%s).\n", ps, precise ? (open_window ? ", precise, open window" : ", precise") : "",
 	       stamped ? (split_on ? ", per-SyncFull waits, split waits" : ", per-SyncFull waits") : "");
 }
 
