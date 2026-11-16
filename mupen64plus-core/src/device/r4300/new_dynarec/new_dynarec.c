@@ -10361,6 +10361,15 @@ static int new_recompile_block_once(int addr)
         if(stop_after_jal) done=1;
         // Stop on BREAK
         if((source[i+1]&0xfc00003f)==0x0d) done=1;
+        /* Joey64 (2026-11-16, Onegai Monsters on the RG477M): a JAL whose delay slot is a jump is junk too (code not
+         * loaded yet): the same as the J/JR case above, or a block that stops here ends on a branch with no delay
+         * slot and pass 2 quits the app (exit(1) for a compile the CPU waits on). */
+        if(type==UJUMP||type==CJUMP||type==SJUMP||type==RJUMP||type==FJUMP)
+        {
+          done=stop_after_jal=1;
+          itype[i]=NOP;
+          DebugMessage(M64MSG_VERBOSE, "Disabled speculative precompilation");
+        }
       }
       // Don't recompile stuff that's already compiled
       if(!drc_in_worker_async && check_addr(start+i*4+4)) done=1; /* Joey64: no list reads off the emulation thread */
@@ -10371,6 +10380,8 @@ static int new_recompile_block_once(int addr)
     assert(i<MAXBLOCK-1);
     if(start+i*4==pagelimit-4) done=1;
     assert(start+i*4<pagelimit);
+    /* Joey64 (2026-11-16): never between a branch and its delay slot (the slot is the last row, MAXBLOCK-1) */
+    if (i>=MAXBLOCK-2&&itype[i]!=UJUMP&&itype[i]!=CJUMP&&itype[i]!=SJUMP&&itype[i]!=RJUMP&&itype[i]!=FJUMP) done=1;
     if (i==MAXBLOCK-1) done=1;
 #if NEW_DYNAREC == NEW_DYNAREC_ARM64
     /* Joey64 (audit 3 part 6b L3): the shorter block of a retry (drc_cap), never between a branch and its delay slot */
