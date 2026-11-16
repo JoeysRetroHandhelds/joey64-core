@@ -42,9 +42,10 @@
  * (si_controller.c). A pak read or write moves 32 bytes over the joybus, about 1 ms on hardware (~54000); the core
  * finished them almost at once. Pokemon Stadium's GB Tower copies the whole Game Boy ROM while the Game Boy boot
  * logo runs and starts the game only if the copy is still running when the logo ends (PC 0x100); a copy that ended
- * first left the Game Boy stopped on the logo for good. Below ~6000 it still fails; 20000 leaves a wide margin and a
- * shorter background copy than hardware. N64_TPAK_SI=<n> sets it for dev. */
-#define TPAK_SI_DEFAULT 20000
+ * first left the Game Boy stopped on the logo for good. Below ~6000 it still fails. The default is the hardware time
+ * (Joey 2026-11-16: use the real N64 number): the joybus runs at 4 us a bit and a pak read sends 3 bytes and gets
+ * 33 back, 288 bits = ~1.15 ms = ~54000 at the 46.875 MHz count rate. N64_TPAK_SI=<n> sets it for dev. */
+#define TPAK_SI_DEFAULT 54000
 uint32_t g_tpak_si_extra;
 
 static void tpak_si_time(void)
