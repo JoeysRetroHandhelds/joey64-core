@@ -23,6 +23,7 @@ RSP::JIT::CPU cpu;
 short MFC0_count[32];
 int SP_STATUS_TIMEOUT;
 unsigned DMA_poll_count; // the same DMA bringing nothing new, in a row (rsp/cp0.cpp)
+bool yield_halt; // HALT was set by a poll yield (rsp/cp0.cpp), not by the task: see parallelRSPDoRspCycles
 } // namespace RSP
 
 extern "C"
@@ -115,6 +116,7 @@ extern "C"
 		for (auto &count : RSP::MFC0_count)
 			count = 0;
 		RSP::DMA_poll_count = 0;
+		RSP::yield_halt = false;
 
 		while (!(*RSP::rsp.SP_STATUS_REG & SP_STATUS_HALT))
 		{
@@ -130,13 +132,28 @@ extern "C"
 			return cycles;
 		else if (*RSP::cpu.get_state().cp0.irq & 1)
 			RSP::rsp.CheckInterrupts();
-		else if (*RSP::rsp.SP_STATUS_REG & SP_STATUS_HALT)
+		/* Joey64 (2026-11-16): only a HALT the task set itself ends it here (upstream be05ef71, "RSP hang when setting
+		 * HALT but not BREAK"). The poll yields set HALT too, to leave the loop when the task waits on the CPU (SP_STATUS
+		 * polled 16/0x7fff times, or the same DMA 256 times); since be05ef71 that return also caught them, so a task that
+		 * waits on the CPU was dropped, never resumed: Pokemon Stadium's GB Tower froze when its Game Boy game started,
+		 * and Thornmarked's RSP sat at pc 0x04c. A yield falls through to the HALT clear below as before be05ef71 (cxd4's
+		 * rule), and the core resumes the task from its SP event (rsp_core.c rsp_interrupt_event). */
+		else if ((*RSP::rsp.SP_STATUS_REG & SP_STATUS_HALT) && !RSP::yield_halt)
 			return cycles;
 		else if (*RSP::rsp.SP_SEMAPHORE_REG != 0) // Semaphore lock fixes.
 		{
 		}
 		else
-			RSP::SP_STATUS_TIMEOUT = 16; // From now on, wait 16 times, not 0x7fff
+		{
+			// Dev (GB Tower test, 2026-11-16): N64_RSP_POLL=<n> keeps n polls per slice instead of 16.
+			static int poll = -1;
+			if (poll < 0)
+			{
+				const char *e = getenv("N64_RSP_POLL");
+				poll = e && atoi(e) > 0 ? atoi(e) : 16;
+			}
+			RSP::SP_STATUS_TIMEOUT = poll; // From now on, wait 16 times, not 0x7fff
+		}
 
 		// CPU restarts with the correct SIGs.
 		*RSP::rsp.SP_STATUS_REG &= ~SP_STATUS_HALT;

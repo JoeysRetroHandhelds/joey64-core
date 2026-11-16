@@ -43,5 +43,8 @@ void poweron_transferpak(struct transferpak* tpk);
 
 void change_gb_cart(struct transferpak* tpk, struct gb_cart* gb_cart);
 
+/* joybus time of the Transfer Pak accesses run since the last SI DMA (CP0 count units) */
+extern uint32_t g_tpak_si_extra;
+
 extern const struct pak_interface g_itransferpak;
 #endif

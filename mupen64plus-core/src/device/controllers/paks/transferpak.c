@@ -32,10 +32,27 @@
 #include "device/gb/gb_cart.h"
 #include "device/controllers/game_controller.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #define RESET_MODE_CART_ENABLE_BIT UINT32_C(0x00000001)
 #define RESET_MODE_PAK_ENABLE_BIT UINT32_C(0x00000080)
+
+/* Joey64 (2026-11-16): joybus time of a Transfer Pak access, in CP0 count units, added to the SI DMA that ran it
+ * (si_controller.c). A pak read or write moves 32 bytes over the joybus, about 1 ms on hardware (~54000); the core
+ * finished them almost at once. Pokemon Stadium's GB Tower copies the whole Game Boy ROM while the Game Boy boot
+ * logo runs and starts the game only if the copy is still running when the logo ends (PC 0x100); a copy that ended
+ * first left the Game Boy stopped on the logo for good. Below ~6000 it still fails; 20000 leaves a wide margin and a
+ * shorter background copy than hardware. N64_TPAK_SI=<n> sets it for dev. */
+#define TPAK_SI_DEFAULT 20000
+uint32_t g_tpak_si_extra;
+
+static void tpak_si_time(void)
+{
+    static int per = -1;
+    if (per < 0) { const char* e = getenv("N64_TPAK_SI"); per = e ? atoi(e) : TPAK_SI_DEFAULT; }
+    g_tpak_si_extra += (uint32_t)per;
+}
 
 static uint16_t gb_cart_address(unsigned int bank, uint16_t address)
 {
@@ -141,12 +158,15 @@ static void read_transferpak(void* pak, uint16_t address, uint8_t* data, size_t 
     default:
         DebugMessage(M64MSG_WARNING, "Unknown tpak read: %04x", address);
     }
+    tpak_si_time();
 }
 
 static void write_transferpak(void* pak, uint16_t address, const uint8_t* data, size_t size)
 {
     struct transferpak* tpk = (struct transferpak*)pak;
     uint8_t value = data[size-1];
+
+    tpak_si_time();
 
     DebugMessage(M64MSG_VERBOSE, "tpak write: %04x <- %02x", address, value);
 

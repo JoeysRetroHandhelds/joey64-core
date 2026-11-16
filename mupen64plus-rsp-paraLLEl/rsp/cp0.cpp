@@ -9,6 +9,7 @@ extern RSP_INFO rsp;
 extern short MFC0_count[32];
 extern int SP_STATUS_TIMEOUT;
 extern unsigned DMA_poll_count;
+extern bool yield_halt;
 } // namespace RSP
 #endif
 
@@ -36,6 +37,7 @@ extern "C"
 			if (RSP::MFC0_count[rt] >= RSP::SP_STATUS_TIMEOUT)
 			{
 				*RSP::rsp.SP_STATUS_REG |= SP_STATUS_HALT;
+				RSP::yield_halt = true; // a yield to the CPU, not the task halting (parallel.cpp)
 				return MODE_CHECK_FLAGS;
 			}
 		}
@@ -183,6 +185,7 @@ extern "C"
 			{
 				RSP::DMA_poll_count = 0;
 				*RSP::rsp.SP_STATUS_REG |= SP_STATUS_HALT;
+				RSP::yield_halt = true; // a yield to the CPU, not the task halting (parallel.cpp)
 				return MODE_CHECK_FLAGS;
 			}
 		}

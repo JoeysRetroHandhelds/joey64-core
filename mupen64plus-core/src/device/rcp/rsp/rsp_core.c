@@ -22,6 +22,7 @@
 #include "rsp_core.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "device/memory/memory.h"
 #include "device/r4300/r4300_core.h"
@@ -390,6 +391,14 @@ void do_SP_Task(struct rsp_core* sp)
         sp->rsp_task_locked = 1;
         sp->mi->r4300->cp0.interrupt_unsafe_state |= INTR_UNSAFE_RSP;
         sp->mi->regs[MI_INTR_REG] |= MI_INTR_SP;
+        /* Joey64 (2026-11-16): a task still running (it yielded waiting on the CPU) resumes from this event, so give the
+         * CPU time to answer first: with 0 (a task that is neither graphics nor audio) it would resume at once, over and over. */
+        {
+            static int resume = -1; /* dev (GB Tower test): N64_RSP_RESUME=<count cycles> */
+            if (resume < 0) { const char* e = getenv("N64_RSP_RESUME"); resume = e && atoi(e) > 0 ? atoi(e) : 1000; }
+            if (sp_delay_time < (uint32_t)resume)
+                sp_delay_time = resume;
+        }
     }
     if (sp->mi->regs[MI_INTR_REG] & MI_INTR_SP)
     {

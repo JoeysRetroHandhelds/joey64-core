@@ -25,6 +25,7 @@
 
 #include "api/callbacks.h"
 #include "api/m64p_types.h"
+#include "device/controllers/paks/transferpak.h"
 #include "device/memory/memory.h"
 #include "device/pif/pif.h"
 #include "device/r4300/r4300_core.h"
@@ -96,7 +97,11 @@ static void dma_si_read(struct si_controller* si)
 
     cp0_update_count(si->mi->r4300);
     si->regs[SI_STATUS_REG] |= SI_STATUS_DMA_BUSY;
-    add_interrupt_event(&si->mi->r4300->cp0, SI_INT, si->dma_duration + add_random_interrupt_time(si->mi->r4300));
+    {
+        uint32_t extra = g_tpak_si_extra;   /* Transfer Pak accesses this DMA ran take joybus time */
+        g_tpak_si_extra = 0;
+        add_interrupt_event(&si->mi->r4300->cp0, SI_INT, si->dma_duration + extra + add_random_interrupt_time(si->mi->r4300));
+    }
 }
 
 void init_si(struct si_controller* si,
