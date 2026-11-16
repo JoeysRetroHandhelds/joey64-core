@@ -3,6 +3,8 @@
 // (rdp.cpp, TexPack) calls these: GLideNHQ is not thread-safe.
 #include "texpack_ghq.h"
 #include "../../GLideN64/src/GLideNHQ/TxFilterExport.h"
+#include "../../GLideN64/src/GLideNHQ/TxHiResCache.h"
+#include <stdarg.h>
 #include <string.h>
 #include <wchar.h>
 #include <stdlib.h>
@@ -20,6 +22,9 @@ enum : unsigned
 	GL_UNSIGNED_SHORT_5_6_5_ = 0x8363,
 };
 bool inited;
+// As GLideN64 with its defaults (hi-res packs on, full alpha channel, compressed cache) and file storage, so a .hts of
+// any size is read entry by entry from disk instead of loaded whole. The app's conversion makes packs with the same.
+const int PACK_OPTIONS = RICE_HIRESTEXTURES | FILE_HIRESTEXCACHE | DUMP_HIRESTEXCACHE | GZ_HIRESTEXCACHE | LET_TEXARTISTS_FLY;
 
 std::wstring widen(const char *s)
 {
@@ -87,13 +92,48 @@ bool texpack_ghq_init(const char *dir, const char *romname)
 	if (inited)
 		return true;
 	const std::wstring wdir = widen(dir), wrom = widen(romname);
-	// As GLideN64 with its defaults (hi-res packs on, full alpha channel, compressed cache) and file storage, so a
-	// .hts of any size is read entry by entry from disk instead of loaded whole.
-	const int options = RICE_HIRESTEXTURES | FILE_HIRESTEXCACHE | DUMP_HIRESTEXCACHE | GZ_HIRESTEXCACHE |
-	                    LET_TEXARTISTS_FLY;
-	inited = txfilter_init(4096, 4096, 32, options, 0, wdir.c_str(), wdir.c_str(), wdir.c_str(), wrom.c_str(),
+	inited = txfilter_init(4096, 4096, 32, PACK_OPTIONS, 0, wdir.c_str(), wdir.c_str(), wdir.c_str(), wrom.c_str(),
 	                       nullptr) != 0;
 	return inited;
+}
+
+// The app's background conversion (Joey 2026-11-15, approved mockup texpacks4: PNG packs are made into a .hts outside
+// play). GLideN64 calls its info callback once per texture it adds ("[%d] total mem..."), with the count so far; that
+// count goes to the app's progress callback, which may also hold this thread (the app waits there while a game runs).
+namespace
+{
+int (*build_progress)(int);
+int build_count;
+
+void build_info(const wchar_t *format, ...)
+{
+	if (!build_progress || wcsncmp(format, L"[%d]", 4) != 0)
+		return;
+	va_list ap;
+	va_start(ap, format);
+	const int n = va_arg(ap, int);
+	va_end(ap);
+	build_count = n;
+	build_progress(n);
+}
+}
+
+// Makes <dir>/<romname>_HIRESTEXTURES.hts from the PNG pack in <dir>/<romname>/, as a game would at its start, but with
+// its own GLideNHQ loader (not the txfilter one a game uses), so it can run with no game loaded. Returns the number of
+// textures in it (0: nothing made). The app only calls it in its conversion process, one at a time.
+extern "C" __attribute__((visibility("default"))) int joey64_texpack_build(const char *dir, const char *romname,
+                                                                           int (*progress)(int))
+{
+	const std::wstring wdir = widen(dir), wrom = widen(romname);
+	build_progress = progress;
+	build_count = 0;
+	int n = 0;
+	{
+		TxHiResCache cache(4096, 4096, 32, PACK_OPTIONS, wdir.c_str(), wdir.c_str(), wrom.c_str(), build_info);
+		n = cache.empty() ? 0 : (build_count > 0 ? build_count : 1); // 1: loaded whole from an earlier build
+	}
+	build_progress = nullptr;
+	return n;
 }
 
 void texpack_ghq_shutdown()
