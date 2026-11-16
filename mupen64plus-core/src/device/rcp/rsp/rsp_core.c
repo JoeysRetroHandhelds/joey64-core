@@ -269,10 +269,16 @@ void read_rsp_regs(void* opaque, uint32_t address, uint32_t* value)
     }
 }
 
+/* Resume delay of a task that keeps yielding (do_SP_Task): 0 = none yet. A CPU write to an SP register (an answer,
+ * a DMA, a new task) starts it over. */
+static uint32_t rsp_resume_wait;
+
 void write_rsp_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask)
 {
     struct rsp_core* sp = (struct rsp_core*)opaque;
     uint32_t reg = rsp_reg(address);
+
+    rsp_resume_wait = 0;
 
     switch(reg)
     {
@@ -392,14 +398,20 @@ void do_SP_Task(struct rsp_core* sp)
         sp->mi->r4300->cp0.interrupt_unsafe_state |= INTR_UNSAFE_RSP;
         sp->mi->regs[MI_INTR_REG] |= MI_INTR_SP;
         /* Joey64 (2026-11-16): a task still running (it yielded waiting on the CPU) resumes from this event, so give the
-         * CPU time to answer first: with 0 (a task that is neither graphics nor audio) it would resume at once, over and over. */
+         * CPU time to answer first: with 0 (a task that is neither graphics nor audio) it would resume at once, over and over.
+         * The wait doubles at each resume in a row without a CPU write to the SP registers, up to 64000 count cycles (~1.4 ms):
+         * a task that is never answered (Thornmarked) otherwise ran its poll every 1000 cycles and slowed the game to 4 fps. */
         {
             static int resume = -1; /* dev (GB Tower test): N64_RSP_RESUME=<count cycles> */
             if (resume < 0) { const char* e = getenv("N64_RSP_RESUME"); resume = e && atoi(e) > 0 ? atoi(e) : 1000; }
-            if (sp_delay_time < (uint32_t)resume)
-                sp_delay_time = resume;
+            rsp_resume_wait = rsp_resume_wait == 0 ? (uint32_t)resume
+                            : (rsp_resume_wait >= 32000 ? 64000 : rsp_resume_wait * 2);
+            if (sp_delay_time < rsp_resume_wait)
+                sp_delay_time = rsp_resume_wait;
         }
     }
+    else
+        rsp_resume_wait = 0;
     if (sp->mi->regs[MI_INTR_REG] & MI_INTR_SP)
     {
         cp0_update_count(sp->mi->r4300);
