@@ -2266,7 +2266,15 @@ void retro_run (void)
 
 void retro_reset (void)
 {
-    CoreDoCommand(M64CMD_RESET, 0, (void*)0);
+    /* Joey64 (2026-11-16): a hard reset (power off and on), not the Reset button's soft one. The soft reset raises the
+     * pre-NMI interrupt and lets the game run half a second before the NMI reboots it; with parallel-RSP a game's RSP
+     * task could then loop inside one recompiled block forever (no CP0 read, so no yield), the CPU never ran again
+     * and the NMI that would halt the RSP never came: Banjo-Kazooie and Mario Kart 64 hung at 100% on the emulation
+     * thread (Odin 2 Portal). RetroArch users report the same Restart freeze (forums.libretro.com/t/45983, where
+     * sonninnos proposed this change). Cartridge saves stay (flash, SRAM, EEPROM aren't cleared by poweron).
+     * Dev env N64_SOFT_RESET=1: the soft reset as before. */
+    const char *soft = getenv("N64_SOFT_RESET");
+    CoreDoCommand(M64CMD_RESET, soft && *soft == '1' ? 0 : 1, (void*)0);
 }
 
 void *retro_get_memory_data(unsigned type)
