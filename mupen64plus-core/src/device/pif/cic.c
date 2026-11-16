@@ -37,7 +37,11 @@
  * ROM 0x1000-0x101000 and loops for good when the sum isn't the header's, so they hung before their first frame, as they
  * would on a console. The header's CRCs are read only by the boot code here (the ini was matched by MD5/CRC before this
  * runs), so the loaded copy gets the computed sum. Only for a CIC told by its boot code: the sum (the n64crc tool's
- * algorithm) depends on it, and a good dump always matches, so it never changes. */
+ * algorithm) depends on it, and a good dump always matches, so it never changes.
+ * 2026-11-15: t2 takes r when t2 >= d, not only when t2 > d (the n64crc tool's rule). The two only differ when t2 equals
+ * the word; of the 1,198 ROMs in our test set with a known CIC that happens in one, Pokemon Stadium (USA) (Rev 2) (GoodN64
+ * V1.2 [!], header 9C8FB2FA 9B84A09B as in the ini): n64crc gave 9B8E6E56, the boot code then saw a wrong CRC2 and the game
+ * never drew a frame (since c994aa7). With >= it matches its header, and all 1,188 that matched before still match. */
 void fix_boot_checksum(void* rom, size_t size)
 {
     uint32_t* w = (uint32_t*)rom;
@@ -70,7 +74,7 @@ void fix_boot_checksum(void* rom, size_t size)
         if ((d & 0x1F) == 0)
             r = d;
         t5 += r;
-        if (t2 > d)
+        if (t2 >= d)
             t2 ^= r;
         else
             t2 ^= t6 ^ d;
