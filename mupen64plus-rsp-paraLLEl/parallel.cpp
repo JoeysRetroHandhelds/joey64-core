@@ -95,8 +95,14 @@ extern "C"
 
 	EXPORT unsigned int CALL parallelRSPDoRspCycles(unsigned int cycles)
 	{
-		if (*RSP::rsp.SP_STATUS_REG & (SP_STATUS_HALT | SP_STATUS_BROKE))
+		/* Joey64 (2026-11-16): only HALT keeps the RSP from running, as on the hardware, where BROKE is just the flag a
+		 * BREAK left. A task the CPU starts by clearing HALT alone (old libdragon's ugfx: SP_STATUS = 0x101, no
+		 * CLR_BROKE) was skipped while the last task's BROKE stood, yet reported done: ZZ Gunner drew one frame and
+		 * then waited forever for an RDP list that never came. The stale flag is cleared as the task starts, so the
+		 * BROKE check after the run means this task's own BREAK. */
+		if (*RSP::rsp.SP_STATUS_REG & SP_STATUS_HALT)
 			return 0;
+		*RSP::rsp.SP_STATUS_REG &= ~SP_STATUS_BROKE;
 
 		// Only at a task's start: a task this RSP was already running continues here.
 		if (hle_audio && (*RSP::rsp.SP_PC_REG & 0xfff) == 0 && hleTryAudioTask())
