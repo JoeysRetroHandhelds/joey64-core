@@ -116,7 +116,9 @@ bool TxHiResCache::_load(boolean replace) /* 0 : reload, 1 : replace partial */
 	if (_texPackPath.empty() || _ident.empty())
 		return false;
 
-	if (!replace)
+	// Joey64: only when there's a PNG folder to make the cache again from. Without one a cache that failed to load (a
+	// pack in another format) is the user's own pack, and clearing it writes an empty one over the file.
+	if (!replace && _HiResTexPackPathExists())
 		TxCache::clear();
 
 	tx_wstring dir_path(_texPackPath);
