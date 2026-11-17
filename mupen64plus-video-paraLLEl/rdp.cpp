@@ -373,6 +373,7 @@ bool frame_valid = true;
 // Joey64: the trim of the border around the game's picture (joey_note_vi_area).
 static std::atomic<int> joey_vi_trim[4];
 static int joey_vi_seen[4], joey_vi_held;
+static bool joey_vi_published; // a game's area has been given to the app (the first one goes at once)
 
 // Smart sync (replaces synchronous mode when the synchronous option is on; env N64_RDP_SMART=0 gives plain
 // synchronous mode again; with the option off parallel-RDP is plain async): run asynchronously, but remember
@@ -2938,6 +2939,7 @@ bool init()
 	for (auto &t : joey_vi_trim) t.store(0);
 	memset(joey_vi_seen, 0, sizeof(joey_vi_seen));
 	joey_vi_held = 0;
+	joey_vi_published = false;
 	if (!context || !vulkan)
 		return false;
 
@@ -3206,9 +3208,16 @@ static void joey_note_vi_area(uint32_t h_start_reg, uint32_t v_start_reg, uint32
 			       (h_start_reg >> 16) & 0x3ff, h_start_reg & 0x3ff, (v_start_reg >> 16) & 0x3ff, v_start_reg & 0x3ff,
 			       v_sync_reg & 0x3ff, t[0], t[1], t[2], t[3]);
 	}
-	if (joey_vi_held < 20 && ++joey_vi_held == 20)
+	// The game's first area counts at once (Joey 2026-11-17: the picture "starts smaller then expands" at boot: it
+	// showed with its border for the 20 pictures, 1.2 s in Mario Kart 64's logo); nothing was shown before it.
+	const bool first = !joey_vi_published && (t[0] | t[1] | t[2] | t[3]) != 0;
+	if (first || (joey_vi_held < 20 && ++joey_vi_held == 20))
+	{
 		for (int i = 0; i < 4; i++)
 			joey_vi_trim[i].store(t[i]);
+		joey_vi_published = true;
+		joey_vi_held = 20;
+	}
 }
 
 void complete_frame()
