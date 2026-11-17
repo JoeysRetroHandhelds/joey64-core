@@ -30,6 +30,8 @@
 #include "type_to_string.hpp"
 #include "quirks.hpp"
 #include "timer.hpp"
+#include <time.h>
+#include <atomic>
 #include <algorithm>
 #include <string.h>
 #include <stdlib.h>
@@ -2756,9 +2758,22 @@ void Device::PerFrame::trim_command_pools()
 			pool.trim();
 }
 
+}
+namespace RDP { extern std::atomic<uint64_t> joey_wait_total_ns; }
+namespace Vulkan
+{
+static inline uint64_t joey_frame_wait_now_ns()
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return uint64_t(t.tv_sec) * 1000000000ull + uint64_t(t.tv_nsec);
+}
+
 void Device::PerFrame::begin()
 {
 	VkDevice vkdevice = device.get_device();
+	// Joey64: the time this waits for the GPU goes into joey64_rdp_wait_ns (the app's "GPU waits").
+	const uint64_t joey_t0 = joey_frame_wait_now_ns();
 
 	Vulkan::QueryPoolHandle wait_fence_ts;
 	if (!in_destructor)
@@ -2806,6 +2821,8 @@ void Device::PerFrame::begin()
 			managers.fence.recycle_fence(fence);
 		wait_and_recycle_fences.clear();
 	}
+
+	RDP::joey_wait_total_ns.fetch_add(joey_frame_wait_now_ns() - joey_t0, std::memory_order_relaxed);
 
 	for (auto &cmd_pool : cmd_pools)
 		for (auto &pool : cmd_pool)
