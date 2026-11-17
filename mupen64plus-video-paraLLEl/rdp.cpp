@@ -43,6 +43,7 @@ const struct retro_hw_render_interface_vulkan *vulkan;
 // Joey64 N64_RDP_WAITSTATS (defined in parallel-rdp/rdp_device.cpp)
 extern std::atomic<uint64_t> joey_drain_ns, joey_timeline_ns;
 extern std::atomic<uint32_t> joey_timeline_waits;
+extern std::atomic<uint64_t> joey_wait_total_ns;
 bool joey_waitstats_on();
 
 static int cmd_cur;
@@ -3489,6 +3490,13 @@ const VkApplicationInfo *parallel_get_application_info(void)
 extern "C" __attribute__((visibility("default"))) unsigned joey64_rdp_waits()
 {
 	return RDP::Smart::faults_total.load(std::memory_order_relaxed);
+}
+
+// Nanoseconds the core has waited for the GPU since start (every timeline wait: smart sync's faults, SyncFull in
+// synchronous mode, scanout, run-ahead), for the app's stats line (report idea 2, 2026-11-16).
+extern "C" __attribute__((visibility("default"))) uint64_t joey64_rdp_wait_ns()
+{
+	return RDP::joey_wait_total_ns.load(std::memory_order_relaxed);
 }
 
 // Joey64: the black border the game leaves around its picture (VI H_START/V_START), for the app to trim:

@@ -1253,6 +1253,9 @@ uint64_t CommandProcessor::signal_timeline()
 // worker's CPU work) and waiting for timeline values (GPU work), read and reset by the plugin every 300 scanouts.
 std::atomic<uint64_t> joey_drain_ns{0}, joey_timeline_ns{0};
 std::atomic<uint32_t> joey_timeline_waits{0};
+// Every wait for the GPU since start, always counted (the app's stats line splits a frame's emulation time into the
+// part spent waiting for the GPU; joey64_rdp_wait_ns, report idea 2, 2026-11-16).
+std::atomic<uint64_t> joey_wait_total_ns{0};
 bool joey_waitstats_on()
 {
 	static const bool on = getenv("N64_RDP_WAITSTATS") && *getenv("N64_RDP_WAITSTATS") == '1';
@@ -1275,13 +1278,15 @@ void CommandProcessor::wait_for_timeline(uint64_t index)
 			ring.note_wait();
 		ring.kick();
 	}
-	const uint64_t joey_t0 = joey_waitstats_on() ? joey_now_ns() : 0;
+	const uint64_t joey_t0 = joey_now_ns();
 	timeline_worker.wait([this, index]() -> bool {
 		return thread_timeline_value >= index;
 	});
-	if (joey_t0)
+	const uint64_t joey_dt = joey_now_ns() - joey_t0;
+	joey_wait_total_ns.fetch_add(joey_dt, std::memory_order_relaxed);
+	if (joey_waitstats_on())
 	{
-		joey_timeline_ns += joey_now_ns() - joey_t0;
+		joey_timeline_ns += joey_dt;
 		++joey_timeline_waits;
 	}
 	if (measure_stall_time)
