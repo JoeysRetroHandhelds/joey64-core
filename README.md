@@ -16,12 +16,15 @@ Claude Code, which also runs most of the device testing. I decide what goes in a
   - repeat frames skipped (the VI shows the same picture again);
   - "smart sync": async, with RDRAM pages the RDP drew into page-protected, so the CPU waits for the GPU only
     when it reads them (Pokémon Snap, Resident Evil 2 and Cruis'n USA draw right without full synchronous mode);
+    it tracks the drawn bytes too, so a recompiled access beside them goes on without waiting;
   - a lock-free command ring with lazy waking, pipeline cache kept between runs and saved off the emulation
     thread, upscaling changeable while running, and fixes for Adreno and Mali drivers (Vulkan 1.1 loaders,
     host query reset on the Retroid Pocket Duo);
-  - reports the game's own border so the host can trim it.
+  - reports the game's own border, from its first picture, so the host can trim it;
+  - times every wait for the GPU, so the host's stats can tell GPU waits from emulation.
 - **parallel-RSP:** HLE audio with LLE graphics by default, AArch64 fast paths for vector multiplies and loads,
-  and a stop for RSP programs that only poll RDRAM.
+  a stop for RSP programs that only poll RDRAM, and a task that runs while a stale BROKE stands (only HALT
+  stops the RSP, as on hardware).
 - **Recompiler (new_dynarec, arm64):** a jump cache, an optional compile thread, a per-game block list, code
   in cartridge ROM compiled, and a bad address raising an exception instead of `exit(1)`.
 - **GLideN64:** updated to gonetz master, Pokémon Snap's photo check fixed on GLES, NEON math and ARMv8 CRC32 on
@@ -37,7 +40,12 @@ Claude Code, which also runs most of the device testing. I decide what goes in a
   interrupts off (libdragon homebrew), and per-game CountPerOp entries.
 - **Save states:** retro_serialize and retro_unserialize return at once instead of running a frame, and
   refuse states that are cut short or from another ROM.
-- **Experiments, off unless the host turns them on:** run-ahead states, texture packs on parallel-RDP.
+- **Reset is a hard reset** (power off and on, cartridge saves kept): the soft reset could leave a parallel-RSP
+  task looping forever (Banjo-Kazooie, Mario Kart 64).
+- **Texture packs on parallel-RDP:** GLideN64 .hts packs, and PNG packs built into an .hts with no game
+  loaded (`joey64_texpack_build`).
+- **Run-ahead states** for the host's run-ahead.
+- Linked at 16 KB pages, so it loads on Android devices with 16 KB memory pages.
 - angrylion-rdp-plus is removed (its old MAME licence is non-commercial).
 
 ## Branches and releases
