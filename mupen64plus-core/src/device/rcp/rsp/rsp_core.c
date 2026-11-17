@@ -272,6 +272,9 @@ void read_rsp_regs(void* opaque, uint32_t address, uint32_t* value)
 /* Resume delay of a task that keeps yielding (do_SP_Task): 0 = none yet. A CPU write to an SP register (an answer,
  * a DMA, a new task) starts it over. */
 static uint32_t rsp_resume_wait;
+/* Set by parallel-RSP (rsp/cp0.cpp) at each poll yield: 1 = the same DMA brought nothing new 256 times (waiting on
+ * RDRAM), 0 = SP_STATUS read 16 times. */
+int joey64_rsp_dma_yield;
 
 void write_rsp_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask)
 {
@@ -400,10 +403,16 @@ void do_SP_Task(struct rsp_core* sp)
         /* Joey64 (2026-11-16): a task still running (it yielded waiting on the CPU) resumes from this event, so give the
          * CPU time to answer first: with 0 (a task that is neither graphics nor audio) it would resume at once, over and over.
          * The wait doubles at each resume in a row without a CPU write to the SP registers, up to 64000 count cycles (~1.4 ms):
-         * a task that is never answered (Thornmarked) otherwise ran its poll every 1000 cycles and slowed the game to 4 fps. */
+         * a task that is never answered (Thornmarked) otherwise ran its poll every 1000 cycles and slowed the game to 4 fps.
+         * 2026-11-17: only after a DMA-poll yield (Thornmarked waits on RDRAM). A yield from SP_STATUS reads is a loop that
+         * moves on (16 reads per resume): Pokemon Stadium's graphics task after the GB Tower paid up to 64000 cycles per 16
+         * passes, the menus read the controller one frame in 13 (~150 ms input lag); with 1000 they read it as before. */
         {
             static int resume = -1; /* dev (GB Tower test): N64_RSP_RESUME=<count cycles> */
             if (resume < 0) { const char* e = getenv("N64_RSP_RESUME"); resume = e && atoi(e) > 0 ? atoi(e) : 1000; }
+            static int kind = -1; /* dev: N64_RSP_BACKOFF_KIND=0 backs off after every yield, as 018ba79 did */
+            if (kind < 0) { const char* e = getenv("N64_RSP_BACKOFF_KIND"); kind = !(e && e[0] == '0'); }
+            if (kind && !joey64_rsp_dma_yield) rsp_resume_wait = 0; /* a polling loop that moves on: no backoff */
             rsp_resume_wait = rsp_resume_wait == 0 ? (uint32_t)resume
                             : (rsp_resume_wait >= 32000 ? 64000 : rsp_resume_wait * 2);
             if (sp_delay_time < rsp_resume_wait)

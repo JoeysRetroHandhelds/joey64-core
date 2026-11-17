@@ -11,6 +11,7 @@ extern int SP_STATUS_TIMEOUT;
 extern unsigned DMA_poll_count;
 extern bool yield_halt;
 } // namespace RSP
+extern "C" int joey64_rsp_dma_yield; // rsp_core.c: the last yield was a DMA poll
 #endif
 
 using namespace RSP;
@@ -38,6 +39,7 @@ extern "C"
 			{
 				*RSP::rsp.SP_STATUS_REG |= SP_STATUS_HALT;
 				RSP::yield_halt = true; // a yield to the CPU, not the task halting (parallel.cpp)
+				joey64_rsp_dma_yield = 0;
 				return MODE_CHECK_FLAGS;
 			}
 		}
@@ -186,6 +188,7 @@ extern "C"
 				RSP::DMA_poll_count = 0;
 				*RSP::rsp.SP_STATUS_REG |= SP_STATUS_HALT;
 				RSP::yield_halt = true; // a yield to the CPU, not the task halting (parallel.cpp)
+				joey64_rsp_dma_yield = 1;
 				return MODE_CHECK_FLAGS;
 			}
 		}
