@@ -91,6 +91,9 @@ ifeq ($(CRC_ARMV8),1)
 endif
 LOCAL_CFLAGS           := $(CFLAGS) $(COREFLAGS)
 LOCAL_LDFLAGS          := -Wl,-version-script=$(LIBRETRO_DIR)/link.T
+# 16 KB page alignment: Google Play rejects 4 KB-aligned native libraries for apps targeting Android 15+ (and 16 KB-page
+# devices can't load them). NDK 27 still links at 4 KB by default.
+LOCAL_LDFLAGS          += -Wl,-z,max-page-size=16384
 # Experiments: extra compile/link flags from the command line, e.g. N64_XFLAGS="-flto=thin"
 # N64_XLDFLAGS="-flto=thin" (appended to C++ flags too, so a -march here wins over CRC_ARMV8's)
 LOCAL_CFLAGS           += $(N64_XFLAGS)
