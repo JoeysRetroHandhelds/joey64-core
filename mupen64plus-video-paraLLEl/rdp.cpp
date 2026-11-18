@@ -2126,7 +2126,7 @@ static std::unordered_map<Rec, uint32_t, RecHash> counts;
 // key log only: how each key's texture was found (L lines) and why draws got no key (F lines), to compare with GLideN64
 static std::unordered_map<Rec, std::string, RecHash> detail; // kind 0, fb 0
 static std::unordered_map<std::string, uint32_t> fails;
-static unsigned frames, draws_tex, draws_nokey, lookups;
+static unsigned frames, draws_tex, draws_nokey, lookups, copy8; // copy8: copy-mode texrects onto an 8-bit colour image
 static uint64_t frame_total;
 
 // cached keys per texture slot until the tile/TMEM state changes (GLideN64 only re-runs update() on CHANGED_TILE /
@@ -2444,6 +2444,8 @@ static void count(const Rec &r) { counts[r]++; }
 static void draw(uint32_t tile, uint8_t kind, const uint32_t *rect_words)
 {
 	draws_tex++;
+	if (kind == 6 && color_size == 1)
+		copy8++;
 	const bool two = cycleType <= 1 && uses_texel1(cycleType == 0); // combiner reads TEXEL1: GLideN64 updates slot 1
 	const uint32_t ti[2] = { tile, (tile + 1) & 7 };
 	for (uint32_t t = 0; t < (two ? 2u : 1u); t++)
@@ -2463,7 +2465,7 @@ static void draw(uint32_t tile, uint8_t kind, const uint32_t *rect_words)
 		if (have[t] && out)
 		{
 			Rec r = cached[t];
-			r.kind = uint8_t(kind | (t ? 8 : 0));
+			r.kind = uint8_t(kind | (t ? 8 : 0) | (color_size == 1 ? 16 : 0));
 			count(r);
 		}
 		else if (t == 0 && !have[t])
@@ -2678,15 +2680,15 @@ static void on_frame()
 	if (!out)
 	{
 		if (frames >= 600)
-			frames = draws_tex = draws_nokey = lookups = 0;
+			frames = draws_tex = draws_nokey = lookups = copy8 = 0;
 		return;
 	}
 	if (frames < 60)
 		return;
 	// window line, then one line per key record: K crc fmt siz w h kind fb count
-	// kind bits: 1 triangle, 2 texrect, 4 copy mode, 8 second texture (TEXEL1)
-	fprintf(out, "W %llu frames %u textured %u nokey %u keys %u lookups %u\n", (unsigned long long)frame_total, frames,
-	        draws_tex, draws_nokey, unsigned(counts.size()), lookups);
+	// kind bits: 1 triangle, 2 texrect, 4 copy mode, 8 second texture (TEXEL1), 16 drawn into an 8-bit colour image
+	fprintf(out, "W %llu frames %u textured %u nokey %u keys %u lookups %u copy8 %u\n", (unsigned long long)frame_total,
+	        frames, draws_tex, draws_nokey, unsigned(counts.size()), lookups, copy8);
 	for (auto &kv : counts)
 		fprintf(out, "K %016llx %u %u %u %u %u %u %u\n", (unsigned long long)kv.first.crc, kv.first.fmt, kv.first.siz,
 		        kv.first.w, kv.first.h, kv.first.kind, kv.first.fb, kv.second);
@@ -2707,7 +2709,7 @@ static void on_frame()
 	fails.clear();
 	fflush(out);
 	counts.clear();
-	frames = draws_tex = draws_nokey = lookups = 0;
+	frames = draws_tex = draws_nokey = lookups = copy8 = 0;
 }
 
 static void init(const uint8_t *rdram, uint32_t size)
