@@ -492,6 +492,12 @@ static unsigned precise_done, precise_emulated, precise_waited;
 static uint32_t color_addr, color_width, color_size, depth_addr;
 static uint32_t scissor_yh, scissor_yl;
 static bool depth_write;
+// Lock only down to parallel-RDP's deduced height: the rows a draw writes back (2026-11-18, Joey: always on;
+// DK64 +22% and Banjo-Kazooie ~2x uncapped on the Odin 2 Portal, compat 21/21 on five devices).
+// N64_RDP_SMART_PRIM_ROWS=0 goes back to locking down to the scissor's bottom edge.
+static bool prim_rows;
+static uint32_t scissor_yl_sub;   // scissor yl in quarter lines
+static bool fill_copy;
 
 static void add_range(vector<pair<uint32_t, uint32_t>> &ranges, uint32_t start, uint32_t end)
 {
@@ -717,12 +723,30 @@ static void note_fb()
 		}
 }
 
-static void mark_draw(bool zbuffered)
+static void mark_draw(bool zbuffered, int32_t yl_sub = 0x7fffffff)
 {
 	if (debug)
 		note_fb();
 	uint32_t stride = color_size ? (color_width << (color_size - 1)) : (color_width >> 1);
 	uint32_t y0 = scissor_yh, y1 = scissor_yl + 1;
+	if (prim_rows && yl_sub != 0x7fffffff)
+	{
+		// rdp_renderer.cpp update_deduced_height: the rows this pass writes back reach this far
+		int32_t last = std::min<int32_t>(yl_sub - 1, int32_t(scissor_yl_sub) - 1) >> 2;
+		uint32_t h = uint32_t(std::max<int32_t>(last + 1, 0));
+		if (h < y1)
+			y1 = h;
+		if (y1 <= y0)
+		{
+			// nothing inside the scissor, but the write-back still covers rows 0..h
+			if (prdp_ranges && stride && y1)
+			{
+				set_pages_written(color_addr, color_addr + y1 * stride, 1);
+				set_pages_written(depth_addr, depth_addr + y1 * color_width * 2, 2);
+			}
+			return;
+		}
+	}
 	if (!stride || y1 <= y0)
 		return;
 	set_pages(color_addr + y0 * stride, color_addr + y1 * stride, 1);
@@ -1218,6 +1242,10 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	{
 		const char *ppr = getenv("N64_RDP_SMART_PRDP_RANGES");
 		prdp_ranges = !(ppr && ppr[0] == '0');
+		const char *prw = getenv("N64_RDP_SMART_PRIM_ROWS");
+		prim_rows = !(prw && prw[0] == '0');
+		if (!prim_rows)
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync locks rows down to the scissor's bottom (N64_RDP_SMART_PRIM_ROWS=0).\n");
 		prdp_pages = 0;
 		const char *swf = getenv("N64_RDP_SPLIT_WRITES_FULL");
 		split_writes_full = !(swf && swf[0] == '0');
@@ -1278,25 +1306,29 @@ static void track(RDP::Op op, uint32_t w1, uint32_t w2)
 	case RDP::Op::SetScissor:
 		scissor_yh = (w1 & 0xFFF) >> 2;
 		scissor_yl = (w2 & 0xFFF) >> 2;
+		scissor_yl_sub = w2 & 0xFFF;
 		break;
 	case RDP::Op::SetOtherModes:
 		// 1/2-cycle mode with Z update writes the depth buffer
 		depth_write = ((w1 >> 20) & 2) == 0 && ((w2 >> 5) & 1);
+		fill_copy = ((w1 >> 20) & 2) != 0;
 		break;
 	case RDP::Op::FillTriangle:
 	case RDP::Op::TextureTriangle:
 	case RDP::Op::ShadeTriangle:
 	case RDP::Op::ShadeTextureTriangle:
+		mark_draw(false, int32_t(w1 << 18) >> 18);
+		break;
 	case RDP::Op::TextureRectangle:
 	case RDP::Op::TextureRectangleFlip:
 	case RDP::Op::FillRectangle:
-		mark_draw(false);
+		mark_draw(false, int32_t((w1 & 0xFFF) | (fill_copy ? 3u : 0u)));
 		break;
 	case RDP::Op::FillZBufferTriangle:
 	case RDP::Op::TextureZBufferTriangle:
 	case RDP::Op::ShadeZBufferTriangle:
 	case RDP::Op::ShadeTextureZBufferTriangle:
-		mark_draw(true);
+		mark_draw(true, int32_t(w1 << 18) >> 18);
 		break;
 	default:
 		break;
