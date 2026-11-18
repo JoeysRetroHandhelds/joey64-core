@@ -149,7 +149,27 @@ bool shade_pixel(int x, int y, uint primitive_index, out ShadedData shaded)
 			tile_info0.size = u8(TEX_SIZE);
 		}
 #endif
-		int texel0 = sample_texture_copy(tile_info0, tmem_instance_index, st, s_offset, tlut, tlut_type);
+		int texel0;
+#ifdef TEXPACK
+		// Joey64 texture packs in copy mode (Paper Mario's title and file select backgrounds are copy-mode texture
+		// rectangles): the stock copy pipe moves TMEM words untouched, so a replaced tile was drawn with its own
+		// texels. With a replacement on a 16-bit frame buffer, its colour goes in as the RGBA5551 word copy mode would
+		// write. Copy mode steps one texel per N64 pixel; the upscaled pixel's place inside that texel (the copy pipe
+		// repeats the texel there) picks the replacement's finer texels.
+		uvec4 rep0 = load_tile_replace(tile_info_index0);
+		if (rep0.w != 0u && global_constants.fb_info.fb_size == 2 && int(tile_info0.fmt) != TEXTURE_FORMAT_YUV)
+		{
+			int dx_full = flip ? (x - span_setup.start_x) : (span_setup.end_x - x);
+			ivec2 st_fine = st;
+			st_fine.x += (s_offset << 5) + (((dx_full & (SCALING_FACTOR - 1)) << 5) >> SCALING_LOG2);
+			const float d = 32.0 / float(SCALING_FACTOR);
+			i16x4 c = sample_replacement(tile_info0, rep0, st_fine, true, false, i16x4(0), vec4(d, 0.0, 0.0, d));
+			ivec4 ci = clamp(ivec4(c), ivec4(0), ivec4(255));
+			texel0 = ((ci.r >> 3) << 11) | ((ci.g >> 3) << 6) | ((ci.b >> 3) << 1) | (ci.a >= 128 ? 1 : 0);
+		}
+		else
+#endif
+		texel0 = sample_texture_copy(tile_info0, tmem_instance_index, st, s_offset, tlut, tlut_type);
 		shaded.z_dith = texel0;
 		shaded.coverage_count = U8_C(COVERAGE_COPY_BIT);
 
