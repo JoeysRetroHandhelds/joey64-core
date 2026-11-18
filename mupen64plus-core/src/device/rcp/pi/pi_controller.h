@@ -85,7 +85,12 @@ struct pi_controller
     struct rdp_core* dp;
 
     uint32_t cart_addr_mask; /* ~1 to align cart DMA addresses like hardware, ~0 for ROM hacks that need odd ones */
+    int drop_past_rdram;     /* PI_OPTION_DROP_PAST_RDRAM: see dma_pi_write */
 };
+
+/* init_pi's options (the ROM database's ForceAlignmentOfPiDma and SkipPiDmaPastRdram) */
+#define PI_OPTION_ALIGN 1
+#define PI_OPTION_DROP_PAST_RDRAM 2
 
 static osal_inline uint32_t pi_reg(uint32_t address)
 {

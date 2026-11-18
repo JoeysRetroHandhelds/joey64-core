@@ -244,6 +244,7 @@ m64p_error open_rom(const unsigned char* romimage, unsigned int size)
         ROM_SETTINGS.sidmaduration = entry->sidmaduration;
         ROM_SETTINGS.aidmamodifier = entry->aidmamodifier;
         ROM_SETTINGS.forcealignmentofpidma = entry->forcealignmentofpidma;
+        ROM_SETTINGS.skippidmapastrdram = entry->skippidmapastrdram;
         ROM_PARAMS.cheats = entry->cheats;
     }
     else
@@ -261,6 +262,7 @@ m64p_error open_rom(const unsigned char* romimage, unsigned int size)
         ROM_SETTINGS.sidmaduration = DEFAULT_SI_DMA_DURATION;
         ROM_SETTINGS.aidmamodifier = DEFAULT_AI_DMA_MODIFIER;
         ROM_SETTINGS.forcealignmentofpidma = DEFAULT_FORCE_ALIGNMENT_OF_PI_DMA;
+        ROM_SETTINGS.skippidmapastrdram = 0;
         ROM_PARAMS.cheats = NULL;
 
         /* check if ROM has the Advanced Homebrew ROM Header (see https://n64brew.dev/wiki/ROM_Header) */
@@ -387,6 +389,7 @@ m64p_error open_disk(void)
         ROM_SETTINGS.sidmaduration = entry->sidmaduration;
         ROM_SETTINGS.aidmamodifier = entry->aidmamodifier;
         ROM_SETTINGS.forcealignmentofpidma = entry->forcealignmentofpidma;
+        ROM_SETTINGS.skippidmapastrdram = entry->skippidmapastrdram;
         ROM_PARAMS.cheats = entry->cheats;
     }
     else
@@ -405,6 +408,7 @@ m64p_error open_disk(void)
         ROM_SETTINGS.sidmaduration = DEFAULT_SI_DMA_DURATION;
         ROM_SETTINGS.aidmamodifier = DEFAULT_AI_DMA_MODIFIER;
         ROM_SETTINGS.forcealignmentofpidma = DEFAULT_FORCE_ALIGNMENT_OF_PI_DMA;
+        ROM_SETTINGS.skippidmapastrdram = 0;
         ROM_PARAMS.cheats = NULL;
     }
 
@@ -623,6 +627,12 @@ static size_t romdatabase_resolve_round(void)
             entry->entry.set_flags |= ROMDATABASE_ENTRY_FORCEALIGNMENTOFPIDMA;
         }
 
+        if (!isset_bitmask(entry->entry.set_flags, ROMDATABASE_ENTRY_SKIPPIDMAPASTRDRAM) &&
+            isset_bitmask(ref->set_flags, ROMDATABASE_ENTRY_SKIPPIDMAPASTRDRAM)) {
+            entry->entry.skippidmapastrdram = ref->skippidmapastrdram;
+            entry->entry.set_flags |= ROMDATABASE_ENTRY_SKIPPIDMAPASTRDRAM;
+        }
+
         if (!isset_bitmask(entry->entry.set_flags, ROMDATABASE_ENTRY_CHEATS) &&
             isset_bitmask(ref->set_flags, ROMDATABASE_ENTRY_CHEATS)) {
             if (ref->cheats)
@@ -764,6 +774,7 @@ void romdatabase_open(void)
             search->entry.sidmaduration = DEFAULT_SI_DMA_DURATION;
             search->entry.aidmamodifier = DEFAULT_AI_DMA_MODIFIER;
             search->entry.forcealignmentofpidma = 1;
+            search->entry.skippidmapastrdram = 0;
             search->entry.set_flags = ROMDATABASE_ENTRY_NONE;
 
             search->next_entry = NULL;
@@ -879,6 +890,11 @@ void romdatabase_open(void)
                 } else {
                     DebugMessage(M64MSG_WARNING, "ROM Database: Invalid CountPerOp on line %i", lineno);
                 }
+            }
+            else if (!strcmp(l.name, "SkipPiDmaPastRdram"))
+            {
+                search->entry.skippidmapastrdram = atoi(l.value);
+                search->entry.set_flags |= ROMDATABASE_ENTRY_SKIPPIDMAPASTRDRAM;
             }
             else if (!strcmp(l.name, "ForceAlignmentOfPiDma"))
             {

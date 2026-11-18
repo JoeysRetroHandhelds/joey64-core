@@ -130,9 +130,19 @@ static void dma_pi_write(struct pi_controller* pi)
         length += 1;
     if (length <= 0x80)
         length = length >= (dram_addr & 0x7) ? length - (dram_addr & 0x7) : 0;
-    unsigned int cycles = handler->dma_write(opaque, dram, dram_addr, cart_addr, length);
-
-    post_framebuffer_write(&pi->dp->fb, dram_addr, length);
+    unsigned int cycles;
+    /* SkipPiDmaPastRdram (Project64's rule, per game): a DMA that would run past the end of RDRAM writes nothing, and
+     * its interrupt still comes. Featherlight v1.1 asks for a 0-byte DMA, whose length register becomes 0xFFFFFF:
+     * 16 MB from 0x240000 wiped every thread's stack and it jumped to a junk return address. Hardware writes the part
+     * inside RDRAM, over about 3 s (the game's own notes: it glitches there and runs on Project64). */
+    if (pi->drop_past_rdram && (size_t)dram_addr + length > pi->ri->rdram->dram_size) {
+        DebugMessage(M64MSG_WARNING, "PI DMA past the end of RDRAM dropped: 0x%" PRIX32 " -> 0x%" PRIX32 " (0x%" PRIX32 ")",
+                     cart_addr, dram_addr, length);
+        cycles = 0x100;
+    } else {
+        cycles = handler->dma_write(opaque, dram, dram_addr, cart_addr, length);
+        post_framebuffer_write(&pi->dp->fb, dram_addr, length);
+    }
 
     /* Mark DMA as busy */
     pi->regs[PI_STATUS_REG] |= PI_STATUS_DMA_BUSY;
@@ -161,7 +171,8 @@ void init_pi(struct pi_controller* pi,
     pi->mi = mi;
     pi->ri = ri;
     pi->dp = dp;
-    pi->cart_addr_mask = force_alignment_of_pi_dma ? ~UINT32_C(1) : ~UINT32_C(0);
+    pi->cart_addr_mask = (force_alignment_of_pi_dma & PI_OPTION_ALIGN) ? ~UINT32_C(1) : ~UINT32_C(0);
+    pi->drop_past_rdram = (force_alignment_of_pi_dma & PI_OPTION_DROP_PAST_RDRAM) != 0;
 }
 
 void poweron_pi(struct pi_controller* pi)

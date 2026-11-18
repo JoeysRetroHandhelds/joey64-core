@@ -288,6 +288,7 @@ typedef struct
    unsigned int sidmaduration; /* Default SI DMA duration */
    unsigned int aidmamodifier; /* Percentage modifier for AI DMA duration */
    unsigned int forcealignmentofpidma; /* 1 - align PI DMA cart addresses (hardware), 0 - don't (some ROM hacks) */
+   unsigned int skippidmapastrdram; /* 1 - drop a cart -> RDRAM DMA that would run past the end of RDRAM (Project64) */
 } m64p_rom_settings;
 
 /* ----------------------------------------- */
