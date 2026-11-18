@@ -1403,8 +1403,10 @@ void CommandProcessor::scanout_sync(std::vector<RGBA> &colors, unsigned &width, 
 
 void CommandProcessor::FenceExecutor::notify_work_locked(const CoherencyOperation &work)
 {
+	// Release store (upstream parallel-rdp does the same): timeline_reached() reads this with an
+	// acquire load from the emulation thread without the worker's lock.
 	if (work.timeline_value)
-		*value = work.timeline_value;
+		__atomic_store_n(value, work.timeline_value, __ATOMIC_RELEASE);
 }
 
 bool CommandProcessor::FenceExecutor::is_sentinel(const CoherencyOperation &work) const
