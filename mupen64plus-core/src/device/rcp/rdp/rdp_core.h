@@ -87,6 +87,11 @@ struct rdp_core
     uint32_t dps_regs[DPS_REGS_COUNT];
     unsigned char do_on_unfreeze;
 
+    /* N64_RDP_ADAPT (dev switch, from mupen64plus-core-dento): DP interrupts of full syncs that finished while one was still due,
+     * each with its own delay; not in save states (a load starts with none) */
+    uint32_t pending_delay[4];
+    unsigned int pending;
+
     struct fb fb;
 
     struct rsp_core* sp;
@@ -119,5 +124,13 @@ void read_dps_regs(void* opaque, uint32_t address, uint32_t* value);
 void write_dps_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask);
 
 void rdp_interrupt_event(void* opaque);
+
+/* A graphics task's full sync is done: its DP interrupt after the current delay (4000 cycles as upstream; with N64_RDP_ADAPT
+ * it grows while the emulator is behind real time, so a game that paces itself by the full sync draws fewer frames instead of
+ * slowing down, as mupen64plus-core-dento's Core[RdpFullSyncDelay..Max]). */
+void rdp_full_sync_done(struct rdp_core* dp);
+/* N64_RDP_ADAPT: once a VI, how far ahead (+) or behind (-) real time the emulator is, in ms (dento's sleepTime) */
+int rdp_adapt_enabled(void);
+void rdp_adapt_vi(double sleep_ms);
 
 #endif

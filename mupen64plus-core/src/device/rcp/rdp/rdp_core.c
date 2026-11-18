@@ -22,8 +22,14 @@
 #include "rdp_core.h"
 
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
+#include "api/callbacks.h"
+#include "api/m64p_types.h"
 #include "device/memory/memory.h"
+#include "device/r4300/r4300_core.h"
+#include "device/r4300/interrupt.h"
 #include "device/rcp/mi/mi_controller.h"
 #include "device/rcp/rsp/rsp_core.h"
 #include "plugin/plugin.h"
@@ -76,6 +82,7 @@ void poweron_rdp(struct rdp_core* dp)
     dp->dpc_regs[DPC_STATUS_REG] |= DPC_STATUS_START_GCLK;
 
     dp->do_on_unfreeze = 0;
+    dp->pending = 0;
 
     poweron_fb(&dp->fb);
 }
@@ -150,5 +157,81 @@ void rdp_interrupt_event(void* opaque)
     struct rdp_core* dp = (struct rdp_core*)opaque;
 
     raise_rcp_interrupt(dp->mi, MI_INTR_DP);
+    if (dp->pending != 0) {
+        uint32_t d = dp->pending_delay[0];
+        memmove(dp->pending_delay, dp->pending_delay + 1, --dp->pending * sizeof(dp->pending_delay[0]));
+        cp0_update_count(dp->mi->r4300);
+        add_interrupt_event(&dp->mi->r4300->cp0, DP_INT, d);
+    }
+}
+
+/* ---- N64_RDP_ADAPT (dev switch, off by default), ported from mupen64plus-core-dento (beebono, GPL-2.0-or-later):
+ * main.c adapt_full_sync_delay + rdp_core.c rdp_full_sync_done. N64_RDP_ADAPT=1 moves the delay between 4000 (upstream's)
+ * and 900000 cycles; N64_RDP_ADAPT=<lo>:<hi> sets the range. ---- */
+static int adapt_state = -1;              /* -1 not read yet, 0 off, 1 on */
+static uint32_t adapt_lo = 4000, adapt_hi = 900000, adapt_delay = 4000;
+static unsigned int adapt_n, adapt_slack, adapt_behind, adapt_log_vis, adapt_log_behind;
+static uint32_t adapt_log_max;
+
+int rdp_adapt_enabled(void)
+{
+    if (adapt_state < 0) {
+        const char* e = getenv("N64_RDP_ADAPT");
+        adapt_state = e && e[0] && e[0] != '0';
+        if (adapt_state) {
+            unsigned int lo, hi;
+            if (strchr(e, ':') && sscanf(e, "%u:%u", &lo, &hi) == 2 && hi > lo) { adapt_lo = lo; adapt_hi = hi; }
+            adapt_delay = adapt_lo;
+            DebugMessage(M64MSG_ERROR, "rdp adapt: on, the DP delay moves between %u and %u cycles", adapt_lo, adapt_hi);
+        }
+    }
+    return adapt_state;
+}
+
+/* dento: while behind real time (more than 2 ms) the delay rises a 75th of the range a VI towards the maximum; it falls back
+ * by a 15th of it after 60 VIs with none behind and at least 54 with slack. */
+void rdp_adapt_vi(double sleep_ms)
+{
+    uint32_t up, down;
+    if (!rdp_adapt_enabled())
+        return;
+    up = (adapt_hi - adapt_lo) / 75 ? (adapt_hi - adapt_lo) / 75 : 1;
+    down = (adapt_hi - adapt_lo) / 15 ? (adapt_hi - adapt_lo) / 15 : 1;
+    if (sleep_ms < -2.0) {
+        ++adapt_behind; ++adapt_log_behind;
+        adapt_delay = (adapt_delay + up < adapt_hi) ? adapt_delay + up : adapt_hi;
+    } else if (sleep_ms > 0.0) {
+        ++adapt_slack;
+    }
+    if (++adapt_n >= 60) {
+        if (adapt_behind == 0 && adapt_slack >= 54)
+            adapt_delay = (adapt_delay > adapt_lo + down) ? adapt_delay - down : adapt_lo;
+        adapt_n = adapt_slack = adapt_behind = 0;
+    }
+    if (adapt_delay > adapt_log_max) adapt_log_max = adapt_delay;
+    if (++adapt_log_vis >= 600) {
+        DebugMessage(M64MSG_ERROR, "rdp adapt: delay %u cycles now, highest %u, %u of the last 600 VIs behind",
+                     adapt_delay, adapt_log_max, adapt_log_behind);
+        adapt_log_vis = adapt_log_behind = 0; adapt_log_max = adapt_delay;
+    }
+}
+
+void rdp_full_sync_done(struct rdp_core* dp)
+{
+    struct cp0* cp0 = &dp->mi->r4300->cp0;
+    if (!rdp_adapt_enabled()) {
+        cp0_update_count(dp->mi->r4300);
+        add_interrupt_event(cp0, DP_INT, 4000);
+        return;
+    }
+    if (get_event(&cp0->q, DP_INT)) {
+        if (dp->pending < sizeof(dp->pending_delay) / sizeof(dp->pending_delay[0]))
+            dp->pending_delay[dp->pending++] = adapt_delay;
+        else
+            dp->pending_delay[dp->pending - 1] += adapt_delay;
+        return;
+    }
+    cp0_update_count(dp->mi->r4300);
+    add_interrupt_event(cp0, DP_INT, adapt_delay);
 }
 

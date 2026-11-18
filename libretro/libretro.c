@@ -56,7 +56,9 @@
 #include "main/netplay.h"
 #include "plugin/plugin.h"
 #include "device/rcp/pi/pi_controller.h"
+#include "device/rcp/rdp/rdp_core.h"
 #include "device/pif/pif.h"
+#include <time.h>
 #include "libretro_memory.h"
 
 #include "audio_plugin.h"
@@ -2229,6 +2231,32 @@ void retro_run (void)
 #endif
 
     co_switch(game_thread);
+
+    /* N64_RDP_ADAPT (dev switch): dento's sleepTime, game time against wall time since the last reset, once a frame. A frame
+     * without video (run-ahead's hidden frames) isn't counted; out of +-50 ms (a pause, fast-forward, a state load) it starts over. */
+    if (rdp_adapt_enabled())
+    {
+       static double ad_t0 = -1.0, ad_game = 0.0;
+       int av = 3;
+       struct timespec ts;
+       double now;
+       if (!environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av))
+          av = 3;
+       clock_gettime(CLOCK_MONOTONIC, &ts);
+       now = ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+       if (av & 1)
+       {
+          if (ad_t0 < 0.0) { ad_t0 = now; ad_game = 0.0; }
+          else
+          {
+             double sleep_ms;
+             ad_game += 1000.0 / vi_expected_refresh_rate_from_tv_standard(ROM_PARAMS.systemtype);
+             sleep_ms = ad_game - (now - ad_t0);
+             rdp_adapt_vi(sleep_ms);
+             if (sleep_ms < -50.0 || sleep_ms > 50.0) { ad_t0 = now; ad_game = 0.0; }
+          }
+       }
+    }
 
     if(current_rdp_type == RDP_PLUGIN_GLIDEN64)
     {
