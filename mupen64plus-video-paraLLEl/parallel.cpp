@@ -73,6 +73,13 @@ extern "C" void parallel_ra_settle(void)
 	RDP::ra_settle();
 }
 
+// Joey64 dev (2026-11-21): the host's N64_HASH_RAM calls this first, so its hash doesn't race the RDP's
+// copy-back (async parallel-RDP writes RDRAM on a worker as the GPU finishes).
+extern "C" __attribute__((visibility("default"))) void joey64_rdp_settle(void)
+{
+	RDP::ra_settle();
+}
+
 extern "C" void parallel_set_hidden_frame(int av)
 {
 	RDP::set_hidden_frame(av);
