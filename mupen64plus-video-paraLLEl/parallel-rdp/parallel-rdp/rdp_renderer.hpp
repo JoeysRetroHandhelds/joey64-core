@@ -81,6 +81,9 @@ struct RendererOptions
 	// The device has no storageBuffer8BitAccess: use the NO_STORAGE_8BIT
 	// shader variants, whose hidden RDRAM is 16 bits per entry.
 	bool no_storage_8bit = false;
+	// No storageBuffer16BitAccess either: NO_STORAGE_16BIT variants, hidden
+	// RDRAM and coverage 32 bits per entry. Implies no_storage_8bit.
+	bool no_storage_16bit = false;
 };
 
 enum class ValidationError
@@ -491,6 +494,7 @@ private:
 		bool ubershader = false;
 		bool supports_small_integer_arithmetic = false;
 		bool no_storage_8bit = false;
+		bool no_storage_16bit = false;
 		bool subgroup_tile_binning = false;
 		bool subgroup_depth_blend = false;
 		bool super_sample_readback = false;

@@ -30,10 +30,19 @@ layout(set = 0, binding = 0, std430) buffer VRAM32
 	uint data[];
 } vram32;
 
+#if NO_STORAGE_16BIT
+#define vram16_load(i) load_u16_from_u32(vram32.data, i)
+#define vram16_store(i, v) store_u16_to_u32(vram32.data, i, v)
+#define vram16_set_ones(i) set_u16_in_u32(vram32.data, i)
+#else
 layout(set = 0, binding = 0, std430) buffer VRAM16
 {
 	mem_u16 data[];
 } vram16;
+#define vram16_load(i) uint(vram16.data[i])
+#define vram16_store(i, v) vram16.data[i] = mem_u16(v)
+#define vram16_set_ones(i) vram16.data[i] = mem_u16_ones(i)
+#endif
 
 #if !NO_STORAGE_8BIT
 layout(set = 0, binding = 0, std430) buffer VRAM8
@@ -47,10 +56,19 @@ layout(set = 0, binding = 1, std430) buffer HiddenVRAM
 	mem_hidden data[];
 } hidden_vram;
 
+#if NO_STORAGE_16BIT
+layout(set = 0, binding = 2, std430) readonly buffer TMEM32
+{
+	TMEMInstance32Mem instances[];
+} tmem32;
+#define tmem16_load(inst, i) load_u16_from_u32(tmem32.instances[inst].elems, i)
+#else
 layout(set = 0, binding = 2, std430) readonly buffer TMEM16
 {
 	TMEMInstance16Mem instances[];
 } tmem16;
+#define tmem16_load(inst, i) uint(tmem16.instances[inst].elems[i])
+#endif
 
 #if !NO_STORAGE_8BIT
 layout(set = 0, binding = 2, std430) readonly buffer TMEM8

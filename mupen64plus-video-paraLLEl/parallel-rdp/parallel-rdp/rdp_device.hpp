@@ -315,6 +315,8 @@ private:
 	bool is_supported = false;
 	// Hidden RDRAM is 16 bits per entry (see RendererOptions::no_storage_8bit).
 	bool no_storage_8bit = false;
+	// 32 bits per entry (RendererOptions::no_storage_16bit); implies no_storage_8bit.
+	bool no_storage_16bit = false;
 	void flush_hidden_dram_to_dump();
 	bool is_host_coherent = true;
 	bool timestamp = false;

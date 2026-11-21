@@ -30,13 +30,25 @@ void store_span_setup(uint index, SpanSetup setup)
 #else
 	span_setups.elems[index].rgba = setup.rgba;
 	span_setups.elems[index].stzw = setup.stzw;
+#if NO_STORAGE_16BIT
+	uvec4 xl = uvec4(setup.xleft) & 0xffffu;
+	uvec4 xr = uvec4(setup.xright) & 0xffffu;
+	span_setups.elems[index].xleft = uvec2(xl.x | (xl.y << 16u), xl.z | (xl.w << 16u));
+	span_setups.elems[index].xright = uvec2(xr.x | (xr.y << 16u), xr.z | (xr.w << 16u));
+#else
 	span_setups.elems[index].xleft = mem_u16x4(uvec4(setup.xleft));
 	span_setups.elems[index].xright = mem_u16x4(uvec4(setup.xright));
+#endif
 	span_setups.elems[index].interpolation_base_x = setup.interpolation_base_x;
 	span_setups.elems[index].start_x = setup.start_x;
 	span_setups.elems[index].end_x = setup.end_x;
+#if NO_STORAGE_16BIT
+	span_setups.elems[index].lodlength_valid_line =
+			(uint(setup.lodlength) & 0xffffu) | ((uint(setup.valid_line) & 0xffffu) << 16u);
+#else
 	span_setups.elems[index].lodlength = mem_i16(setup.lodlength);
 	span_setups.elems[index].valid_line = mem_u16(setup.valid_line);
+#endif
 #endif
 }
 

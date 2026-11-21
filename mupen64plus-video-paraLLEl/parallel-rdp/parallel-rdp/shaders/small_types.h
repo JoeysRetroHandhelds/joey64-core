@@ -34,7 +34,21 @@
 #define NO_STORAGE_8BIT 0
 #endif
 
+// NO_STORAGE_16BIT: for devices without storageBuffer16BitAccess either
+// (Adreno 610-640). No buffer is accessed as 16-bit: RDRAM and TMEM are read
+// and written through 32-bit views, hidden RDRAM and coverage take 32 bits an
+// entry, and mem_u16/mem_i16 stay undefined so a missed access fails to build.
+#ifndef NO_STORAGE_16BIT
+#define NO_STORAGE_16BIT 0
+#endif
+
+#if NO_STORAGE_16BIT && !NO_STORAGE_8BIT
+#error "NO_STORAGE_16BIT requires NO_STORAGE_8BIT"
+#endif
+
+#if !NO_STORAGE_16BIT
 #extension GL_EXT_shader_16bit_storage : require
+#endif
 #if !NO_STORAGE_8BIT
 #extension GL_EXT_shader_8bit_storage : require
 #endif
@@ -55,12 +69,31 @@
 	atomicAnd(arr[uint(i) >> 2u], ~(0xffu << store_u8_shift_)); \
 	atomicOr(arr[uint(i) >> 2u], (uint(v) & 0xffu) << store_u8_shift_); \
 } while (false)
+#if NO_STORAGE_16BIT
+// Halfword i of a uint array (element 0 in the low bits). Stores replace the
+// lane atomically: the other half may be a pixel another invocation writes.
+#define load_u16_from_u32(arr, i) ((arr[uint(i) >> 1u] >> ((uint(i) & 1u) * 16u)) & 0xffffu)
+#define store_u16_to_u32(arr, i, v) do { \
+	uint store_u16_shift_ = (uint(i) & 1u) * 16u; \
+	atomicAnd(arr[uint(i) >> 1u], ~(0xffffu << store_u16_shift_)); \
+	atomicOr(arr[uint(i) >> 1u], (uint(v) & 0xffffu) << store_u16_shift_); \
+} while (false)
+#define set_u16_in_u32(arr, i) atomicOr(arr[uint(i) >> 1u], 0xffffu << ((uint(i) & 1u) * 16u))
+// Halfwords of a packed word, element 0 in the low bits.
+#define unpack_mem_u16(w, i) int((uint(w) >> (16u * uint(i))) & 0xffffu)
+#define unpack_mem_i16(w, i) bitfieldExtract(int(w), 16 * int(i), 16)
+// Hidden RDRAM and coverage: one 32-bit element per entry.
+#define mem_hidden uint
+#define mem_cov uint
+#else
 // Hidden RDRAM holds one 16-bit element per RDRAM halfword instead of one
 // byte, so neighbouring pixels never share a word.
 #define mem_hidden uint16_t
+#define mem_cov uint16_t
 // 0xffff as a 16-bit store value, built from a runtime value: a converted
 // constant is folded into a 16-bit OpConstant, which needs shaderInt16.
 #define mem_u16_ones(runtime) uint16_t(uint(runtime) | 0xffffu)
+#endif
 #else
 #define mem_hidden mem_u8
 #define mem_u16_ones(runtime) mem_u16(0xffff)
@@ -124,6 +157,7 @@
 #define mem_i8x4 i8vec4
 #endif
 
+#if !NO_STORAGE_16BIT
 #define mem_u16 uint16_t
 #define mem_u16x2 u16vec2
 #define mem_u16x3 u16vec3
@@ -133,6 +167,7 @@
 #define mem_i16x2 i16vec2
 #define mem_i16x3 i16vec3
 #define mem_i16x4 i16vec4
+#endif
 
 #define u8 int
 #define u16 int

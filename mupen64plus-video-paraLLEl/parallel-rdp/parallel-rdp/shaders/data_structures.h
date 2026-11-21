@@ -76,7 +76,18 @@ const int DEPTH_BLEND_MULTI_CYCLE_BIT = 1 << 6;
 const int DEPTH_BLEND_AA_BIT = 1 << 7;
 const int DEPTH_BLEND_DITHER_ENABLE_BIT = 1 << 8;
 
-#if NO_STORAGE_8BIT
+#if NO_STORAGE_16BIT
+// NO_STORAGE_16BIT twins: the same bytes, halfword pairs in one uint.
+struct TriangleSetupMem
+{
+	int xh, xm, xl;
+	uint yh_ym;
+	int dxhdy, dxmdy, dxldy;
+	uint yl_flags_tile;
+};
+#define triangle_setup_flags(index) unpack_mem_u8(triangle_setup.elems[index].yl_flags_tile, 2)
+#define triangle_setup_tile(index) unpack_mem_u8(triangle_setup.elems[index].yl_flags_tile, 3)
+#elif NO_STORAGE_8BIT
 // The NO_STORAGE_8BIT twins below keep each Mem struct's layout; byte
 // groups become 16/32-bit words (lowest address in the low bits).
 struct TriangleSetupMem
@@ -126,6 +137,22 @@ struct AttributeSetupMem
 };
 #define AttributeSetup AttributeSetupMem
 
+#if NO_STORAGE_16BIT
+struct SpanSetupMem
+{
+	ivec4 rgba;
+	ivec4 stzw;
+
+	uvec2 xleft;
+	uvec2 xright;
+
+	int interpolation_base_x;
+	int start_x;
+	int end_x;
+	uint lodlength_valid_line;
+};
+#define span_setup_valid_line(e) unpack_mem_u16((e).lodlength_valid_line, 1)
+#else
 struct SpanSetupMem
 {
 	ivec4 rgba;
@@ -140,6 +167,8 @@ struct SpanSetupMem
 	mem_i16 lodlength;
 	mem_u16 valid_line;
 };
+#define span_setup_valid_line(e) uint((e).valid_line)
+#endif
 #if SMALL_TYPES
 #define SpanSetup SpanSetupMem
 #else
@@ -185,10 +214,15 @@ struct DerivedSetupMem
 	uint blend_color_packed;
 	uint fill_color;
 
+#if NO_STORAGE_16BIT
+	uint dz_dz_compressed_min_lod;
+	uvec2 factors;
+#else
 	mem_u16 dz;
 	mem_u16 dz_compressed_min_lod;
 
 	mem_i16x4 factors;
+#endif
 };
 #else
 struct DerivedSetupMem
@@ -406,10 +440,18 @@ struct InstanceIndicesMem
 #define instance_tile_info(prim, tile) state_indices.elems[prim].tile_infos[tile]
 #endif
 
+#if NO_STORAGE_16BIT
+// The same 4 KiB a TMEM instance, read as 32-bit words.
+struct TMEMInstance32Mem
+{
+	uint elems[1024];
+};
+#else
 struct TMEMInstance16Mem
 {
 	mem_u16 elems[2048];
 };
+#endif
 
 #if !NO_STORAGE_8BIT
 struct TMEMInstance8Mem

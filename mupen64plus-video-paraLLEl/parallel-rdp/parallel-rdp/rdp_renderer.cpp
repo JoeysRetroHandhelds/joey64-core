@@ -105,7 +105,8 @@ bool Renderer::init_renderer(const RendererOptions &options)
 		return false;
 
 	// Buffers are sized for it below, before init_caps.
-	caps.no_storage_8bit = options.no_storage_8bit;
+	caps.no_storage_8bit = options.no_storage_8bit || options.no_storage_16bit;
+	caps.no_storage_16bit = options.no_storage_16bit;
 
 	caps.max_width = options.upscaling_factor * Limits::MaxWidth;
 	caps.max_height = options.upscaling_factor * Limits::MaxHeight;
@@ -215,7 +216,9 @@ bool Renderer::init_caps()
 		LOGI("Allow small types = %d.\n", int(allow_small_types));
 	}
 
-	if (!features.vk11_features.storageBuffer16BitAccess)
+	if (caps.no_storage_16bit)
+		LOGI("16-bit storage for SSBOs is not used, falling back to 32-bit storage.\n");
+	else if (!features.vk11_features.storageBuffer16BitAccess)
 	{
 		LOGE("16-bit storage for SSBOs is not supported! This is a minimum requirement for paraLLEl-RDP.\n");
 		return false;
@@ -314,6 +317,8 @@ int Renderer::resolve_shader_define(const char *name, const char *define) const
 		return int(caps.supports_small_integer_arithmetic);
 	else if (strcmp(define, "NO_STORAGE_8BIT") == 0)
 		return int(caps.no_storage_8bit);
+	else if (strcmp(define, "NO_STORAGE_16BIT") == 0)
+		return int(caps.no_storage_16bit);
 	else if (strcmp(define, "SUBGROUP") == 0)
 	{
 		if (strcmp(name, "tile_binning_combined") == 0)
@@ -382,7 +387,9 @@ void Renderer::init_buffers(const RendererOptions &options)
 		per_tile_shaded_shaded_alpha = device->create_buffer(info);
 		// Without 8-bit storage, coverage and shade alpha share one 16-bit
 		// element in the coverage buffer (rasterizer.comp).
-		if (caps.no_storage_8bit)
+		if (caps.no_storage_16bit)
+			info.size *= sizeof(uint32_t);
+		else if (caps.no_storage_8bit)
 			info.size *= sizeof(uint16_t);
 		per_tile_shaded_coverage = device->create_buffer(info);
 		device->set_name(*per_tile_shaded_coverage, "per-tile-shaded-coverage");
@@ -652,7 +659,8 @@ bool Renderer::init_internal_upscaling_factor(const RendererOptions &options)
 
 	{
 		auto cmd = device->request_command_buffer();
-		cmd->fill_buffer(*upscaling_multisampled_hidden_rdram, caps.no_storage_8bit ? 0x00030003u : 0x03030303u);
+		cmd->fill_buffer(*upscaling_multisampled_hidden_rdram,
+		                 caps.no_storage_16bit ? 0x00000003u : caps.no_storage_8bit ? 0x00030003u : 0x03030303u);
 		cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
 		             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
 		             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);

@@ -45,10 +45,12 @@ layout(set = 0, binding = 0) readonly buffer RDRAMSingleSampled8
 } vram8;
 #endif
 
+#if !NO_STORAGE_16BIT
 layout(set = 0, binding = 0) readonly buffer RDRAMSingleSampled16
 {
     uint16_t elems[];
 } vram16;
+#endif
 
 layout(set = 0, binding = 0) readonly buffer RDRAMSingleSampled32
 {
@@ -67,10 +69,12 @@ layout(set = 0, binding = 2) buffer RDRAMUpscalingReference8
 } vram_reference8;
 #endif
 
+#if !NO_STORAGE_16BIT
 layout(set = 0, binding = 2) buffer RDRAMUpscalingReference16
 {
     uint16_t elems[];
 } vram_reference16;
+#endif
 
 layout(set = 0, binding = 2) buffer RDRAMUpscalingReference32
 {
@@ -84,10 +88,12 @@ layout(set = 0, binding = 3) buffer RDRAMUpscaling8
 } vram_upscaled8;
 #endif
 
+#if !NO_STORAGE_16BIT
 layout(set = 0, binding = 3) buffer RDRAMUpscaling16
 {
     uint16_t elems[];
 } vram_upscaled16;
+#endif
 
 layout(set = 0, binding = 3) buffer RDRAMUpscaling32
 {
@@ -137,8 +143,13 @@ void update_rdram_16(uint index)
 {
     index &= RDRAM_MASK_16;
 
+#if NO_STORAGE_16BIT
+    uint real_word = load_u16_from_u32(vram32.elems, index);
+    uint reference_word = load_u16_from_u32(vram_reference32.elems, index);
+#else
     uint real_word = uint(vram16.elems[index]);
     uint reference_word = uint(vram_reference16.elems[index]);
+#endif
 
     if (real_word != reference_word)
     {
@@ -146,10 +157,18 @@ void update_rdram_16(uint index)
         uint real_hidden_word = uint(hidden_vram.elems[mirrored_index]);
         for (int i = 0; i < NUM_SAMPLES; i++)
         {
+#if NO_STORAGE_16BIT
+            store_u16_to_u32(vram_upscaled32.elems, index + i * (RDRAM_SIZE >> 1), real_word);
+#else
             vram_upscaled16.elems[index + i * (RDRAM_SIZE >> 1)] = uint16_t(real_word);
+#endif
             hidden_vram_upscaled.elems[mirrored_index + i * (RDRAM_SIZE >> 1)] = mem_hidden(real_hidden_word);
         }
+#if NO_STORAGE_16BIT
+        store_u16_to_u32(vram_reference32.elems, index, real_word);
+#else
         vram_reference16.elems[index] = uint16_t(real_word);
+#endif
     }
 }
 

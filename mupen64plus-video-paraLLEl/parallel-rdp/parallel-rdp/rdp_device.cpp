@@ -131,7 +131,17 @@ CommandProcessor::CommandProcessor(Vulkan::Device &device_, void *rdram_ptr,
 		LOGI("Overriding no 8-bit storage = %d.\n", int(no_storage_8bit));
 	}
 
-	info.size = hidden_rdram_size * (no_storage_8bit ? 2 : 1);
+	// Without 16-bit SSBO access either (Adreno 610-640), one 32-bit element.
+	no_storage_16bit = !device.get_device_features().vk11_features.storageBuffer16BitAccess;
+	if (const char *env = getenv("PARALLEL_RDP_NO_STORAGE_16BIT"))
+	{
+		no_storage_16bit = strtol(env, nullptr, 0) > 0;
+		LOGI("Overriding no 16-bit storage = %d.\n", int(no_storage_16bit));
+	}
+	if (no_storage_16bit)
+		no_storage_8bit = true;
+
+	info.size = hidden_rdram_size * (no_storage_16bit ? 4 : no_storage_8bit ? 2 : 1);
 	// Should be CachedHost, but seeing some insane bug on incoherent Arm systems for time being,
 	// so just forcing coherent memory here for now. Not sure what is going on.
 	info.domain = (flags & COMMAND_PROCESSOR_FLAG_HOST_VISIBLE_HIDDEN_RDRAM_BIT) != 0 ?
@@ -234,6 +244,7 @@ void CommandProcessor::init_renderer()
 	opts.super_sampled_readback = (flags & COMMAND_PROCESSOR_FLAG_SUPER_SAMPLED_READ_BACK_BIT) != 0;
 	opts.super_sampled_readback_dither = (flags & COMMAND_PROCESSOR_FLAG_SUPER_SAMPLED_DITHER_BIT) != 0;
 	opts.no_storage_8bit = no_storage_8bit;
+	opts.no_storage_16bit = no_storage_16bit;
 
 	is_supported = renderer.init_renderer(opts);
 
@@ -367,7 +378,15 @@ void CommandProcessor::flush_hidden_dram_to_dump()
 	const void *hidden = begin_read_hidden_rdram();
 	size_t size = hidden_rdram->get_create_info().size;
 
-	if (no_storage_8bit)
+	if (no_storage_16bit)
+	{
+		const uint32_t *wide = static_cast<const uint32_t *>(hidden);
+		std::vector<uint8_t> narrow(size / 4);
+		for (size_t i = 0; i < narrow.size(); i++)
+			narrow[i] = uint8_t(wide[i]);
+		dump_writer->flush_hidden_dram(narrow.data(), uint32_t(narrow.size()));
+	}
+	else if (no_storage_8bit)
 	{
 		const uint16_t *wide = static_cast<const uint16_t *>(hidden);
 		std::vector<uint8_t> narrow(size / 2);
@@ -391,7 +410,7 @@ void CommandProcessor::set_validation_interface(ValidationInterface *iface)
 
 void CommandProcessor::clear_hidden_rdram()
 {
-	clear_buffer(*hidden_rdram, no_storage_8bit ? 0x00030003u : 0x03030303u);
+	clear_buffer(*hidden_rdram, no_storage_16bit ? 0x00000003u : no_storage_8bit ? 0x00030003u : 0x03030303u);
 }
 
 void CommandProcessor::clear_tmem()

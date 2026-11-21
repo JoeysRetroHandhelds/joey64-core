@@ -28,6 +28,22 @@ TriangleSetup load_triangle_setup(uint index)
 #if SMALL_TYPES
 	return triangle_setup.elems[index];
 #else
+#if NO_STORAGE_16BIT
+	uint yh_ym = triangle_setup.elems[index].yh_ym;
+	uint yl_flags_tile = triangle_setup.elems[index].yl_flags_tile;
+	return TriangleSetup(
+			triangle_setup.elems[index].xh,
+			triangle_setup.elems[index].xm,
+			triangle_setup.elems[index].xl,
+			i16(unpack_mem_i16(yh_ym, 0)),
+			i16(unpack_mem_i16(yh_ym, 1)),
+			triangle_setup.elems[index].dxhdy,
+			triangle_setup.elems[index].dxmdy,
+			triangle_setup.elems[index].dxldy,
+			i16(unpack_mem_i16(yl_flags_tile, 0)),
+			unpack_mem_u8(yl_flags_tile, 2),
+			unpack_mem_u8(yl_flags_tile, 3));
+#else
 	return TriangleSetup(
 			triangle_setup.elems[index].xh,
 			triangle_setup.elems[index].xm,
@@ -44,6 +60,7 @@ TriangleSetup load_triangle_setup(uint index)
 #else
 			u8(triangle_setup.elems[index].flags),
 			u8(triangle_setup.elems[index].tile));
+#endif
 #endif
 #endif
 }

@@ -28,6 +28,21 @@ SpanSetup load_span_setup(uint index)
 #if SMALL_TYPES
 	return span_setups.elems[index];
 #else
+#if NO_STORAGE_16BIT
+	uvec2 xl = span_setups.elems[index].xleft;
+	uvec2 xr = span_setups.elems[index].xright;
+	uint lv = span_setups.elems[index].lodlength_valid_line;
+	return SpanSetup(
+			span_setups.elems[index].rgba,
+			span_setups.elems[index].stzw,
+			u16x4(unpack_mem_u16(xl.x, 0), unpack_mem_u16(xl.x, 1), unpack_mem_u16(xl.y, 0), unpack_mem_u16(xl.y, 1)),
+			u16x4(unpack_mem_u16(xr.x, 0), unpack_mem_u16(xr.x, 1), unpack_mem_u16(xr.y, 0), unpack_mem_u16(xr.y, 1)),
+			span_setups.elems[index].interpolation_base_x,
+			span_setups.elems[index].start_x,
+			span_setups.elems[index].end_x,
+			i16(unpack_mem_i16(lv, 0)),
+			u16(unpack_mem_u16(lv, 1)));
+#else
 	return SpanSetup(
 			span_setups.elems[index].rgba,
 			span_setups.elems[index].stzw,
@@ -38,6 +53,7 @@ SpanSetup load_span_setup(uint index)
 			span_setups.elems[index].end_x,
 			i16(span_setups.elems[index].lodlength),
 			u16(span_setups.elems[index].valid_line));
+#endif
 #endif
 }
 
