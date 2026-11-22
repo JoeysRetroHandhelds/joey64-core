@@ -124,7 +124,10 @@ CommandProcessor::CommandProcessor(Vulkan::Device &device_, void *rdram_ptr,
 
 	// Without 8-bit SSBO access the shaders keep hidden RDRAM as one 16-bit
 	// element per entry, so neighbouring pixels never share a word.
-	no_storage_8bit = !device.get_device_features().storage_8bit_features.storageBuffer8BitAccess;
+	// vk12_features, not storage_8bit_features: on a Vulkan 1.2+ device the context fills only vk12_features (on 1.1
+	// it copies the KHR struct into it), so the KHR struct read 0 there and every 1.2+ GPU took the fallback (release
+	// audit 2026-11-22, Odin 2 Portal Turnip: "8-bit storage for SSBOs is not used"). init_caps reads the same field.
+	no_storage_8bit = !device.get_device_features().vk12_features.storageBuffer8BitAccess;
 	if (const char *env = getenv("PARALLEL_RDP_NO_STORAGE_8BIT"))
 	{
 		no_storage_8bit = strtol(env, nullptr, 0) > 0;
@@ -277,6 +280,14 @@ void *CommandProcessor::enable_texpack(size_t max_bytes, size_t &bytes, TexpackI
 #else
 	if (!is_supported || texpack_bank)
 		return nullptr;
+	// The texpack bank has no NO_STORAGE variants: its rasterizer writes 8-bit coverage and shade alpha apart, which the
+	// fallback's depth_blend reads packed into one 16-bit value (wrong coverage and alpha), and on a GPU really without
+	// 8-bit storage its pipelines can't be made (release audit 2026-11-22). No pack there until the bank has them.
+	if (no_storage_8bit || no_storage_16bit)
+	{
+		LOGI("Texture packs: off without 8-bit / 16-bit storage buffers.\n");
+		return nullptr;
+	}
 
 	const char *env = getenv("N64_RDP_TEXPACK_IMAGE");
 	if (image && !(env && env[0] == '0'))

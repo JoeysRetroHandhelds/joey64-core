@@ -16,4 +16,4 @@ aarch64 JIT fast paths (rsp/vu_inline.cpp, rsp/vu_inline.h, rsp/vu_neon.h, rsp/n
 vector load/store, scalar load/store and divide code in rsp_jit.cpp, code packing in jit_allocator.cpp, the SP DMA row
 copy and IMEM filter in rsp/cp0.cpp, the jit_raw() and ldxr_c/ldxi changes in lightning/, tests/): from beebono's
 parallel-rsp fork (branch m64p-aarch64, https://github.com/beebono/parallel-rsp), licensed like upstream parallel-rsp,
-MIT or LGPL-3.0-or-later. In Joey64 they are on only with the dev env N64_RSP_BJIT=1.
+MIT or LGPL-3.0-or-later. In the core they are on only with the env N64_RSP_BJIT=1; Joey64 sets it on every GPU.
