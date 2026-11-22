@@ -487,6 +487,13 @@ static unsigned faults_emulated;
 // accesses a page or waiting instead made no difference), Paper Mario 12-15% less, the rest the same, geomean 0.996.
 static bool open_window;
 static unsigned precise_done, precise_emulated, precise_waited;
+// N64_RDP_SMART_MASKCHECK=1 (debug, 2026-11-22, from gopher64's Android flicker fix #1401/#1413/#1414): without
+// host-imported RDRAM the read-back copies every byte whose GPU write mask is set, and the mask keeps earlier GPU
+// writes until a direct upload clears it. A store precise mode does through the alias onto such bytes can be put back
+// to the old GPU value. Counts those stores (and loads, for scale) in the precise log line.
+static bool maskcheck;
+static const uint8_t *mask_view;
+static unsigned mask_stores, mask_store_hits, mask_load_hits;
 
 // RDP state that decides where draws land
 static uint32_t color_addr, color_width, color_size, depth_addr;
@@ -910,6 +917,8 @@ static void split_now()
 static void on_sync_full()
 {
 	sync_signal = frontend->signal_timeline();
+	if (maskcheck && !mask_view)
+		mask_view = frontend->debug_write_mask();
 	trace(" |S%u|", sync_count + 1);
 	trace_last_addr = 0;
 	if (debug && sync_count == 1205 && trace_len)
@@ -950,6 +959,10 @@ static void on_sync_full()
 			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart precise: beside the drawn bytes %u found the GPU done, %u went through the alias, %u waited\n",
 			       precise_done, precise_emulated, precise_waited);
 			precise_done = precise_emulated = precise_waited = 0;
+			if (maskcheck)
+				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart maskcheck: mask %s, %u stores through the alias, %u on GPU-written bytes, %u loads on them\n",
+				       mask_view ? "mapped" : "not mapped", mask_stores, mask_store_hits, mask_load_hits);
+			mask_stores = mask_store_hits = mask_load_hits = 0;
 		}
 		if (debug)
 		{
@@ -1104,7 +1117,25 @@ static void handler(int sig, siginfo_t *info, void *uc)
 				precise_done++;
 				return; // retried on the unlocked page
 			}
-			if (emulate_access(uc, offset))
+			if (maskcheck && mask_view)
+			{
+				uint32_t insn = *reinterpret_cast<const uint32_t *>(static_cast<ucontext_t *>(uc)->uc_mcontext.pc);
+				uint32_t bytes = 1u << (insn >> 30);
+				bool store = ((insn >> 22) & 3) == 0;
+				bool hit = false;
+				for (uint32_t i = 0; i < bytes && offset + i < rdram_size; i++)
+					hit |= mask_view[offset + i] != 0;
+				if (emulate_access(uc, offset))
+				{
+					if (store)
+						mask_stores++;
+					if (hit)
+						(store ? mask_store_hits : mask_load_hits)++;
+					precise_emulated++;
+					return;
+				}
+			}
+			else if (emulate_access(uc, offset))
 			{
 				precise_emulated++;
 				return;
@@ -1214,6 +1245,10 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	const char *opw = getenv("N64_RDP_SMART_OPEN");
 	open_window = opw && opw[0] == '1';
 	precise_done = precise_emulated = precise_waited = 0;
+	const char *mck = getenv("N64_RDP_SMART_MASKCHECK");
+	maskcheck = mck && mck[0] == '1';
+	mask_view = nullptr;
+	mask_stores = mask_store_hits = mask_load_hits = 0;
 	const char *stp = getenv("N64_RDP_SMART_STAMP");
 	stamped = !(stp && stp[0] == '0');
 	const char *spl = getenv("N64_RDP_SMART_SPLIT");

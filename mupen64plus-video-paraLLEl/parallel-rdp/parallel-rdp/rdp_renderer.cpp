@@ -2959,6 +2959,14 @@ unsigned Renderer::get_scaling_factor() const
 	return caps.upscaling;
 }
 
+const uint8_t *Renderer::debug_write_mask()
+{
+	if (is_host_coherent || !rdram || !rdram->get_allocation().is_host_allocation())
+		return nullptr;
+	return static_cast<const uint8_t *>(device->map_host_buffer(*rdram, Vulkan::MEMORY_ACCESS_READ_BIT,
+	                                                            rdram_offset + rdram_size, rdram_size));
+}
+
 const Vulkan::Buffer *Renderer::get_upscaled_rdram_buffer() const
 {
 	return upscaling_multisampled_rdram.get();

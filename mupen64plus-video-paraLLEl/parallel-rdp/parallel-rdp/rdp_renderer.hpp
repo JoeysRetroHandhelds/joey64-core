@@ -187,6 +187,10 @@ public:
 	                                            unsigned addr, unsigned pixels, unsigned pixel_size_log2);
 	unsigned get_scaling_factor() const;
 
+	// Joey64 debug (N64_RDP_SMART_MASKCHECK=1): the GPU copy's byte write mask (rdram_size bytes), when RDRAM's GPU
+	// copy can be mapped (not host-imported); else nullptr. Read only.
+	const uint8_t *debug_write_mask();
+
 	const Vulkan::Buffer *get_upscaled_rdram_buffer() const;
 	const Vulkan::Buffer *get_upscaled_hidden_rdram_buffer() const;
 
