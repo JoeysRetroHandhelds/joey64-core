@@ -3623,6 +3623,10 @@ bool Renderer::tmem_upload_range_needs_flush(uint32_t addr, uint32_t length) con
 // marked for GPU read.
 void Renderer::prepare_tmem_upload(const UploadInfo &upload)
 {
+	// An empty upload reads no RDRAM; with a 0 height or width the sums below wrap to ~4 GB and always matched,
+	// flushing the batch for nothing (release audit 2026-11-22).
+	if (upload.height <= 0 || upload.vram_effective_width <= 0)
+		return;
 	uint32_t addr = uint32_t(upload.vram_addr);
 	unsigned bytes_per_texel = 1u << (upload.vram_size - 1);
 	unsigned row_bytes = upload.vram_effective_width * bytes_per_texel;
