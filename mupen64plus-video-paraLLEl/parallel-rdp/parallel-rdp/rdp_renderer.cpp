@@ -2577,7 +2577,7 @@ void Renderer::maintain_queues()
 	// If we have no pending submissions, the GPU is idle and there is no reason not to submit.
 	// If we haven't submitted anything in a while (1.0 ms), it's probably fine to submit again.
 	if (pending_render_passes >= ImplementationConstants::MaxPendingRenderPassesBeforeFlush ||
-	    (caps.super_sample_readback && pending_render_passes_upscaled >= ImplementationConstants::MaxPendingRenderPassesBeforeFlush) ||
+	    (ssrb_live() && pending_render_passes_upscaled >= ImplementationConstants::MaxPendingRenderPassesBeforeFlush) ||
 	    pending_primitives >= Limits::MaxPrimitives ||
 	    pending_primitives_upscaled >= Limits::MaxPrimitives ||
 	    active_submissions.load(std::memory_order_relaxed) == 0 ||
@@ -2621,7 +2621,7 @@ void Renderer::enqueue_fence_wait(Vulkan::Fence fence)
 void Renderer::submit_to_queue()
 {
 	bool pending_host_visible_render_passes =
-			(caps.super_sample_readback ? pending_render_passes_upscaled : pending_render_passes) != 0;
+			(ssrb_live() ? pending_render_passes_upscaled : pending_render_passes) != 0;
 	bool pending_upscaled_passes = pending_render_passes_upscaled != 0;
 	pending_render_passes = 0;
 	pending_render_passes_upscaled = 0;
@@ -3341,7 +3341,7 @@ void Renderer::flush_queues()
 	instance.upload(*device, stream, *stream.cmd);
 
 	// If we have super-sampled readback, then this is meaningless.
-	bool has_single_sampled_render_pass = !caps.super_sample_readback;
+	bool has_single_sampled_render_pass = !ssrb_live();
 
 	if (has_single_sampled_render_pass)
 	{
@@ -3491,7 +3491,7 @@ void Renderer::flush_deferred_upscaled()
 
 bool Renderer::render_pass_is_upscaled() const
 {
-	if (caps.super_sample_readback)
+	if (ssrb_live())
 		return true;
 
 	bool need_render_pass = fb.width != 0 && fb.deduced_height != 0 && !stream.span_info_jobs.empty();

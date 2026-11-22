@@ -1407,7 +1407,10 @@ void set_hidden_frame(int av)
 		return;
 	bool hidden = allow == 3 ? (av & 9) == 9 && !RaNative::off && RaNative::clean >= 600 :
 	              allow == 2 ? (av & 8) != 0 : !(av & 1);
-	bool skip = hidden && active_upscaling > 1 && !super_sampled_read_back;
+	// With super-sampled read-back (the default since 2026-11-17) the skip frames draw the plain 1x pass
+	// (Renderer::ssrb_live); N64_RA_NATIVE_SSRB=0 keeps them upscaled as before 2026-11-21.
+	static const bool ssrb_native = !(getenv("N64_RA_NATIVE_SSRB") && getenv("N64_RA_NATIVE_SSRB")[0] == '0');
+	bool skip = hidden && active_upscaling > 1 && (ssrb_native || !super_sampled_read_back);
 	if (skip != last)
 	{
 		frontend->set_skip_upscaled(skip);
