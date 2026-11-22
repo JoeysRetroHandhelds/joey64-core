@@ -16,17 +16,24 @@ Claude Code, which also runs most of the device testing. I decide what goes in a
   - repeat frames skipped (the VI shows the same picture again);
   - "smart sync": async, with RDRAM pages the RDP drew into page-protected, so the CPU waits for the GPU only
     when it reads them (Pokémon Snap, Resident Evil 2 and Cruis'n USA draw right without full synchronous mode);
-    it tracks the drawn bytes too, so a recompiled access beside them goes on without waiting;
+    it tracks the drawn bytes too, so a recompiled access beside them goes on without waiting, and locks rows
+    only down to each draw's own height;
+  - runs on GPUs without 8-bit or 16-bit storage buffers, through shader variants that reach RDRAM and TMEM
+    through 32-bit views;
+  - TMEM uploads wait for any pending draw they overlap, not just one at the same address;
   - a lock-free command ring with lazy waking, pipeline cache kept between runs and saved off the emulation
     thread, upscaling changeable while running, and fixes for Adreno and Mali drivers (Vulkan 1.1 loaders,
     host query reset on the Retroid Pocket Duo);
   - reports the game's own border, from its first picture, so the host can trim it;
   - times every wait for the GPU, so the host's stats can tell GPU waits from emulation.
-- **parallel-RSP:** HLE audio with LLE graphics by default, AArch64 fast paths for vector multiplies and loads,
+- **parallel-RSP:** HLE audio with LLE graphics by default, beebono's AArch64 recompiler work (NEON vector
+  ops; on when the host sets `N64_RSP_BJIT=1`, as Joey64 does), AArch64 fast paths for vector multiplies and loads,
   a stop for RSP programs that only poll RDRAM, and a task that runs while a stale BROKE stands (only HALT
   stops the RSP, as on hardware).
 - **Recompiler (new_dynarec, arm64):** a jump cache, an optional compile thread, a per-game block list, code
   in cartridge ROM compiled, and a bad address raising an exception instead of `exit(1)`.
+- **Saves and DMA:** FlashRAM offsets wrap at the chip's size like the real chip, and a cartridge DMA that would
+  run past the end of RDRAM can be dropped per game in the ROM database, as Project64 does.
 - **GLideN64:** updated to gonetz master, Pokémon Snap's photo check fixed on GLES, NEON math and ARMv8 CRC32 on
   Android. xBRZ is built out.
 - **Netplay without SDL:** mupen64plus netplay on POSIX sockets, with Joey64's room additions (input resends,
@@ -95,7 +102,7 @@ The following projects have been incorporated into this repository:
 - [GLideN64](https://github.com/gonetz/GLideN64)
 - [cxd4](https://github.com/cxd4/rsp)
 - [parallel-rsp](https://github.com/Themaister/parallel-rsp)
-- [angrylion-rdp-plus](https://github.com/ata4/angrylion-rdp-plus) (Currently based on it's [ParaLLel](https://github.com/libretro/parallel-n64/) variant) (upstream; not in joey64-core): removed from Joey64's core (2026-11-07), its old MAME licence is non-commercial
+- [angrylion-rdp-plus](https://github.com/ata4/angrylion-rdp-plus) (Currently based on it's [ParaLLel](https://github.com/libretro/parallel-n64/) variant) (upstream; not in joey64-core): removed from Joey64's core, its old MAME licence is non-commercial
 
 #### Acknowledgments
 
