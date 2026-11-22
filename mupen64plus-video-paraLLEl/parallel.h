@@ -46,6 +46,8 @@ void parallel_profile_video_refresh_end(void);
 void parallel_get_geometry(struct retro_game_geometry *geom);
 
 const VkApplicationInfo *parallel_get_application_info(void);
+// Joey64: the frontend's audio buffer status (RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK), for N64_FRAMESKIP=2.
+void parallel_audio_buffer_status(bool active, unsigned occupancy, bool underrun_likely);
 bool parallel_create_device(struct retro_vulkan_context *context,
       VkInstance instance,
       VkPhysicalDevice gpu,

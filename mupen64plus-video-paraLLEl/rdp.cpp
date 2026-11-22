@@ -1490,6 +1490,128 @@ static const unsigned cmd_len_lut[64] = {
 // refresh. A refresh is skipped (the frontend keeps showing the last picture) when the VI registers are the same as
 // last time, the RDP drew nothing into the scanned-out rows since, and those rows' RDRAM hashes the same (CPU
 // writes). Interlaced output always scans out. With smart sync, RDRAM is read through the never-protected alias.
+// Joey64 frame skip that skips the drawing (order item 11, 2026-11-08; the rule is armN64's src/rdp.c
+// frameSkipImage/skipCommand, GPL-2.0-or-later, by the armGBA author): N64_FRAMESKIP=1 leaves every other frame drawn
+// into a framebuffer the VI shows undrawn: its triangles and rectangles are not handed to parallel-RDP (modes, loads,
+// syncs and drawing into other images such as render-to-texture still are), and its scanout is not made, so the picture
+// before it stays on screen. A frame starts at a SET_COLOR_IMAGE into one of the VI's last four origins (within 64 KB)
+// other than the one being drawn. A speed setting, not exact: a game that reads back or draws on top of last frame's
+// picture sees an old one. N64_FRAMESKIP=2 is automatic: a frame is skipped only when the frontend's audio buffer was at
+// a third of its target or less, or ran dry, since the last frame start (it is falling behind), never two in a row.
+namespace FSkip
+{
+static bool enabled, automatic;
+static std::atomic<bool> behind{false};
+static uint32_t shown[4]; // the VI's last origins
+static unsigned shown_next;
+static uint32_t drawing;
+static bool into_shown, skipping;
+static uint64_t frames;
+static uint32_t buffer[4];
+static bool skipped[4];
+static unsigned dropped, scanouts_skipped, scanouts;
+static unsigned d_ci_shown, d_ci_same, d_ci_other, d_starts, d_starts_behind; // N64_FRAMESKIP_DEBUG counts
+static std::atomic<unsigned> d_cb_calls{0}, d_cb_active{0}, d_cb_low{0}, d_cb_dry{0}, d_cb_min{100};
+
+static int shown_index(uint32_t addr)
+{
+	for (int i = 0; i < 4; i++)
+		if (shown[i] && shown[i] >= addr && shown[i] - addr < 0x10000)
+			return i;
+	return -1;
+}
+
+static void color_image(uint32_t addr)
+{
+	into_shown = shown_index(addr) >= 0;
+	if (!into_shown) d_ci_other++; else if (addr == drawing) d_ci_same++; else d_ci_shown++;
+	if (!into_shown || addr == drawing)
+		return; // textures drawn in between don't start a frame
+	drawing = addr;
+	frames++;
+	d_starts++;
+	const bool was_behind = behind.exchange(false, std::memory_order_relaxed); // any low or dry report since the last start
+	if (was_behind) d_starts_behind++;
+	skipping = automatic ? was_behind && !skipping : (frames & 1) != 0;
+	int slot = 0;
+	for (int i = 0; i < 4; i++)
+		if (buffer[i] == addr || !buffer[i])
+		{
+			slot = i;
+			break;
+		}
+	buffer[slot] = addr;
+	skipped[slot] = skipping;
+}
+
+// Whether to leave this command out.
+static bool drop(uint32_t command, uint32_t w2)
+{
+	if (command == 0x3f)
+	{
+		color_image(w2 & 0xffffff);
+		return false;
+	}
+	const bool draws = (command >= 0x08 && command <= 0x0f) || command == 0x24 || command == 0x25 || command == 0x36;
+	if (draws && into_shown && skipping)
+	{
+		dropped++;
+		return true;
+	}
+	return false;
+}
+
+// At a scanout: note the origin; whether the frame there was left undrawn.
+static bool skip_scanout(uint32_t origin)
+{
+	if (shown_index(origin) < 0)
+	{
+		shown[shown_next] = origin;
+		shown_next = (shown_next + 1) & 3;
+	}
+	bool skip = false;
+	for (int i = 0; i < 4; i++)
+		if (buffer[i] && origin >= buffer[i] && origin - buffer[i] < 0x10000)
+		{
+			skip = skipped[i];
+			break;
+		}
+	if (++(skip ? scanouts_skipped : scanouts) + scanouts_skipped >= 600)
+	{
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip: %u of the last %u scanouts skipped, %u draws left out.\n",
+		       scanouts_skipped, scanouts + scanouts_skipped, dropped);
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip debug: colour images %u into a new shown buffer, %u into the one drawn, %u elsewhere; "
+		       "%u frame starts, %u while behind; shown %06x %06x %06x %06x, drawing %06x.\n",
+		       d_ci_shown, d_ci_same, d_ci_other, d_starts, d_starts_behind, shown[0], shown[1], shown[2], shown[3], drawing);
+		scanouts = scanouts_skipped = dropped = 0;
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip debug: audio status %u calls, %u active, %u at 33%% or less, %u ran dry, lowest %u%%.\n",
+		       d_cb_calls.exchange(0), d_cb_active.exchange(0), d_cb_low.exchange(0), d_cb_dry.exchange(0), d_cb_min.exchange(100));
+		d_ci_shown = d_ci_same = d_ci_other = d_starts = d_starts_behind = 0;
+	}
+	return skip;
+}
+
+static void init()
+{
+	const char *e = getenv("N64_FRAMESKIP");
+	enabled = e && (e[0] == '1' || e[0] == '2');
+	automatic = e && e[0] == '2';
+	behind = false;
+	memset(shown, 0, sizeof(shown));
+	memset(buffer, 0, sizeof(buffer));
+	memset(skipped, 0, sizeof(skipped));
+	shown_next = 0;
+	drawing = 0;
+	into_shown = skipping = false;
+	frames = 0;
+	dropped = scanouts_skipped = scanouts = 0;
+	if (enabled)
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip on: %s.\n", automatic ?
+		       "automatic, a frame into a shown buffer is left undrawn while audio runs low (never two in a row)" :
+		       "every other frame into a shown buffer is left undrawn");
+}
+}
+
 namespace Dup
 {
 static bool enabled;
@@ -2942,7 +3064,7 @@ void process_commands()
 		// before the command is queued: texture packs queue the draw's replacements ahead of it
 		if (TexKeys::enabled)
 			TexKeys::track(RDP::Op(command), &cmd_data[2 * cmd_cur]);
-		if (command >= 8 && frontend)
+		if (command >= 8 && frontend && !(FSkip::enabled && FSkip::drop(command, cmd_data[2 * cmd_cur + 1])))
 		{
 			frontend->enqueue_command(cmd_length * 2, &cmd_data[2 * cmd_cur]);
 			words_since_frame_context += cmd_length * 2;
@@ -3106,6 +3228,7 @@ bool init()
 	// Repeat-frame skipping hashes RDRAM, which smart sync may have protected: only with its alias, or without it.
 	const char *dup = getenv("N64_RDP_SKIP_DUP");
 	Dup::enabled = !(dup && *dup == '0') && (!Smart::enabled || g_rdram_alias);
+	FSkip::init();
 	return true;
 }
 
@@ -3355,6 +3478,12 @@ void complete_frame()
 		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: bench per frame:%s\n", line.c_str());
 	}
 
+	// Before the repeat check, so a skipped frame never becomes its baseline.
+	if (FSkip::enabled && FSkip::skip_scanout(*GET_GFX_INFO(VI_ORIGIN_REG) & 0xffffff))
+	{
+		frame_valid = false; // the picture before it stays
+		return;
+	}
 	if (Dup::enabled)
 	{
 		bool same = Dup::same_as_last();
@@ -3634,3 +3763,16 @@ extern "C" __attribute__((visibility("default"))) void joey64_vi_trim(int *out)
 	for (int i = 0; i < 4; i++)
 		out[i] = RDP::joey_vi_trim[i].load();
 }
+void parallel_audio_buffer_status(bool active, unsigned occupancy, bool underrun_likely)
+{
+	// Held until the next frame start takes it: a game that draws every second refresh can have its audio run dry
+	// only in the refresh before the one its frames start in (MK64).
+	if (active && (occupancy <= 33 || underrun_likely))
+		RDP::FSkip::behind.store(true, std::memory_order_relaxed);
+	RDP::FSkip::d_cb_calls++;
+	if (active) RDP::FSkip::d_cb_active++;
+	if (occupancy <= 33) RDP::FSkip::d_cb_low++;
+	if (underrun_likely) RDP::FSkip::d_cb_dry++;
+	if (occupancy < RDP::FSkip::d_cb_min.load()) RDP::FSkip::d_cb_min = occupancy;
+}
+
