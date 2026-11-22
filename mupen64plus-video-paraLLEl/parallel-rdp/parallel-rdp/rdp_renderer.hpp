@@ -248,6 +248,7 @@ private:
 		uint32_t depth_addr = 0;
 		uint32_t width = 0;
 		uint32_t deduced_height = 0;
+		uint32_t depth_write_height = 0; // the lowest row + 1 a depth-writing primitive reached (gopher64 6ee5c1132)
 		FBFormat fmt = FBFormat::I8;
 		bool depth_write_pending = false;
 		bool color_write_pending = false;
@@ -423,6 +424,9 @@ private:
 	unsigned pending_primitives_upscaled = 0;
 
 	bool tmem_upload_needs_flush(uint32_t addr) const;
+	bool tmem_upload_range_needs_flush(uint32_t addr, uint32_t length) const;
+	void prepare_tmem_upload(const UploadInfo &upload);
+	bool tmem_range_check = true;
 
 	bool render_pass_is_upscaled() const;
 	bool should_render_upscaled() const;

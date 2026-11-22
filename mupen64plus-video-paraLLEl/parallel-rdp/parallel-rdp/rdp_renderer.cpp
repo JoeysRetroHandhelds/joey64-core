@@ -1770,6 +1770,13 @@ void Renderer::update_deduced_height(const TriangleSetup &setup)
 	int max_active_line = max_active_sub_scanline >> 2;
 	int height = std::max(max_active_line + 1, 0);
 	fb.deduced_height = std::max(fb.deduced_height, uint32_t(height));
+	// gopher64 parallel-rdp-standalone 6ee5c1132 (MIT, ported 2026-11-21): colour-only draws can make the pass taller
+	// without writing depth, so the depth rows written are tracked on their own (see flush_queues).
+	bool writes_depth = (stream.depth_blend_state.flags & DEPTH_BLEND_DEPTH_UPDATE_BIT) != 0 &&
+	                    (setup.flags & TRIANGLE_SETUP_FILL_COPY_RASTER_BIT) == 0 &&
+	                    fb.depth_addr != fb.addr;
+	if (writes_depth)
+		fb.depth_write_height = std::max(fb.depth_write_height, uint32_t(height));
 }
 
 bool Renderer::need_flush() const
@@ -2690,6 +2697,7 @@ void Renderer::reset_context()
 	stream.max_shaded_tiles = 0;
 
 	fb.deduced_height = 0;
+	fb.depth_write_height = 0;
 	fb.color_write_pending = false;
 	fb.depth_write_pending = false;
 
@@ -3297,7 +3305,11 @@ void Renderer::flush_queues()
 
 		// We're going to write to these pages, so lock them down.
 		lock_pages_for_gpu_write(fb.addr, get_byte_size_for_bound_color_framebuffer());
-		lock_pages_for_gpu_write(fb.depth_addr, get_byte_size_for_bound_depth_framebuffer());
+		// Only the depth rows this pass wrote come back (none when nothing wrote depth): gopher64 6ee5c1132.
+		// PARALLEL_RDP_DEPTH_ROWS=0 (dev): the whole image, as before.
+		static const bool depth_rows = !(getenv("PARALLEL_RDP_DEPTH_ROWS") && getenv("PARALLEL_RDP_DEPTH_ROWS")[0] == '0');
+		lock_pages_for_gpu_write(fb.depth_addr, depth_rows ? fb.width * fb.depth_write_height * 2 :
+		                                                     get_byte_size_for_bound_depth_framebuffer());
 	}
 
 	// Native-first: a 1x-only pass may go ahead of a held-back upscaled pass drawing in the same place (its own
@@ -3590,6 +3602,47 @@ bool Renderer::tmem_upload_needs_flush(uint32_t addr) const
 	return false;
 }
 
+// gopher64 parallel-rdp-standalone 1e94c7730 + 19316eae7 (MIT, ported 2026-11-21): the check above only looks at the
+// load's start address, so a load that starts before a colour or depth image still being drawn in this batch and runs
+// into it (or a TLUT from just-drawn pixels) read RDRAM from before those draws. This tests the upload's whole byte
+// range against both images, both ways round, modulo RDRAM size.
+bool Renderer::tmem_upload_range_needs_flush(uint32_t addr, uint32_t length) const
+{
+	uint32_t mask = uint32_t(rdram_size - 1);
+	auto overlaps = [&](uint32_t base, uint32_t size) {
+		return size != 0 && (((addr - base) & mask) < size || ((base - addr) & mask) < length);
+	};
+
+	return (fb.color_write_pending && overlaps(fb.addr, get_byte_size_for_bound_color_framebuffer())) ||
+	       (fb.depth_write_pending && overlaps(fb.depth_addr, get_byte_size_for_bound_depth_framebuffer()));
+}
+
+// One upload's real RDRAM extent (as the shader fetches it: whole 64-bit groups, and a TLUT's four-word over-fetch
+// from an unaligned address, update_tmem_lut in tmem_update.comp), rounded out to 64 bytes. TMEM uploads run before
+// the batch's draws, so an earlier draw into that range is finished first; on the incoherent path the same range is
+// marked for GPU read.
+void Renderer::prepare_tmem_upload(const UploadInfo &upload)
+{
+	uint32_t addr = uint32_t(upload.vram_addr);
+	unsigned bytes_per_texel = 1u << (upload.vram_size - 1);
+	unsigned row_bytes = upload.vram_effective_width * bytes_per_texel;
+	if (upload.mode == int32_t(UploadMode::TLUT))
+	{
+		row_bytes = (upload.vram_effective_width - 1) * bytes_per_texel + 2;
+		if (bytes_per_texel == 1 || (addr & 1))
+			row_bytes += 6;
+	}
+
+	uint32_t src = addr & ~63u;
+	uint32_t end = addr + (upload.height - 1) * upload.vram_width * bytes_per_texel + row_bytes;
+	uint32_t length = ((end + 63u) & ~63u) - src;
+
+	if (tmem_upload_range_needs_flush(src, length))
+		flush_queues();
+	if (!is_host_coherent)
+		mark_pages_for_gpu_read(src, length);
+}
+
 void Renderer::load_tile(uint32_t tile, const LoadTileInfo &info)
 {
 	if (validation_iface && info.mode == UploadMode::TLUT)
@@ -3601,7 +3654,9 @@ void Renderer::load_tile(uint32_t tile, const LoadTileInfo &info)
 		}
 	}
 
-	if (tmem_upload_needs_flush(info.tex_addr))
+	static const bool range_on = !(getenv("PARALLEL_RDP_TMEM_RANGE") && getenv("PARALLEL_RDP_TMEM_RANGE")[0] == '0');
+	tmem_range_check = range_on;
+	if (!tmem_range_check && tmem_upload_needs_flush(info.tex_addr))
 		flush_queues();
 
 	// Detect noop cases.
@@ -3621,7 +3676,7 @@ void Renderer::load_tile(uint32_t tile, const LoadTileInfo &info)
 			return;
 	}
 
-	if (!is_host_coherent)
+	if (!is_host_coherent && !tmem_range_check)
 	{
 		unsigned pixel_count;
 		unsigned offset_pixels;
@@ -3974,6 +4029,8 @@ void Renderer::load_tile_iteration(uint32_t tile, const LoadTileInfo &info, uint
 
 	upload.inv_tmem_stride_words = 1.0f / float(upload.tmem_stride_words);
 
+	if (tmem_range_check)
+		prepare_tmem_upload(upload);
 	stream.tmem_upload_infos.push_back(upload);
 	if (stream.tmem_upload_infos.size() + 1 >= Limits::MaxTMEMInstances)
 		flush_queues();
