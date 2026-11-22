@@ -487,6 +487,13 @@ static unsigned faults_emulated;
 // accesses a page or waiting instead made no difference), Paper Mario 12-15% less, the rest the same, geomean 0.996.
 static bool open_window;
 static unsigned precise_done, precise_emulated, precise_waited;
+// N64_RDP_SMART_MASKCHECK=1 (debug, 2026-11-22, from gopher64's Android flicker fix #1401/#1413/#1414): without
+// host-imported RDRAM the read-back copies every byte whose GPU write mask is set, and the mask keeps earlier GPU
+// writes until a direct upload clears it. A store precise mode does through the alias onto such bytes can be put back
+// to the old GPU value. Counts those stores (and loads, for scale) in the precise log line.
+static bool maskcheck;
+static const uint8_t *mask_view;
+static unsigned mask_stores, mask_store_hits, mask_load_hits;
 
 // RDP state that decides where draws land
 static uint32_t color_addr, color_width, color_size, depth_addr;
@@ -910,6 +917,8 @@ static void split_now()
 static void on_sync_full()
 {
 	sync_signal = frontend->signal_timeline();
+	if (maskcheck && !mask_view)
+		mask_view = frontend->debug_write_mask();
 	trace(" |S%u|", sync_count + 1);
 	trace_last_addr = 0;
 	if (debug && sync_count == 1205 && trace_len)
@@ -950,6 +959,17 @@ static void on_sync_full()
 			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart precise: beside the drawn bytes %u found the GPU done, %u went through the alias, %u waited\n",
 			       precise_done, precise_emulated, precise_waited);
 			precise_done = precise_emulated = precise_waited = 0;
+			if (maskcheck)
+			{
+				// Control: how much of RDRAM the mask marks GPU-written right now (a view that always reads 0 shows here).
+				size_t set = 0;
+				if (mask_view)
+					for (size_t b = 0; b < rdram_size; b += 64)
+						set += mask_view[b] != 0;
+				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart maskcheck: mask %s (%zu of %zu sampled bytes set), %u stores through the alias, %u on GPU-written bytes, %u loads on them\n",
+				       mask_view ? "mapped" : "not mapped", set, rdram_size / 64, mask_stores, mask_store_hits, mask_load_hits);
+			}
+			mask_stores = mask_store_hits = mask_load_hits = 0;
 		}
 		if (debug)
 		{
@@ -1104,7 +1124,25 @@ static void handler(int sig, siginfo_t *info, void *uc)
 				precise_done++;
 				return; // retried on the unlocked page
 			}
-			if (emulate_access(uc, offset))
+			if (maskcheck && mask_view)
+			{
+				uint32_t insn = *reinterpret_cast<const uint32_t *>(static_cast<ucontext_t *>(uc)->uc_mcontext.pc);
+				uint32_t bytes = 1u << (insn >> 30);
+				bool store = ((insn >> 22) & 3) == 0;
+				bool hit = false;
+				for (uint32_t i = 0; i < bytes && offset + i < rdram_size; i++)
+					hit |= mask_view[offset + i] != 0;
+				if (emulate_access(uc, offset))
+				{
+					if (store)
+						mask_stores++;
+					if (hit)
+						(store ? mask_store_hits : mask_load_hits)++;
+					precise_emulated++;
+					return;
+				}
+			}
+			else if (emulate_access(uc, offset))
 			{
 				precise_emulated++;
 				return;
@@ -1214,6 +1252,10 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	const char *opw = getenv("N64_RDP_SMART_OPEN");
 	open_window = opw && opw[0] == '1';
 	precise_done = precise_emulated = precise_waited = 0;
+	const char *mck = getenv("N64_RDP_SMART_MASKCHECK");
+	maskcheck = mck && mck[0] == '1';
+	mask_view = nullptr;
+	mask_stores = mask_store_hits = mask_load_hits = 0;
 	const char *stp = getenv("N64_RDP_SMART_STAMP");
 	stamped = !(stp && stp[0] == '0');
 	const char *spl = getenv("N64_RDP_SMART_SPLIT");
@@ -1371,6 +1413,13 @@ void ra_settle()
 // what that same frame drew (often or sometimes), so their pictures went blocky.
 // N64_RA_NATIVE_HIDDEN=3 (automatic): only the shown extra frame (bits 0 and 3), and only once 600 of them in a row
 // showed rows no draw of that same frame touched (Dup's tracking); the first one that did turns it off for good.
+// Mode 3 also covers the opposite games (Joey 2026-11-21, "Build it, test first"): once mode 3 is off and 600 shown
+// extra frames in a row drew what they showed (Smash: every frame; DK64: none), the hidden real frames are drawn at
+// native size instead (mode 1's choice), since what those games show is the extra frame's own drawing. The first
+// shown frame after that whose picture changed without its own drawing (it would show the real frame's native
+// drawing) is held (the last picture stays one refresh) and turns this off for good. Before it starts, such a frame
+// only starts the count again. Odin 3 Portal Smash capped with mode 1: GPU busy 22.1 -> 18.1% (game 59), 29.0 ->
+// 24.7% (91), the same pictures; Flip 19.9 -> 26.7 fps and 15.0 -> 19.7. N64_RA_NATIVE_REAL=0 turns this part off.
 // Mode 3 is the default (Joey 2026-11-09, after all 14 quick-set games showed the same pictures at 4x on the Thor);
 // N64_RA_NATIVE_HIDDEN=0 turns it off. Without run-ahead no frame has bit 3, so nothing changes.
 // Set at each retro_run, before the frame's commands, so it applies in command order.
@@ -1387,6 +1436,10 @@ static unsigned warm;
 // 2026-11-09): the first frame of its copyright screen, drawn straight into the shown buffer after 600 frames that
 // weren't, came out with softer text and a faint bar; held, it shows the black frame before once more.
 static bool native_now;
+// The opposite case: shown extra frames in a row that drew what they showed (counted once mode 3 is off), whether
+// hidden real frames are now drawn at native size, and whether that was turned off for good.
+static unsigned drew_run;
+static bool real_native, real_off;
 }
 void set_hidden_frame(int av)
 {
@@ -1405,9 +1458,13 @@ void set_hidden_frame(int av)
 	RaNative::cur_av = av;
 	if (!allow || !frontend)
 		return;
-	bool hidden = allow == 3 ? (av & 9) == 9 && !RaNative::off && RaNative::clean >= 600 :
+	bool hidden = allow == 3 ? ((av & 9) == 9 && !RaNative::off && RaNative::clean >= 600) ||
+	                           (!(av & 1) && RaNative::real_native && !RaNative::real_off) :
 	              allow == 2 ? (av & 8) != 0 : !(av & 1);
-	bool skip = hidden && active_upscaling > 1 && !super_sampled_read_back;
+	// With super-sampled read-back (the default since 2026-11-17) the skip frames draw the plain 1x pass
+	// (Renderer::ssrb_live); N64_RA_NATIVE_SSRB=0 keeps them upscaled as before 2026-11-21.
+	static const bool ssrb_native = !(getenv("N64_RA_NATIVE_SSRB") && getenv("N64_RA_NATIVE_SSRB")[0] == '0');
+	bool skip = hidden && active_upscaling > 1 && (ssrb_native || !super_sampled_read_back);
 	if (skip != last)
 	{
 		frontend->set_skip_upscaled(skip);
@@ -3333,6 +3390,34 @@ void complete_frame()
 			}
 			else if (RaNative::clean < 600 && ++RaNative::clean == 600)
 				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: 600 shown frames showed what the frame before drew: extra frames at native size from now on\n");
+		}
+		else if (RaNative::mode == 3 && (RaNative::cur_av & 9) == 9 && RaNative::off && !RaNative::real_off && active_upscaling > 1)
+		{
+			static const bool real_on = !(getenv("N64_RA_NATIVE_REAL") && getenv("N64_RA_NATIVE_REAL")[0] == '0');
+			if (!real_on)
+				RaNative::real_off = true;
+			else if (Dup::last_drew)
+			{
+				if (RaNative::drew_run < 600 && ++RaNative::drew_run == 600)
+				{
+					RaNative::real_native = true;
+					log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: 600 shown frames drew what they showed: hidden real frames at native size from now on\n");
+				}
+			}
+			else if (!same)
+			{
+				// The picture changed without this frame drawing it: what it shows came from the frame before.
+				if (RaNative::real_native)
+				{
+					RaNative::real_off = true;
+					same = true;              // not scanned out: the last picture stays
+					Dup::have_last = false;   // and the next refresh is scanned out whatever it holds
+					log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: run-ahead: a shown frame showed the hidden frame's drawing (after %u that drew their own): hidden frames upscaled from now on; the last picture is held for it\n",
+					       RaNative::drew_run);
+				}
+				else
+					RaNative::drew_run = 0;
+			}
 		}
 		if (++(same ? Dup::skipped : Dup::scanned), Dup::skipped + Dup::scanned >= 600)
 		{

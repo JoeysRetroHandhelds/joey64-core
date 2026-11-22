@@ -2577,7 +2577,7 @@ void Renderer::maintain_queues()
 	// If we have no pending submissions, the GPU is idle and there is no reason not to submit.
 	// If we haven't submitted anything in a while (1.0 ms), it's probably fine to submit again.
 	if (pending_render_passes >= ImplementationConstants::MaxPendingRenderPassesBeforeFlush ||
-	    (caps.super_sample_readback && pending_render_passes_upscaled >= ImplementationConstants::MaxPendingRenderPassesBeforeFlush) ||
+	    (ssrb_live() && pending_render_passes_upscaled >= ImplementationConstants::MaxPendingRenderPassesBeforeFlush) ||
 	    pending_primitives >= Limits::MaxPrimitives ||
 	    pending_primitives_upscaled >= Limits::MaxPrimitives ||
 	    active_submissions.load(std::memory_order_relaxed) == 0 ||
@@ -2621,7 +2621,7 @@ void Renderer::enqueue_fence_wait(Vulkan::Fence fence)
 void Renderer::submit_to_queue()
 {
 	bool pending_host_visible_render_passes =
-			(caps.super_sample_readback ? pending_render_passes_upscaled : pending_render_passes) != 0;
+			(ssrb_live() ? pending_render_passes_upscaled : pending_render_passes) != 0;
 	bool pending_upscaled_passes = pending_render_passes_upscaled != 0;
 	pending_render_passes = 0;
 	pending_render_passes_upscaled = 0;
@@ -2957,6 +2957,14 @@ void Renderer::resolve_coherency_external(unsigned offset, unsigned length)
 unsigned Renderer::get_scaling_factor() const
 {
 	return caps.upscaling;
+}
+
+const uint8_t *Renderer::debug_write_mask()
+{
+	if (is_host_coherent || !rdram || !rdram->get_allocation().is_host_allocation())
+		return nullptr;
+	return static_cast<const uint8_t *>(device->map_host_buffer(*rdram, Vulkan::MEMORY_ACCESS_READ_BIT,
+	                                                            rdram_offset + rdram_size, rdram_size));
 }
 
 const Vulkan::Buffer *Renderer::get_upscaled_rdram_buffer() const
@@ -3341,7 +3349,7 @@ void Renderer::flush_queues()
 	instance.upload(*device, stream, *stream.cmd);
 
 	// If we have super-sampled readback, then this is meaningless.
-	bool has_single_sampled_render_pass = !caps.super_sample_readback;
+	bool has_single_sampled_render_pass = !ssrb_live();
 
 	if (has_single_sampled_render_pass)
 	{
@@ -3491,7 +3499,7 @@ void Renderer::flush_deferred_upscaled()
 
 bool Renderer::render_pass_is_upscaled() const
 {
-	if (caps.super_sample_readback)
+	if (ssrb_live())
 		return true;
 
 	bool need_render_pass = fb.width != 0 && fb.deduced_height != 0 && !stream.span_info_jobs.empty();
@@ -3623,6 +3631,10 @@ bool Renderer::tmem_upload_range_needs_flush(uint32_t addr, uint32_t length) con
 // marked for GPU read.
 void Renderer::prepare_tmem_upload(const UploadInfo &upload)
 {
+	// An empty upload reads no RDRAM; with a 0 height or width the sums below wrap to ~4 GB and always matched,
+	// flushing the batch for nothing (release audit 2026-11-22).
+	if (upload.height <= 0 || upload.vram_effective_width <= 0)
+		return;
 	uint32_t addr = uint32_t(upload.vram_addr);
 	unsigned bytes_per_texel = 1u << (upload.vram_size - 1);
 	unsigned row_bytes = upload.vram_effective_width * bytes_per_texel;

@@ -130,6 +130,8 @@ public:
 	void wait_for_timeline(uint64_t index);
 	// Non-blocking: has the GPU work up to this timeline value finished (results written back to RDRAM)?
 	bool timeline_reached(uint64_t index) const { return __atomic_load_n(&thread_timeline_value, __ATOMIC_ACQUIRE) >= index; }
+	// Joey64 debug: Renderer::debug_write_mask.
+	const uint8_t *debug_write_mask() { return renderer.debug_write_mask(); }
 	void idle();
 	void begin_frame_context();
 

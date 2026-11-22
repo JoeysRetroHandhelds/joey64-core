@@ -187,6 +187,10 @@ public:
 	                                            unsigned addr, unsigned pixels, unsigned pixel_size_log2);
 	unsigned get_scaling_factor() const;
 
+	// Joey64 debug (N64_RDP_SMART_MASKCHECK=1): the GPU copy's byte write mask (rdram_size bytes), when RDRAM's GPU
+	// copy can be mapped (not host-imported); else nullptr. Read only.
+	const uint8_t *debug_write_mask();
+
 	const Vulkan::Buffer *get_upscaled_rdram_buffer() const;
 	const Vulkan::Buffer *get_upscaled_hidden_rdram_buffer() const;
 
@@ -429,6 +433,10 @@ private:
 	bool tmem_range_check = true;
 
 	bool render_pass_is_upscaled() const;
+	// Joey64 (2026-11-21): super-sampled read-back for the passes being recorded now. Off while run-ahead's skip
+	// frames draw at native size only (set_skip_upscaled): those passes are the plain 1x pass writing RDRAM, and the
+	// next super-sampled pass's Pre stage blows what they drew up into the upscaled copy, as for a CPU write.
+	bool ssrb_live() const { return caps.super_sample_readback && !skip_upscaled; }
 	bool should_render_upscaled() const;
 	bool skip_upscaled = false;
 
