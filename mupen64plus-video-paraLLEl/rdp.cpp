@@ -1580,12 +1580,17 @@ static bool skip_scanout(uint32_t origin)
 	{
 		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip: %u of the last %u scanouts skipped, %u draws left out.\n",
 		       scanouts_skipped, scanouts + scanouts_skipped, dropped);
-		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip debug: colour images %u into a new shown buffer, %u into the one drawn, %u elsewhere; "
-		       "%u frame starts, %u while behind; shown %06x %06x %06x %06x, drawing %06x.\n",
-		       d_ci_shown, d_ci_same, d_ci_other, d_starts, d_starts_behind, shown[0], shown[1], shown[2], shown[3], drawing);
+		static const bool debug = getenv("N64_FRAMESKIP_DEBUG") && *getenv("N64_FRAMESKIP_DEBUG") == '1';
+		if (debug)
+		{
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip debug: colour images %u into a new shown buffer, %u into the one drawn, %u elsewhere; "
+			       "%u frame starts, %u while behind; shown %06x %06x %06x %06x, drawing %06x.\n",
+			       d_ci_shown, d_ci_same, d_ci_other, d_starts, d_starts_behind, shown[0], shown[1], shown[2], shown[3], drawing);
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip debug: audio status %u calls, %u active, %u at 33%% or less, %u ran dry, lowest %u%%.\n",
+			       d_cb_calls.load(), d_cb_active.load(), d_cb_low.load(), d_cb_dry.load(), d_cb_min.load());
+		}
 		scanouts = scanouts_skipped = dropped = 0;
-		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip debug: audio status %u calls, %u active, %u at 33%% or less, %u ran dry, lowest %u%%.\n",
-		       d_cb_calls.exchange(0), d_cb_active.exchange(0), d_cb_low.exchange(0), d_cb_dry.exchange(0), d_cb_min.exchange(100));
+		d_cb_calls = 0; d_cb_active = 0; d_cb_low = 0; d_cb_dry = 0; d_cb_min = 100;
 		d_ci_shown = d_ci_same = d_ci_other = d_starts = d_starts_behind = 0;
 	}
 	return skip;
