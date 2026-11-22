@@ -80,6 +80,33 @@ endif
 
 include $(CLEAR_VARS)
 
+# parallel-RSP rsp/vu_inline.cpp (beebono's aarch64 JIT work, used with N64_RSP_BJIT=1): the VU op bodies the JIT copies
+# into its own code. The copied code must not touch any integer register the JIT keeps live, so every one of them is fixed
+# for that file (x0-x8, x16, x17 stay free; x19 holds CPUState, read with one mov since clang cannot fix x19), and it
+# must stay out of LTO (the bodies are machine code that is read at run time and copied, not called). ndk-build has no
+# per-file flags, so it is a static library of its own.
+PRSP_VU_INLINE_SRC := $(filter %/rsp/vu_inline.cpp,$(SOURCES_CXX))
+SOURCES_CXX        := $(filter-out %/rsp/vu_inline.cpp,$(SOURCES_CXX))
+PRSP_VU_INLINE_LIB :=
+ifneq ($(PRSP_VU_INLINE_SRC),)
+ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
+  PRSP_VU_INLINE_LIB := prsp_vu_inline
+  include $(CLEAR_VARS)
+  LOCAL_MODULE         := prsp_vu_inline
+  LOCAL_SRC_FILES      := $(PRSP_VU_INLINE_SRC)
+  LOCAL_CPPFLAGS       := -std=gnu++11 $(CXXFLAGS) $(COREFLAGS) -fno-lto -fno-stack-protector \
+                          -ffixed-x9 -ffixed-x10 -ffixed-x11 -ffixed-x12 -ffixed-x13 -ffixed-x14 -ffixed-x15 -ffixed-x18 \
+                          -ffixed-x20 -ffixed-x21 -ffixed-x22 -ffixed-x23 -ffixed-x24 -ffixed-x25 -ffixed-x26 -ffixed-x27 -ffixed-x28
+  ifeq ($(CRC_ARMV8),1)
+    LOCAL_CPPFLAGS     += -march=armv8-a+crc
+  endif
+  LOCAL_CPP_FEATURES   := exceptions
+  LOCAL_ARM_MODE       := arm
+  LOCAL_ARM_NEON       := true
+  include $(BUILD_STATIC_LIBRARY)
+endif
+endif
+
 include $(CLEAR_VARS)
 LOCAL_MODULE           := retro
 LOCAL_SRC_FILES        := $(SOURCES_CXX) $(SOURCES_C) $(SOURCES_ASM) $(SOURCES_NASM)
@@ -100,7 +127,7 @@ LOCAL_CFLAGS           += $(N64_XFLAGS)
 LOCAL_CPPFLAGS         += $(N64_XFLAGS)
 LOCAL_LDFLAGS          += $(N64_XLDFLAGS)
 LOCAL_LDLIBS           := -llog -lEGL $(GLLIB) $(CORELDLIBS)
-LOCAL_STATIC_LIBRARIES := 
+LOCAL_STATIC_LIBRARIES := $(PRSP_VU_INLINE_LIB)
 LOCAL_CPP_FEATURES     := exceptions
 LOCAL_ARM_MODE         := arm
 LOCAL_ARM_NEON         := true

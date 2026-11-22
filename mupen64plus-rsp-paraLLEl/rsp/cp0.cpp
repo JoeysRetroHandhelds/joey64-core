@@ -1,4 +1,5 @@
 #include "../state.hpp"
+#include <string.h>
 
 #ifdef PARALLEL_INTEGRATION
 #include "../rsp_1.1.h"
@@ -111,6 +112,34 @@ extern "C"
 	}
 
 #ifdef PARALLEL_INTEGRATION
+	// From beebono's parallel-rsp fork (Joey64: N64_RSP_BJIT=1 only, CPUState::fast_dma). The only way the RSP itself can
+	// modify IMEM is an SP DMA read (stores address DMEM only). Copies `bytes` (a multiple of 4) from `src` to IMEM at byte
+	// offset `off` (off + bytes <= 0x1000) and marks the code blocks dirty. With imem_skip_identical a block is marked
+	// (together with its predecessor, because a compiled region starting there can extend into it) only when the copy
+	// actually changes one of its bytes: microcode that is reloaded unchanged (the boot ucode copies the same text to IMEM
+	// for every task) then keeps its compiled blocks. Returns whether any byte changed (Joey64's DMA poll stop).
+	static inline bool copy_to_imem(RSP::CPUState *rsp, unsigned off, const uint32_t *src, unsigned bytes)
+	{
+		bool changed = false;
+		if (!bytes)
+			return false;
+		const unsigned end = off + bytes;
+		for (unsigned block = off / CODE_BLOCK_SIZE; block <= (end - 1) / CODE_BLOCK_SIZE; block++)
+		{
+			const unsigned b0 = block * CODE_BLOCK_SIZE > off ? block * CODE_BLOCK_SIZE : off;
+			const unsigned b1 = (block + 1) * CODE_BLOCK_SIZE < end ? (block + 1) * CODE_BLOCK_SIZE : end;
+			uint32_t *dst = rsp->imem + (b0 >> 2);
+			const uint32_t *from = src + ((b0 - off) >> 2);
+			const bool differs = memcmp(dst, from, b1 - b0) != 0;
+			changed |= differs;
+			if (rsp->imem_skip_identical && !differs)
+				continue;
+			rsp->dirty_blocks |= (0x3 << block) >> 1;
+			memcpy(dst, from, b1 - b0);
+		}
+		return changed;
+	}
+
 	static int rsp_dma_read(RSP::CPUState *rsp)
 	{
 		uint32_t length_reg = *rsp->cp0.cr[CP0_REGISTER_DMA_READ_LENGTH];
@@ -145,6 +174,28 @@ extern "C"
 
 		do
 		{
+			const uint32_t dest_start = dest & 0x1FFC;
+			const uint32_t source_start = source & 0x7FFFFC;
+			if (rsp->fast_dma && (dest_start & 0xfff) + length <= 0x1000 && source_start + length <= 0x800000)
+			{
+				// The row neither wraps in RDRAM nor straddles DMEM / IMEM: plain copy.
+				const uint32_t *from = rsp->rdram + (source_start >> 2);
+				if (dest_start & 0x1000)
+					changed |= copy_to_imem(rsp, dest_start & 0xfff, from, length);
+				else
+				{
+					uint32_t *to = rsp->dmem + (dest_start >> 2);
+					if (memcmp(to, from, length))
+					{
+						changed = true;
+						memcpy(to, from, length);
+					}
+				}
+				source += length + skip;
+				dest += length;
+				continue;
+			}
+
 			unsigned j = 0;
 			do
 			{
@@ -152,7 +203,9 @@ extern "C"
 				uint32_t dest_addr = (dest + j) & 0x1FFC;
 				uint32_t word = rsp->rdram[source_addr >> 2];
 
-				if (dest_addr & 0x1000)
+				if ((dest_addr & 0x1000) && rsp->fast_dma)
+					changed |= copy_to_imem(rsp, dest_addr & 0xfff, &word, 4); // a row that wraps (N64_RSP_BJIT=1)
+				else if (dest_addr & 0x1000)
 				{
 					// Invalidate IMEM.
 					unsigned block = (dest_addr & 0xfff) / CODE_BLOCK_SIZE;
@@ -224,6 +277,19 @@ extern "C"
 		unsigned i = 0;
 		do
 		{
+			const uint32_t source_start = source & 0x1FFC;
+			const uint32_t dest_start = dest & 0x7FFFFC;
+			if (rsp->fast_dma && (source_start & 0xfff) + length <= 0x1000 && dest_start + length <= 0x800000)
+			{
+				// From beebono's fork (N64_RSP_BJIT=1 only): one memcpy per row.
+				const uint32_t *src = (source_start & 0x1000) ? rsp->imem + ((source_start & 0xfff) >> 2)
+				                                              : rsp->dmem + (source_start >> 2);
+				memcpy(rsp->rdram + (dest_start >> 2), src, length);
+				source += length;
+				dest += length + skip;
+				continue;
+			}
+
 			unsigned j = 0;
 
 			do

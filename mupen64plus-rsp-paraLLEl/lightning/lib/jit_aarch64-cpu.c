@@ -316,6 +316,7 @@ typedef union {
 #  define A64_STRB			0x38206800
 #  define A64_LDRB			0x38606800
 #  define A64_LDRSB			0x38e06800
+#  define A64_LDRSBX			0x38a06800
 #  define A64_STR			0xf8206800
 #  define A64_LDR			0xf8606800
 #  define A64_LDAXR			0xc85ffc00
@@ -433,6 +434,7 @@ typedef union {
 #  define UXTW(Rd,Rm)			ox_x(A64_UXTW,Rd,Rm)
 #  define REV(Rd,Rn)			o_xx(A64_REV,Rd,Rn)
 #  define LDRSB(Rt,Rn,Rm)		oxxx(A64_LDRSB,Rt,Rn,Rm)
+#  define LDRSBX(Rt,Rn,Rm)		oxxx(A64_LDRSBX,Rt,Rn,Rm)
 #  define LDRSBI(Rt,Rn,Imm12)		oxxi(A64_LDRSBI,Rt,Rn,Imm12)
 #  define LDURSB(Rt,Rn,Imm9)		oxx9(A64_LDURSB,Rt,Rn,Imm9)
 #  define LDRB(Rt,Rn,Rm)		oxxx(A64_LDRB,Rt,Rn,Rm)
@@ -1594,6 +1596,11 @@ _ldi_l(jit_state_t *_jit, jit_int32_t r0, jit_word_t i0)
 static void
 _ldxr_c(jit_state_t *_jit, jit_int32_t r0, jit_int32_t r1, jit_int32_t r2)
 {
+    if (jit_prsp_bjit) {
+	/* LDRSB with an X destination already sign-extends to 64 bits. */
+	LDRSBX(r0, r1, r2);
+	return;
+    }
     LDRSB(r0, r1, r2);
     extr_c(r0, r0);
 }

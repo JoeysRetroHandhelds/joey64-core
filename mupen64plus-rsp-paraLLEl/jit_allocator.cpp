@@ -63,14 +63,45 @@ static bool commit_execute(void *ptr, size_t size)
 #endif
 }
 
+// From beebono's parallel-rsp fork: on Linux-like systems regions can be packed back to back (64-byte aligned) instead of
+// one page each: the page-aligned layout put every hot region entry on the same L1I sets and wasted about half of the code
+// pages (more I-cache and I-TLB misses). Joey64: only with set_pack(true) (N64_RSP_BJIT=1); otherwise one page each, as before.
+#if !defined(_WIN32) && !defined(IOS) && !(defined(__APPLE__) && defined(__aarch64__))
+#define PRSP_PACK_CODE 1
+static uintptr_t page_mask()
+{
+	static const uintptr_t mask = uintptr_t(sysconf(_SC_PAGESIZE) > 0 ? sysconf(_SC_PAGESIZE) : 4096) - 1;
+	return mask;
+}
+#endif
+
+void Allocator::set_pack(bool enable)
+{
+#ifdef PRSP_PACK_CODE
+	pack = enable;
+#else
+	(void)enable;
+#endif
+}
+
 bool Allocator::commit_code(void *code, size_t size)
 {
+#ifdef PRSP_PACK_CODE
+	// Whole pages: a packed region need not start on one. For page-aligned code this is the same range as before.
+	uintptr_t begin = reinterpret_cast<uintptr_t>(code) & ~page_mask();
+	uintptr_t end = (reinterpret_cast<uintptr_t>(code) + size + page_mask()) & ~page_mask();
+	return commit_execute(reinterpret_cast<void *>(begin), end - begin);
+#else
 	return commit_execute(code, size);
+#endif
 }
 
 void *Allocator::allocate_code(size_t size)
 {
-	size = align_page(size);
+	if (pack)
+		size = (size + 63) & ~size_t(63);
+	else
+		size = align_page(size);
 	if (blocks.empty())
 		blocks.push_back(reserve_block(std::max(size, block_size)));
 
@@ -78,7 +109,10 @@ void *Allocator::allocate_code(size_t size)
 	if (!block->code)
 		return nullptr;
 
-	block->offset = align_page(block->offset);
+	if (pack)
+		block->offset = (block->offset + 63) & ~size_t(63);
+	else
+		block->offset = align_page(block->offset);
 	if (block->offset + size > block->size)
 		block = nullptr;
 
@@ -95,10 +129,39 @@ void *Allocator::allocate_code(size_t size)
 
 	void *ret = block->code + block->offset;
 	block->offset += size;
+	last_code = static_cast<uint8_t *>(ret);
+	last_size = size;
 
+#ifdef PRSP_PACK_CODE
+	if (pack)
+	{
+		uintptr_t begin = reinterpret_cast<uintptr_t>(ret) & ~page_mask();
+		uintptr_t end = (reinterpret_cast<uintptr_t>(ret) + size + page_mask()) & ~page_mask();
+		if (!commit_read_write(reinterpret_cast<void *>(begin), end - begin))
+			return nullptr;
+		return ret;
+	}
+#endif
 	if (!commit_read_write(ret, size))
 		return nullptr;
 	return ret;
+}
+
+void Allocator::shrink_last(void *code, size_t used)
+{
+#ifdef PRSP_PACK_CODE
+	if (!pack || blocks.empty() || code != last_code)
+		return;
+	used = (used + 63) & ~size_t(63);
+	if (used < last_size)
+	{
+		blocks.back().offset -= last_size - used;
+		last_size = used;
+	}
+#else
+	(void)code;
+	(void)used;
+#endif
 }
 
 Allocator::Block Allocator::reserve_block(size_t size)

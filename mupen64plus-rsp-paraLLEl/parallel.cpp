@@ -233,5 +233,9 @@ extern "C"
 		RSP::cpu.set_dmem(reinterpret_cast<uint32_t *>(Rsp_Info.DMEM));
 		RSP::cpu.set_imem(reinterpret_cast<uint32_t *>(Rsp_Info.IMEM));
 		RSP::cpu.set_rdram(reinterpret_cast<uint32_t *>(Rsp_Info.RDRAM));
+#ifndef DEBUG_JIT
+		// Joey64 dev switch N64_RSP_BJIT=1: beebono's aarch64 JIT work (rsp_jit.cpp), read here rather than at load.
+		RSP::cpu.update_bjit_from_env();
+#endif
 	}
 }

@@ -191,6 +191,8 @@ typedef enum {
     jit_code_live,		jit_code_align,
     jit_code_save,		jit_code_load,
 #define jit_skip(u)             jit_new_node_w(jit_code_skip, u)
+/* parallel-rsp extension (aarch64 only, from beebono's parallel-rsp fork): emit a raw instruction word. */
+#define jit_raw(w)		jit_new_node_ww(jit_code_skip, 4, (jit_word_t)(jit_uint32_t)(w))
     jit_code_skip,
 #define jit_name(u)		_jit_name(_jit,u)
     jit_code_name,
@@ -1067,6 +1069,9 @@ typedef void  (*jit_free_func_ptr)	(void*);
  * Prototypes
  */
 extern void init_jit(const char*);
+/* Joey64: non-zero while parallel-rsp compiles with N64_RSP_BJIT=1; turns on the fork's Lightning changes
+ * (one-instruction ldxr_c on aarch64, ldxi_* forgetting the tracked value of their destination). */
+extern int jit_prsp_bjit;
 extern void finish_jit(void);
 
 extern jit_state_t *jit_new_state(void);

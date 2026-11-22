@@ -180,6 +180,8 @@ _patch_register(jit_state_t *jit, jit_node_t *node, jit_node_t *link,
 /*
  * Implementation
  */
+int jit_prsp_bjit;
+
 void
 init_jit(const char *progname)
 {
@@ -3702,6 +3704,17 @@ _simplify(jit_state_t *_jit)
 		if (simplify_ldxi(prev, node)) {
 		    result = 1;
 		    simplify_spill(node = prev, regno);
+		}
+#else
+		/* From beebono's parallel-rsp fork (Joey64: N64_RSP_BJIT=1 only).
+		 * The load still overwrites its destination: forget the value
+		 * a previous movi/movr left there, or a later movi of the same
+		 * constant is deleted as redundant (movi r, 0; ldxi r, ...;
+		 * movi r, 0 lost the second movi). */
+		if (jit_prsp_bjit) {
+		    regno = jit_regno(node->u.w);
+		    _jitc->values[regno].kind = 0;
+		    ++_jitc->gen[regno];
 		}
 #endif
 		break;

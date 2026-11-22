@@ -12,6 +12,12 @@
 #include "state.hpp"
 #include "jit_allocator.hpp"
 
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(PARALLEL_RSP_NO_VU_FAST)
+// aarch64: VU ops are emitted as register-convention bodies (rsp/vu_inline.cpp) instead of RSP_Vxxx helper calls.
+#define PRSP_VU_FAST 1
+#include "rsp/vu_inline.h"
+#endif
+
 extern "C"
 {
 #include <lightning.h>
@@ -46,11 +52,29 @@ public:
 	// Before leaving a JIT block, or before branching, we must flush out all live registers.
 	void flush_register_window(jit_state_t *_jit);
 
+	// Write back the modified registers but keep every entry live (now clean): the code that follows is reached only by falling through.
+	void writeback_modified_registers(jit_state_t *_jit);
+
 	// Similar, but we only need to invalidate caller save registers (JIT_R).
 	void flush_caller_save_registers(jit_state_t *_jit);
 
 	// Flush a single MIPS register.
 	void flush_mips_register(jit_state_t *_jit, unsigned mips_reg);
+
+	// Out-of-line slow paths that call C helpers: they must keep the caller-save registers that are live at the branch point.
+	// snapshot_caller_save() records them, emit_spill() / emit_reload() write the dirty ones to CPUState::sr before the call
+	// and restore all of them afterwards, without touching the cache bookkeeping of the main code path.
+	struct Saved
+	{
+		unsigned jit_reg;
+		unsigned mips_reg;
+		bool modified;
+		bool zext;
+	};
+	enum { MaxSaved = 8 };
+	unsigned snapshot_caller_save(Saved *out) const;
+	static void emit_spill(jit_state_t *_jit, const Saved *saved, unsigned count);
+	static void emit_reload(jit_state_t *_jit, const Saved *saved, unsigned count);
 
 	void reset();
 
@@ -109,6 +133,35 @@ public:
 
 	void invalidate_imem();
 
+	// Joey64: dev env N64_RSP_BJIT=1 turns on the ported aarch64 JIT work of beebono's parallel-rsp fork. Read again here
+	// (from InitiateRSP); a change drops all compiled code.
+	void update_bjit_from_env();
+
+#ifdef PRSP_VU_FAST
+	// Test hooks: choose the helper-call VU path (false) or the register-convention path before generating code.
+	// Also switches the rest of the N64_RSP_BJIT set (code packing, inline dispatch thunk, SP DMA fast path).
+	void set_vu_fast(bool enable);
+
+	// Test hook: the out-of-line scalar load/store paths clobber every caller-save register and v0 after their helper call, so a
+	// missing spill or reload shows up (the helpers are leaf functions that happen to leave those registers alone).
+	void set_clobber_slow_paths(bool enable)
+	{
+		clobber_slow_paths = enable;
+	}
+
+	// Test hook: the inlined VRCP / VRCPL / VRSQ / VRSQL / CFC2 (default on; only used while the register-convention path is on).
+	void set_div_inline(bool enable)
+	{
+		div_inline_enabled = enable;
+	}
+#endif
+
+	// Test hook: the IMEM DMA invalidation filter (see CPUState).
+	void set_imem_skip(bool enable)
+	{
+		state.imem_skip_identical = enable ? 1 : 0;
+	}
+
 	CPUState &get_state()
 	{
 		return state;
@@ -120,11 +173,19 @@ public:
 
 	Func get_jit_block(uint32_t pc);
 
+
 private:
 	CPUState state;
 	Func blocks[IMEM_WORDS] = {};
 
+	// N64_RSP_BJIT=1 (see CPU::CPU()): the ported aarch64 JIT work is on.
+	bool bjit = false;
+	void apply_bjit(bool enable);
+	void set_bjit(bool enable);
+
 	void invalidate_code();
+
+
 
 	uint64_t hash_imem(unsigned pc, unsigned count) const;
 
@@ -165,9 +226,13 @@ private:
 	                     bool first_instruction, bool next_instruction_is_target);
 	void jit_exit(jit_state_t *_jit, uint32_t pc, const InstructionInfo &last_info, ReturnMode mode, bool first_instruction);
 	void jit_exit_dynamic(jit_state_t *_jit, uint32_t pc, const InstructionInfo &last_info, bool first_instruction);
+	// Leave the region for the pc in JIT_REGISTER_NEXT_PC: the blocks[] lookup of the enter thunk done in place (so the final jump is a
+	// per-site indirect branch), the shared thunk only for a block that is not compiled yet.
+	void jit_goto_pc(jit_state_t *_jit);
 	void jit_end_of_block(jit_state_t *_jit, uint32_t pc, const InstructionInfo &last_info);
 
-	void jit_handle_delay_slot(jit_state_t *_jit, const InstructionInfo &last_info, uint32_t base_pc, uint32_t end_pc);
+	void jit_handle_delay_slot(jit_state_t *_jit, const InstructionInfo &last_info, uint32_t base_pc, uint32_t end_pc,
+	                           bool keep_cache);
 	void jit_handle_impossible_delay_slot(jit_state_t *_jit, const InstructionInfo &info, const InstructionInfo &last_info,
 	                                      uint32_t base_pc, uint32_t end_pc);
 	void jit_handle_latent_delay_slot(jit_state_t *_jit, const InstructionInfo &last_info);
@@ -203,6 +268,67 @@ private:
 
 	RegisterCache regs;
 	Allocator allocator;
+
+#ifdef PRSP_VU_FAST
+	struct VUStub
+	{
+		const uint32_t *src = nullptr; // body in the plugin image (without the final ret)
+		unsigned words = 0;
+		const void *addr = nullptr; // copy (with ret) in the JIT code region, reachable with BL
+		bool ok = false;
+	};
+	VUStub vu_stubs[RSP_VU_STUB_COUNT];
+	bool vu_fast_enabled = false;
+	bool vu_stubs_ready = false;
+	bool div_inline_enabled = true;
+	bool clobber_slow_paths = false;
+	bool inline_dispatch_enabled = true;
+#if defined(__clang__)
+	unsigned vu_inline_words = 9; // VU bodies up to this many words are copied inline instead of called (+1: the mov from x19, vu_inline.cpp)
+#else
+	unsigned vu_inline_words = 8; // VU bodies up to this many words are copied inline instead of called
+#endif
+	int v0_holds = -1; // vector register whose value v0 currently holds (-1 = unknown)
+	void init_vu_stubs();
+	bool jit_emit_vu_fast(jit_state_t *_jit, uint32_t instr);
+	void jit_emit_vu_divide(jit_state_t *_jit, uint32_t instr);
+
+	// Vector load / store fast paths with out-of-line slow paths (see jit_emit_ls_fast).
+	struct SlowLS
+	{
+		jit_node_t *guard;
+		jit_node_t *cont;
+		void (*helper)(CPUState *, unsigned, unsigned, unsigned);
+		unsigned rt, e, sum_reg;
+		RegisterCache::Saved saved[RegisterCache::MaxSaved];
+		unsigned num_saved;
+		int reload_v0; // vector register to reload into v0 after the helper call, or -1
+		unsigned prof_id;
+		bool inline_lqv; // handled by NEON byte shuffling instead of a helper call (LQV, e == 0, unaligned address)
+		unsigned vreg_offset; // byte offset of the destination vector register in CPUState (inline_lqv)
+		unsigned addr_reg;
+	};
+	std::vector<SlowLS> slow_ls;
+
+	// Scalar LH/LHU/LW/SH/SW: the unaligned case calls a C helper out of line (jit_emit_slow_paths), so the aligned case does not
+	// flush the caller-save registers of the cache.
+	struct SlowScalar
+	{
+		jit_node_t *guard;
+		jit_node_t *cont;
+		jit_pointer_t helper;
+		bool store;
+		unsigned addr_reg; // masked address (before the endian flip)
+		unsigned val_reg;  // loads: destination, stores: the value
+		bool inline_lw;    // unaligned LW/LWU: a funnel shift of two words, the helper only for the wrap at the end of DMEM
+		RegisterCache::Saved saved[RegisterCache::MaxSaved];
+		unsigned num_saved;
+		int reload_v0;
+	};
+	std::vector<SlowScalar> slow_scalar;
+	bool jit_emit_ls_fast(jit_state_t *_jit, uint32_t instr);
+	void jit_emit_slow_paths(jit_state_t *_jit);
+#endif
 };
 } // namespace JIT
 } // namespace RSP
