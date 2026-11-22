@@ -960,8 +960,15 @@ static void on_sync_full()
 			       precise_done, precise_emulated, precise_waited);
 			precise_done = precise_emulated = precise_waited = 0;
 			if (maskcheck)
-				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart maskcheck: mask %s, %u stores through the alias, %u on GPU-written bytes, %u loads on them\n",
-				       mask_view ? "mapped" : "not mapped", mask_stores, mask_store_hits, mask_load_hits);
+			{
+				// Control: how much of RDRAM the mask marks GPU-written right now (a view that always reads 0 shows here).
+				size_t set = 0;
+				if (mask_view)
+					for (size_t b = 0; b < rdram_size; b += 64)
+						set += mask_view[b] != 0;
+				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart maskcheck: mask %s (%zu of %zu sampled bytes set), %u stores through the alias, %u on GPU-written bytes, %u loads on them\n",
+				       mask_view ? "mapped" : "not mapped", set, rdram_size / 64, mask_stores, mask_store_hits, mask_load_hits);
+			}
 			mask_stores = mask_store_hits = mask_load_hits = 0;
 		}
 		if (debug)
