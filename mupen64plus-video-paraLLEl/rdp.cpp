@@ -1559,9 +1559,42 @@ static bool in_shown(uint32_t addr)
 	return false;
 }
 
+// N64_FRAMESKIP_TRACE: each frame's commands, for frame starts 950-990 (what the game draws where).
+static struct { unsigned tris, rects, fills, dropped, ci_other, ci_same; uint32_t tex[4], other[4], z; } ft;
+static void ft_add(uint32_t *list, uint32_t a)
+{
+	for (int i = 0; i < 4; i++)
+	{
+		if (list[i] == a)
+			return;
+		if (!list[i])
+		{
+			list[i] = a;
+			return;
+		}
+	}
+}
+static void ft_log()
+{
+	if (trace_left > 0 && frames >= 950 && frames <= 990)
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: fsframe f%llu into %06x skip %d: tris %u rects %u fills %u dropped %u; z %06x; textures %06x %06x %06x %06x; other images %06x %06x %06x %06x (%u), same %u\n",
+		       (unsigned long long)frames, drawing, skipping, ft.tris, ft.rects, ft.fills, ft.dropped, ft.z,
+		       ft.tex[0], ft.tex[1], ft.tex[2], ft.tex[3], ft.other[0], ft.other[1], ft.other[2], ft.other[3], ft.ci_other, ft.ci_same);
+	memset(&ft, 0, sizeof(ft));
+}
+
 static void color_image(uint32_t addr)
 {
 	into_shown = shown_index(addr) >= 0;
+	if (!into_shown)
+	{
+		ft.ci_other++;
+		ft_add(ft.other, addr);
+	}
+	else if (addr == drawing && !drawing_shown)
+		ft.ci_same++;
+	else
+		ft_log();
 	if (!into_shown) d_ci_other++; else if (addr == drawing) d_ci_same++; else d_ci_shown++;
 	if (!into_shown || (addr == drawing && !drawing_shown))
 		return; // textures drawn in between don't start a frame
@@ -1573,11 +1606,11 @@ static void color_image(uint32_t addr)
 	if (was_behind) d_starts_behind++;
 	const bool holding = hold > 0;
 	if (holding) hold--;
-	skipping = shows_copy || holding ? false : automatic ? was_behind && !skipping : (frames & 1) != 0;
 	int slot = -1;
 	for (int i = 0; i < NBUF && slot < 0; i++)
 		if (buffer[i] == addr)
 			slot = i;
+	skipping = shows_copy || holding ? false : automatic ? was_behind && !skipping : (frames & 1) != 0;
 	for (int i = 0; i < NBUF && slot < 0; i++)
 		if (!buffer[i])
 			slot = i;
@@ -1605,6 +1638,19 @@ static bool drop(uint32_t command, uint32_t w1, uint32_t w2)
 		color_image(w2 & 0xffffff);
 		return false;
 	}
+	if (trace_left > 0)
+	{
+		if (command == 0x3d)
+			ft_add(ft.tex, w2 & 0xffffff);
+		if (command == 0x3e)
+			ft.z = w2 & 0xffffff;
+		if (command >= 0x08 && command <= 0x0f)
+			ft.tris++;
+		else if (command == 0x24 || command == 0x25)
+			ft.rects++;
+		else if (command == 0x36)
+			ft.fills++;
+	}
 	if (command == 0x3d && in_shown(w2 & 0xffffff))
 	{
 		hold = 120;
@@ -1612,9 +1658,11 @@ static bool drop(uint32_t command, uint32_t w1, uint32_t w2)
 		return false;
 	}
 	const bool draws = (command >= 0x08 && command <= 0x0f) || command == 0x24 || command == 0x25 || command == 0x36;
-	if (draws && into_shown && skipping)
+	static const bool nodrop = getenv("N64_FRAMESKIP_NODROP") && *getenv("N64_FRAMESKIP_NODROP") == '1'; // debug: skip scanouts, draw everything
+	if (draws && into_shown && skipping && !nodrop)
 	{
 		dropped++;
+		ft.dropped++;
 		return true;
 	}
 	return false;
