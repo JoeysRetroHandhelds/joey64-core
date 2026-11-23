@@ -143,9 +143,9 @@ public:
 
 	// setup may be mutated to apply various fixups to triangle setup.
 	void draw_flat_primitive(TriangleSetup &setup);
-	// Joey64: a fill rectangle about to be drawn (raw 10.2 coordinates, yl with its low bits set); a pass holding only
-	// one that covers whole rows of a 16-bit image in one colour is written with buffer fills instead of the pass.
-	void note_fill_rectangle(uint32_t xh, uint32_t yh, uint32_t xl, uint32_t yl);
+	// Joey64: a fill rectangle (raw 10.2 coordinates, yl with its low bits set) over whole rows of a 16-bit image in one
+	// colour, with nothing waiting to be drawn, is written at once with buffer fills; false: draw it as before.
+	bool fill_rectangle_fast(uint32_t xh, uint32_t yh, uint32_t xl, uint32_t yl);
 	void draw_shaded_primitive(TriangleSetup &setup, const AttributeSetup &attr);
 
 	void set_color_framebuffer(uint32_t addr, uint32_t width, FBFormat fmt);
@@ -444,14 +444,8 @@ private:
 	bool skip_upscaled = false;
 
 	void flush_queues();
-	struct
-	{
-		bool valid = false;
-		uint32_t index = 0, y0 = 0, y1 = 0, color = 0;
-	} fill_fast;
 	unsigned fill_fast_count = 0;
-	bool fill_fast_ready() const;
-	void submit_fill_fast(Vulkan::CommandBuffer &cmd);
+	void submit_fill_fast(Vulkan::CommandBuffer &cmd, uint32_t y0, uint32_t y1, uint32_t word);
 	void submit_render_pass(Vulkan::CommandBuffer &cmd);
 	void submit_render_pass_upscaled(Vulkan::CommandBuffer &cmd, Vulkan::Buffer *tmem_override = nullptr);
 	void submit_render_pass_end(Vulkan::CommandBuffer &cmd);
