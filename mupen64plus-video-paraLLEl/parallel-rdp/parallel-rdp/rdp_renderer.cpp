@@ -2702,6 +2702,8 @@ void Renderer::reset_context()
 	fb.depth_write_pending = false;
 
 	stream.tmem_upload_infos.clear();
+	// A noted fill belongs to the pass it was drawn in.
+	fill_fast.valid = false;
 }
 
 void Renderer::begin_new_context()
@@ -3320,6 +3322,35 @@ void Renderer::flush_queues()
 		                                                     get_byte_size_for_bound_depth_framebuffer());
 	}
 
+	// Joey64 (2026-11-23): a pass holding only one fill rectangle over whole rows of a 16-bit image in one colour (a
+	// depth or colour clear) is written with buffer fills: native RDRAM, its write mask, hidden RDRAM and the
+	// upscaled copies, as the pass would leave them. The pass itself (binning, depth-blend, SSAA resolve) cost the
+	// RP5 ~1.85 ms a frame in GoldenEye at 2x. N64_RDP_FILL_FAST=0 (dev): the pass, as before.
+	{
+		static const bool dbg = getenv("N64_RDP_FILL_DEBUG") && getenv("N64_RDP_FILL_DEBUG")[0] == '1';
+		static unsigned dbg_flush;
+		if (dbg && fill_fast.valid && !fill_fast_ready() && dbg_flush++ < 20)
+			LOGI("fill debug: noted fill not taken: index %u, %u prims, %u texture loads\n", fill_fast.index,
+			     unsigned(stream.triangle_setup.size()), unsigned(stream.tmem_upload_infos.size()));
+	}
+	if (fill_fast_ready())
+	{
+		// Held-back upscaled passes write the same buffers, so they go first.
+		if (!deferred_upscaled.empty())
+			flush_deferred_upscaled();
+		ensure_command_buffer();
+		if (!is_host_coherent)
+			resolve_coherency_host_to_gpu(*stream.cmd);
+		submit_fill_fast(*stream.cmd);
+		if (fill_fast_count++ == 0)
+			LOGI("fill fast path: whole-row fills written directly (first %ux%u at 0x%x).\n",
+			     fb.width, fill_fast.y1 - fill_fast.y0 + 1, fb.addr);
+		base_primitive_index += uint32_t(stream.triangle_setup.size());
+		begin_new_context();
+		maintain_queues();
+		return;
+	}
+
 	// Native-first: a 1x-only pass may go ahead of a held-back upscaled pass drawing in the same place (its own
 	// domain update finds nothing to copy: the held pass's 1x half already updated the reference). The next
 	// upscaled pass's update would copy the 1x-only pass's drawing up, so the held passes are recorded before it.
@@ -3399,6 +3430,99 @@ void Renderer::flush_queues()
 
 	begin_new_context();
 	maintain_queues();
+}
+
+void Renderer::note_fill_rectangle(uint32_t xh, uint32_t yh, uint32_t xl, uint32_t yl)
+{
+	fill_fast.valid = false;
+	static const bool off = getenv("N64_RDP_FILL_FAST") && getenv("N64_RDP_FILL_FAST")[0] == '0';
+	if (off)
+		return;
+
+	const auto &s = stream.scissor_state;
+	const uint32_t flags = stream.static_raster_state.flags;
+	// N64_RDP_FILL_DEBUG=1 (dev): the first fill rectangles a run sees, with what decides the fast path.
+	static const bool dbg = getenv("N64_RDP_FILL_DEBUG") && getenv("N64_RDP_FILL_DEBUG")[0] == '1';
+	static unsigned dbg_seen;
+	if (dbg && dbg_seen < 40 && ++dbg_seen > 20)
+		LOGI("fill debug: rect %u,%u-%u,%u scissor %u,%u-%u,%u fill %d interlace %d fmt %d width %u addr 0x%x "
+		     "depth 0x%x colour 0x%08x prims before %u\n", xh, yh, xl, yl, s.xlo, s.ylo, s.xhi, s.yhi,
+		     int((flags & RASTERIZATION_FILL_BIT) != 0), int((flags & RASTERIZATION_INTERLACE_FIELD_BIT) != 0),
+		     int(fb.fmt), fb.width, fb.addr, fb.depth_addr, constants.fill_color, unsigned(stream.triangle_setup.size()));
+	if ((flags & RASTERIZATION_FILL_BIT) == 0 || (flags & RASTERIZATION_INTERLACE_FIELD_BIT) != 0)
+		return;
+	// 16-bit pixels, rows a multiple of 4 pixels, 8-byte aligned: every buffer range below is whole 32-bit words.
+	if (fb.fmt != FBFormat::RGBA5551 || fb.width == 0 || (fb.width & 3) != 0 || (fb.addr & 7) != 0)
+		return;
+	// Both pixels of the fill word alike, so every pixel and its hidden bits are the same.
+	const uint32_t color = constants.fill_color;
+	if ((color >> 16) != (color & 0xffff))
+		return;
+	// Whole rows: from x 0 through the last pixel (fill mode is inclusive on the right; the scissor's right edge is
+	// exclusive), on whole scanlines.
+	if (xh != 0 || s.xlo != 0 || s.xhi != fb.width * 4 || (xl >> 2) + 1 < fb.width)
+		return;
+	if ((yh & 3) != 0 || (s.ylo & 3) != 0 || (s.yhi & 3) != 0)
+		return;
+	// The rows allocate_span_jobs gives the rectangle (setup.yl is yl).
+	const int y0 = int(std::max(yh, s.ylo)) >> 2;
+	const int y1 = std::min(int(yl) - 1, int(s.yhi) - 1) >> 2;
+	if (y1 < y0)
+		return;
+	if (fb.addr + uint64_t(y1 + 1) * fb.width * 2 > rdram_size)
+		return;
+
+	fill_fast.valid = true;
+	fill_fast.index = uint32_t(stream.triangle_setup.size());
+	fill_fast.y0 = uint32_t(y0);
+	fill_fast.y1 = uint32_t(y1);
+	fill_fast.color = color;
+}
+
+bool Renderer::fill_fast_ready() const
+{
+	return fill_fast.valid && fill_fast.index == 0 && stream.triangle_setup.size() == 1 &&
+	       stream.tmem_upload_infos.empty() && fb.fmt == FBFormat::RGBA5551;
+}
+
+void Renderer::submit_fill_fast(Vulkan::CommandBuffer &cmd)
+{
+	const VkDeviceSize pix0 = fb.addr / 2 + VkDeviceSize(fill_fast.y0) * fb.width;
+	const VkDeviceSize pixels = VkDeviceSize(fill_fast.y1 - fill_fast.y0 + 1) * fb.width;
+	const uint32_t word = fill_fast.color;
+	// Hidden RDRAM: one entry a pixel (8, 16 or 32 bits), the fill colour's low bit times 3 (fill_color in the shader).
+	const uint32_t hidden = (word & 1u) * 3u;
+	const VkDeviceSize entry = caps.no_storage_16bit ? 4 : caps.no_storage_8bit ? 2 : 1;
+	const uint32_t hidden_word = entry == 4 ? hidden : entry == 2 ? hidden * 0x00010001u : hidden * 0x01010101u;
+
+	cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+	            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+	            VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+	cmd.fill_buffer(*rdram, word, rdram_offset + pix0 * 2, pixels * 2);
+	// Without host-coherent RDRAM the write mask marks what the GPU wrote, so the readback copies it to the host.
+	if (!is_host_coherent)
+		cmd.fill_buffer(*rdram, ~0u, rdram_offset + rdram_size + pix0 * 2, pixels * 2);
+	cmd.fill_buffer(*hidden_rdram, hidden_word, pix0 * entry, pixels * entry);
+
+	if (caps.upscaling > 1)
+	{
+		// The reference matches RDRAM, so the next pass's upscaled-domain update copies nothing up here.
+		cmd.fill_buffer(*upscaling_reference_rdram, word, pix0 * 2, pixels * 2);
+		const unsigned samples = caps.upscaling * caps.upscaling;
+		const VkDeviceSize hidden_slice = hidden_rdram->get_create_info().size;
+		for (unsigned i = 0; i < samples; i++)
+		{
+			cmd.fill_buffer(*upscaling_multisampled_rdram, word, i * VkDeviceSize(rdram_size) + pix0 * 2, pixels * 2);
+			cmd.fill_buffer(*upscaling_multisampled_hidden_rdram, hidden_word, i * hidden_slice + pix0 * entry,
+			                pixels * entry);
+		}
+	}
+
+	cmd.barrier(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+	            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_HOST_BIT,
+	            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+	            VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_HOST_READ_BIT);
 }
 
 bool Renderer::native_first_on() const

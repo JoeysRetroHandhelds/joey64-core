@@ -916,6 +916,7 @@ void CommandProcessor::op_fill_rectangle(const uint32_t *words)
 	setup.yh = yh;
 	setup.flags = TRIANGLE_SETUP_FLIP_BIT | TRIANGLE_SETUP_DISABLE_UPSCALING_BIT;
 
+	renderer.note_fill_rectangle(xh, yh, xl, yl);
 	renderer.draw_flat_primitive(setup);
 }
 
