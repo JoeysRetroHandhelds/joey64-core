@@ -3401,6 +3401,134 @@ void Renderer::flush_queues()
 	maintain_queues();
 }
 
+// Joey64 (2026-11-23): a fill rectangle over whole rows of a 16-bit image in one colour (a depth clear, or a colour
+// clear before a pass draws), with nothing waiting to be drawn, is written at once with buffer fills: native RDRAM,
+// its write mask, hidden RDRAM and the upscaled copies, as drawing it would leave them. Drawn, a clear runs the whole
+// binning + depth-blend + SSAA resolve for one rectangle (a pass of its own for a depth clear): ~1.85 ms of GPU a
+// frame in GoldenEye on the RP5 at 2x, 3.5 ms on the RG 55G1 at 1x. N64_RDP_FILL_FAST=0 (dev): drawn, as before.
+// N64_RDP_FILL_DEBUG=1 (dev): logs the fills that are drawn instead, with what decided it.
+bool Renderer::fill_rectangle_fast(uint32_t xh, uint32_t yh, uint32_t xl, uint32_t yl)
+{
+	static const bool off = getenv("N64_RDP_FILL_FAST") && getenv("N64_RDP_FILL_FAST")[0] == '0';
+	static const bool dbg = getenv("N64_RDP_FILL_DEBUG") && getenv("N64_RDP_FILL_DEBUG")[0] == '1';
+	static unsigned dbg_logged;
+	if (off)
+		return false;
+
+	const auto &s = stream.scissor_state;
+	const uint32_t flags = stream.static_raster_state.flags;
+	const uint32_t color = constants.fill_color;
+	const char *why = nullptr;
+	int y0 = 0, y1 = -1;
+
+	if ((flags & RASTERIZATION_FILL_BIT) == 0)
+		why = "not fill mode";
+	else if ((flags & RASTERIZATION_INTERLACE_FIELD_BIT) != 0)
+		why = "interlaced scissor";
+	// 16-bit pixels, rows a multiple of 4 pixels, 8-byte aligned: every buffer range below is whole 32-bit words.
+	else if (fb.fmt != FBFormat::RGBA5551 || fb.width == 0 || (fb.width & 3) != 0 || (fb.addr & 7) != 0)
+		why = "image format, width or alignment";
+	// Both pixels of the fill word alike, so every pixel and its hidden bits are the same.
+	else if ((color >> 16) != (color & 0xffff))
+		why = "two colours";
+	// Whole rows: from x 0 through the last pixel (fill mode is inclusive on the right; the scissor's right edge is
+	// exclusive), on whole scanlines.
+	else if (xh != 0 || s.xlo != 0 || s.xhi != fb.width * 4 || (xl >> 2) + 1 < fb.width)
+		why = "not whole rows";
+	else if ((yh & 3) != 0 || (s.ylo & 3) != 0 || (s.yhi & 3) != 0)
+		why = "part scanlines";
+	// Drawn in order after what is waiting, so only when nothing is.
+	else if (stream.triangle_setup.size() != 0 || stream.span_info_jobs.size() != 0 || !stream.tmem_upload_infos.empty())
+		why = "after other draws in the pass";
+	else
+	{
+		// The rows allocate_span_jobs would give the rectangle (setup.yl is yl).
+		y0 = int(std::max(yh, s.ylo)) >> 2;
+		y1 = std::min(int(yl) - 1, int(s.yhi) - 1) >> 2;
+		if (y1 < y0)
+			why = "no rows";
+		else if (fb.addr + uint64_t(y1 + 1) * fb.width * 2 > rdram_size)
+			why = "past the end of RDRAM";
+	}
+
+	if (why)
+	{
+		if (dbg && (flags & RASTERIZATION_FILL_BIT) != 0 && dbg_logged++ < 30)
+			LOGI("fill debug: drawn (%s): rect %u,%u-%u,%u scissor %u,%u-%u,%u fmt %d width %u addr 0x%x colour 0x%08x, "
+			     "%u waiting\n", why, xh, yh, xl, yl, s.xlo, s.ylo, s.xhi, s.yhi, int(fb.fmt), fb.width, fb.addr, color,
+			     unsigned(stream.triangle_setup.size()));
+		return false;
+	}
+
+	// Held-back upscaled passes write the same buffers, so they go first.
+	if (!deferred_upscaled.empty())
+		flush_deferred_upscaled();
+	ensure_command_buffer();
+	if (!is_host_coherent)
+	{
+		// As flush_queues does for a pass: the CPU's writes to these pages go up first (a page is copied back whole
+		// when nothing in it is masked), and the pages wait for the GPU's write to come back.
+		const uint32_t addr = fb.addr + uint32_t(y0) * fb.width * 2;
+		const uint32_t bytes = uint32_t(y1 - y0 + 1) * fb.width * 2;
+		mark_pages_for_gpu_read(addr, bytes);
+		lock_pages_for_gpu_write(addr, bytes);
+		resolve_coherency_host_to_gpu(*stream.cmd);
+	}
+	submit_fill_fast(*stream.cmd, uint32_t(y0), uint32_t(y1), color);
+	// Counted as a pass the CPU sees, as flush_queues counts one: submit_to_queue copies written pages back to the
+	// host and gives SyncFull a fence to wait on only when such a pass is pending. Without it a frame whose only GPU
+	// work was this fill (frame skip drops the frame's draws, not its depth clear) never came back: Perfect Dark read
+	// last frame's depth, took its lights as hidden and drew no glare (RG 55G1, RP5; Mali's RDRAM is host-coherent).
+	if (ssrb_live())
+		pending_render_passes_upscaled++;
+	else
+		pending_render_passes++;
+	// The rectangle keeps its primitive number, so the noise seeds of what follows are as before.
+	base_primitive_index++;
+	if (fill_fast_count++ == 0)
+		LOGI("fill fast path: whole-row fills written directly (first %ux%d at 0x%x).\n", fb.width, y1 - y0 + 1, fb.addr);
+	return true;
+}
+
+void Renderer::submit_fill_fast(Vulkan::CommandBuffer &cmd, uint32_t y0, uint32_t y1, uint32_t word)
+{
+	const VkDeviceSize pix0 = fb.addr / 2 + VkDeviceSize(y0) * fb.width;
+	const VkDeviceSize pixels = VkDeviceSize(y1 - y0 + 1) * fb.width;
+	// Hidden RDRAM: one entry a pixel (8, 16 or 32 bits), the fill colour's low bit times 3 (fill_color in the shader).
+	const uint32_t hidden = (word & 1u) * 3u;
+	const VkDeviceSize entry = caps.no_storage_16bit ? 4 : caps.no_storage_8bit ? 2 : 1;
+	const uint32_t hidden_word = entry == 4 ? hidden : entry == 2 ? hidden * 0x00010001u : hidden * 0x01010101u;
+
+	cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+	            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+	            VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+	cmd.fill_buffer(*rdram, word, rdram_offset + pix0 * 2, pixels * 2);
+	// Without host-coherent RDRAM the write mask marks what the GPU wrote, so the readback copies it to the host.
+	if (!is_host_coherent)
+		cmd.fill_buffer(*rdram, ~0u, rdram_offset + rdram_size + pix0 * 2, pixels * 2);
+	cmd.fill_buffer(*hidden_rdram, hidden_word, pix0 * entry, pixels * entry);
+
+	if (caps.upscaling > 1)
+	{
+		// The reference matches RDRAM, so the next pass's upscaled-domain update copies nothing up here.
+		cmd.fill_buffer(*upscaling_reference_rdram, word, pix0 * 2, pixels * 2);
+		const unsigned samples = caps.upscaling * caps.upscaling;
+		const VkDeviceSize hidden_slice = hidden_rdram->get_create_info().size;
+		for (unsigned i = 0; i < samples; i++)
+		{
+			cmd.fill_buffer(*upscaling_multisampled_rdram, word, i * VkDeviceSize(rdram_size) + pix0 * 2, pixels * 2);
+			cmd.fill_buffer(*upscaling_multisampled_hidden_rdram, hidden_word, i * hidden_slice + pix0 * entry,
+			                pixels * entry);
+		}
+	}
+
+	cmd.barrier(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+	            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_HOST_BIT,
+	            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+	            VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_HOST_READ_BIT);
+}
+
 bool Renderer::native_first_on() const
 {
 	return defer_upscaled && (native_first_live || native_first_always) && !caps.super_sample_readback &&

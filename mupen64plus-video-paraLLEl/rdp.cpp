@@ -1502,60 +1502,167 @@ namespace FSkip
 {
 static bool enabled, automatic;
 static std::atomic<bool> behind{false};
-static uint32_t shown[4]; // the VI's last origins
+static uint32_t shown[8]; // the VI's last 8 origins (DK64 shows 5)
 static unsigned shown_next;
 static uint32_t drawing;
 static bool into_shown, skipping;
+// The buffer being drawn was scanned out since its frame started: a game drawing every frame into the one buffer it
+// shows (SM64 Elise; DK64's title) never switches buffers, so a colour image into it starts a new frame once it was
+// shown. Without it `skipping` stayed as it was at the last switch: Every other frame left such a game black.
+static bool drawing_shown;
+// The last scanout showed a buffer the RDP never drew as a frame: the game copies a drawn picture there (DK64's title:
+// it draws into 024000 / 04fa00 and shows 0caa00). Skipping a frame would leave the copy's source undrawn, and with two
+// buffers the same one is skipped every time, so the picture went black; no frame is skipped while that lasts, nor for
+// the next 120 frame starts (`hold`): DK64 shows a drawn buffer between copies, and skipping then left the copy black.
+static bool shows_copy;
+// The RDP took a texture from a shown buffer: the game draws last frame's picture again (Perfect Dark's Enter Agent
+// Name blurs it behind the keyboard). A skipped frame there is a black background, so no frame is skipped for the next
+// 120 frame starts. Not the buffer being drawn: SM64 Elise draws into the one buffer it shows and textures from it
+// every frame, which is no earlier picture.
+static unsigned hold;
+static unsigned d_reads; // N64_FRAMESKIP_DEBUG count
 static uint64_t frames;
-static uint32_t buffer[4];
-static bool skipped[4];
+// The buffers frames were drawn into, whether each was skipped, and the frame it was last used: 8 of them, the least
+// recently used replaced. With 4 and slot 0 always replaced DK64 (7 addresses) kept stale entries in slots 1-3, so
+// its copy 0caa00 matched an old 0ca000 and the copy rule never ran.
+static const int NBUF = 8;
+static uint32_t buffer[NBUF];
+static bool skipped[NBUF];
+static uint64_t used[NBUF];
+static uint32_t bytes[NBUF]; // the picture's size: its colour image width x 3/4 of it x the pixel size
+static int trace_left; // N64_FRAMESKIP_TRACE=1: the first 6000 scanouts are logged
 static unsigned dropped, scanouts_skipped, scanouts;
 static unsigned d_ci_shown, d_ci_same, d_ci_other, d_starts, d_starts_behind; // N64_FRAMESKIP_DEBUG counts
 static std::atomic<unsigned> d_cb_calls{0}, d_cb_active{0}, d_cb_low{0}, d_cb_dry{0}, d_cb_min{100};
 
+// The closest one, not the first: DK64's buffers start 0x9e00 apart (04fa00, 059800), so an origin can be within 64 KB
+// of two, and the first match depended on the order the game first used them.
 static int shown_index(uint32_t addr)
 {
+	int best = -1;
+	for (int i = 0; i < 8; i++)
+		if (shown[i] && shown[i] >= addr && shown[i] - addr < 0x10000 && (best < 0 || shown[i] - addr < shown[best] - addr))
+			best = i;
+	return best;
+}
+
+// Whether an address is inside an earlier frame's picture: a buffer a frame was drawn into other than the one being
+// drawn, from its start to its size (a texture taken from last frame's picture starts at the rows it copies). Shown
+// origins with 640 x 480 x 2 bytes after each matched Perfect Dark's own textures in play (thousands a window), which
+// turned frame skip off there.
+static uint32_t cur_width, cur_bpp; // the last colour image's
+static bool in_shown(uint32_t addr)
+{
+	for (int i = 0; i < NBUF; i++)
+		if (buffer[i] && buffer[i] != drawing && addr >= buffer[i] && addr < buffer[i] + bytes[i])
+			return true;
+	return false;
+}
+
+// N64_FRAMESKIP_TRACE: each frame's commands, for frame starts 950-990 (what the game draws where).
+static struct { unsigned tris, rects, fills, dropped, ci_other, ci_same; uint32_t tex[4], other[4], z; } ft;
+static void ft_add(uint32_t *list, uint32_t a)
+{
 	for (int i = 0; i < 4; i++)
-		if (shown[i] && shown[i] >= addr && shown[i] - addr < 0x10000)
-			return i;
-	return -1;
+	{
+		if (list[i] == a)
+			return;
+		if (!list[i])
+		{
+			list[i] = a;
+			return;
+		}
+	}
+}
+static void ft_log()
+{
+	if (trace_left > 0 && frames >= 950 && frames <= 990)
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: fsframe f%llu into %06x skip %d: tris %u rects %u fills %u dropped %u; z %06x; textures %06x %06x %06x %06x; other images %06x %06x %06x %06x (%u), same %u\n",
+		       (unsigned long long)frames, drawing, skipping, ft.tris, ft.rects, ft.fills, ft.dropped, ft.z,
+		       ft.tex[0], ft.tex[1], ft.tex[2], ft.tex[3], ft.other[0], ft.other[1], ft.other[2], ft.other[3], ft.ci_other, ft.ci_same);
+	memset(&ft, 0, sizeof(ft));
 }
 
 static void color_image(uint32_t addr)
 {
 	into_shown = shown_index(addr) >= 0;
+	if (!into_shown)
+	{
+		ft.ci_other++;
+		ft_add(ft.other, addr);
+	}
+	else if (addr == drawing && !drawing_shown)
+		ft.ci_same++;
+	else
+		ft_log();
 	if (!into_shown) d_ci_other++; else if (addr == drawing) d_ci_same++; else d_ci_shown++;
-	if (!into_shown || addr == drawing)
+	if (!into_shown || (addr == drawing && !drawing_shown))
 		return; // textures drawn in between don't start a frame
 	drawing = addr;
+	drawing_shown = false;
 	frames++;
 	d_starts++;
 	const bool was_behind = behind.exchange(false, std::memory_order_relaxed); // any low or dry report since the last start
 	if (was_behind) d_starts_behind++;
-	skipping = automatic ? was_behind && !skipping : (frames & 1) != 0;
-	int slot = 0;
-	for (int i = 0; i < 4; i++)
-		if (buffer[i] == addr || !buffer[i])
-		{
+	const bool holding = hold > 0;
+	if (holding) hold--;
+	int slot = -1;
+	for (int i = 0; i < NBUF && slot < 0; i++)
+		if (buffer[i] == addr)
 			slot = i;
-			break;
-		}
+	skipping = shows_copy || holding ? false : automatic ? was_behind && !skipping : (frames & 1) != 0;
+	for (int i = 0; i < NBUF && slot < 0; i++)
+		if (!buffer[i])
+			slot = i;
+	if (slot < 0)
+	{
+		slot = 0;
+		for (int i = 1; i < NBUF; i++)
+			if (used[i] < used[slot])
+				slot = i;
+	}
 	buffer[slot] = addr;
 	skipped[slot] = skipping;
+	used[slot] = frames;
+	bytes[slot] = cur_width * (cur_width * 3 / 4) * cur_bpp;
 }
 
 // Whether to leave this command out.
-static bool drop(uint32_t command, uint32_t w2)
+static bool drop(uint32_t command, uint32_t w1, uint32_t w2)
 {
 	if (command == 0x3f)
 	{
+		cur_width = (w1 & 0x3ff) + 1;
+		const uint32_t size = (w1 >> 19) & 3; // 2 = 16-bit, 3 = 32-bit
+		cur_bpp = size == 3 ? 4 : size == 2 ? 2 : 1;
 		color_image(w2 & 0xffffff);
 		return false;
 	}
+	if (trace_left > 0)
+	{
+		if (command == 0x3d)
+			ft_add(ft.tex, w2 & 0xffffff);
+		if (command == 0x3e)
+			ft.z = w2 & 0xffffff;
+		if (command >= 0x08 && command <= 0x0f)
+			ft.tris++;
+		else if (command == 0x24 || command == 0x25)
+			ft.rects++;
+		else if (command == 0x36)
+			ft.fills++;
+	}
+	if (command == 0x3d && in_shown(w2 & 0xffffff))
+	{
+		hold = 120;
+		d_reads++;
+		return false;
+	}
 	const bool draws = (command >= 0x08 && command <= 0x0f) || command == 0x24 || command == 0x25 || command == 0x36;
-	if (draws && into_shown && skipping)
+	static const bool nodrop = getenv("N64_FRAMESKIP_NODROP") && *getenv("N64_FRAMESKIP_NODROP") == '1'; // debug: skip scanouts, draw everything
+	if (draws && into_shown && skipping && !nodrop)
 	{
 		dropped++;
+		ft.dropped++;
 		return true;
 	}
 	return false;
@@ -1567,15 +1674,24 @@ static bool skip_scanout(uint32_t origin)
 	if (shown_index(origin) < 0)
 	{
 		shown[shown_next] = origin;
-		shown_next = (shown_next + 1) & 3;
+		shown_next = (shown_next + 1) & 7;
 	}
-	bool skip = false;
-	for (int i = 0; i < 4; i++)
-		if (buffer[i] && origin >= buffer[i] && origin - buffer[i] < 0x10000)
-		{
-			skip = skipped[i];
-			break;
-		}
+	int near = -1; // the closest buffer at or below the origin, as shown_index
+	for (int i = 0; i < NBUF; i++)
+		if (buffer[i] && origin >= buffer[i] && origin - buffer[i] < 0x10000 && (near < 0 || origin - buffer[i] < origin - buffer[near]))
+			near = i;
+	const bool known = near >= 0;
+	if (drawing && (known ? buffer[near] == drawing : origin >= drawing && origin - drawing < 0x10000))
+		drawing_shown = true;
+	const bool skip = known && skipped[near];
+	shows_copy = !known && buffer[0];
+	if (shows_copy) hold = 120;
+	if (trace_left > 0)
+	{
+		trace_left--;
+		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: fstrace f%llu origin %06x near %06x skip %d copy %d hold %u drawing %06x\n",
+		       (unsigned long long)frames, origin, known ? buffer[near] : 0, skip, shows_copy, hold, drawing);
+	}
 	if (++(skip ? scanouts_skipped : scanouts) + scanouts_skipped >= 600)
 	{
 		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip: %u of the last %u scanouts skipped, %u draws left out.\n",
@@ -1584,14 +1700,14 @@ static bool skip_scanout(uint32_t origin)
 		if (debug)
 		{
 			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip debug: colour images %u into a new shown buffer, %u into the one drawn, %u elsewhere; "
-			       "%u frame starts, %u while behind; shown %06x %06x %06x %06x, drawing %06x.\n",
-			       d_ci_shown, d_ci_same, d_ci_other, d_starts, d_starts_behind, shown[0], shown[1], shown[2], shown[3], drawing);
+			       "%u frame starts, %u while behind; %u textures from a shown buffer; shown %06x %06x %06x %06x, drawing %06x.\n",
+			       d_ci_shown, d_ci_same, d_ci_other, d_starts, d_starts_behind, d_reads, shown[0], shown[1], shown[2], shown[3], drawing);
 			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: frame skip debug: audio status %u calls, %u active, %u at 33%% or less, %u ran dry, lowest %u%%.\n",
 			       d_cb_calls.load(), d_cb_active.load(), d_cb_low.load(), d_cb_dry.load(), d_cb_min.load());
 		}
 		scanouts = scanouts_skipped = dropped = 0;
 		d_cb_calls = 0; d_cb_active = 0; d_cb_low = 0; d_cb_dry = 0; d_cb_min = 100;
-		d_ci_shown = d_ci_same = d_ci_other = d_starts = d_starts_behind = 0;
+		d_ci_shown = d_ci_same = d_ci_other = d_starts = d_starts_behind = d_reads = 0;
 	}
 	return skip;
 }
@@ -1605,9 +1721,14 @@ static void init()
 	memset(shown, 0, sizeof(shown));
 	memset(buffer, 0, sizeof(buffer));
 	memset(skipped, 0, sizeof(skipped));
+	memset(used, 0, sizeof(used));
+	memset(bytes, 0, sizeof(bytes));
+	cur_width = cur_bpp = 0;
+	trace_left = getenv("N64_FRAMESKIP_TRACE") && *getenv("N64_FRAMESKIP_TRACE") == '1' ? 6000 : 0;
 	shown_next = 0;
 	drawing = 0;
-	into_shown = skipping = false;
+	into_shown = skipping = drawing_shown = shows_copy = false;
+	hold = 0;
 	frames = 0;
 	dropped = scanouts_skipped = scanouts = 0;
 	if (enabled)
@@ -3069,7 +3190,27 @@ void process_commands()
 		// before the command is queued: texture packs queue the draw's replacements ahead of it
 		if (TexKeys::enabled)
 			TexKeys::track(RDP::Op(command), &cmd_data[2 * cmd_cur]);
-		if (command >= 8 && frontend && !(FSkip::enabled && FSkip::drop(command, cmd_data[2 * cmd_cur + 1])))
+		// N64_DBG_NO_ZCLEAR=1 (measurement only, wrong pictures): fill rectangles into the depth image drawn as the colour
+		// image (every game's depth clear) are left out, so an A/B gives the most a depth-clear fast path could save.
+		static const bool no_zclear = getenv("N64_DBG_NO_ZCLEAR") && *getenv("N64_DBG_NO_ZCLEAR") == '1';
+		static uint32_t nz_color, nz_depth;
+		static unsigned nz_dropped, nz_cmds;
+		bool nz_drop = false;
+		if (no_zclear)
+		{
+			if (command == 0x3f)
+				nz_color = cmd_data[2 * cmd_cur + 1] & 0xffffff;
+			else if (command == 0x3e)
+				nz_depth = cmd_data[2 * cmd_cur + 1] & 0xffffff;
+			else if (command == 0x36 && nz_color && nz_color == nz_depth)
+			{
+				nz_drop = true;
+				nz_dropped++;
+			}
+			if (++nz_cmds % 2000000 == 0)
+				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: no z clear: %u depth clears left out\n", nz_dropped);
+		}
+		if (command >= 8 && frontend && !nz_drop && !(FSkip::enabled && FSkip::drop(command, cmd_data[2 * cmd_cur], cmd_data[2 * cmd_cur + 1])))
 		{
 			frontend->enqueue_command(cmd_length * 2, &cmd_data[2 * cmd_cur]);
 			words_since_frame_context += cmd_length * 2;
