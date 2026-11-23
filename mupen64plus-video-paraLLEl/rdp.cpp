@@ -3190,7 +3190,27 @@ void process_commands()
 		// before the command is queued: texture packs queue the draw's replacements ahead of it
 		if (TexKeys::enabled)
 			TexKeys::track(RDP::Op(command), &cmd_data[2 * cmd_cur]);
-		if (command >= 8 && frontend && !(FSkip::enabled && FSkip::drop(command, cmd_data[2 * cmd_cur], cmd_data[2 * cmd_cur + 1])))
+		// N64_DBG_NO_ZCLEAR=1 (measurement only, wrong pictures): fill rectangles into the depth image drawn as the colour
+		// image (every game's depth clear) are left out, so an A/B gives the most a depth-clear fast path could save.
+		static const bool no_zclear = getenv("N64_DBG_NO_ZCLEAR") && *getenv("N64_DBG_NO_ZCLEAR") == '1';
+		static uint32_t nz_color, nz_depth;
+		static unsigned nz_dropped, nz_cmds;
+		bool nz_drop = false;
+		if (no_zclear)
+		{
+			if (command == 0x3f)
+				nz_color = cmd_data[2 * cmd_cur + 1] & 0xffffff;
+			else if (command == 0x3e)
+				nz_depth = cmd_data[2 * cmd_cur + 1] & 0xffffff;
+			else if (command == 0x36 && nz_color && nz_color == nz_depth)
+			{
+				nz_drop = true;
+				nz_dropped++;
+			}
+			if (++nz_cmds % 2000000 == 0)
+				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: no z clear: %u depth clears left out\n", nz_dropped);
+		}
+		if (command >= 8 && frontend && !nz_drop && !(FSkip::enabled && FSkip::drop(command, cmd_data[2 * cmd_cur], cmd_data[2 * cmd_cur + 1])))
 		{
 			frontend->enqueue_command(cmd_length * 2, &cmd_data[2 * cmd_cur]);
 			words_since_frame_context += cmd_length * 2;
