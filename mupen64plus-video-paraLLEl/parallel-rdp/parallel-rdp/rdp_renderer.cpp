@@ -3475,6 +3475,14 @@ bool Renderer::fill_rectangle_fast(uint32_t xh, uint32_t yh, uint32_t xl, uint32
 		resolve_coherency_host_to_gpu(*stream.cmd);
 	}
 	submit_fill_fast(*stream.cmd, uint32_t(y0), uint32_t(y1), color);
+	// Counted as a pass the CPU sees, as flush_queues counts one: submit_to_queue copies written pages back to the
+	// host and gives SyncFull a fence to wait on only when such a pass is pending. Without it a frame whose only GPU
+	// work was this fill (frame skip drops the frame's draws, not its depth clear) never came back: Perfect Dark read
+	// last frame's depth, took its lights as hidden and drew no glare (RG 55G1, RP5; Mali's RDRAM is host-coherent).
+	if (ssrb_live())
+		pending_render_passes_upscaled++;
+	else
+		pending_render_passes++;
 	// The rectangle keeps its primitive number, so the noise seeds of what follows are as before.
 	base_primitive_index++;
 	if (fill_fast_count++ == 0)
