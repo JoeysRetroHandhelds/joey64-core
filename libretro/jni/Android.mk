@@ -107,6 +107,26 @@ ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
 endif
 endif
 
+# foir (mupen64plus-video-paraLLEl/foir, GPL-3.0-or-later): the CPU RDP behind N64_RDP_CPUCOPY. Its own flags
+# (gnu11, wrapping, no strict aliasing, hidden names, every global renamed foir_*), so a static library of its own.
+FOIR_LIB :=
+ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
+  FOIR_LIB := foir
+  FOIR_DIR := $(ROOT_DIR)/mupen64plus-video-paraLLEl/foir
+  include $(CLEAR_VARS)
+  LOCAL_MODULE         := foir
+  LOCAL_SRC_FILES      := $(addprefix $(FOIR_DIR)/,config.c log.c parser.c setup.c raster.c mt.c stats.c overdraw.c tmem.c \
+                          kernels_scalar.c kernels_tex.c kernels_neon.c kneon_comb.c kneon_blend.c kneon_mem.c kneon_tex.c \
+                          spec.c vi.c vi_filter.c)
+  LOCAL_C_INCLUDES     := $(FOIR_DIR)
+  LOCAL_CFLAGS         := -O3 -fwrapv -fno-strict-aliasing -fvisibility=hidden -DFOIR_NEON=1 -DNDEBUG \
+                          -include $(FOIR_DIR)/rename-foir.h -Wno-unused-parameter -Wno-sign-compare
+  LOCAL_CONLYFLAGS     := -std=gnu11
+  LOCAL_ARM_MODE       := arm
+  LOCAL_ARM_NEON       := true
+  include $(BUILD_STATIC_LIBRARY)
+endif
+
 include $(CLEAR_VARS)
 LOCAL_MODULE           := retro
 LOCAL_SRC_FILES        := $(SOURCES_CXX) $(SOURCES_C) $(SOURCES_ASM) $(SOURCES_NASM)
@@ -127,7 +147,7 @@ LOCAL_CFLAGS           += $(N64_XFLAGS)
 LOCAL_CPPFLAGS         += $(N64_XFLAGS)
 LOCAL_LDFLAGS          += $(N64_XLDFLAGS)
 LOCAL_LDLIBS           := -llog -lEGL $(GLLIB) $(CORELDLIBS)
-LOCAL_STATIC_LIBRARIES := $(PRSP_VU_INLINE_LIB)
+LOCAL_STATIC_LIBRARIES := $(PRSP_VU_INLINE_LIB) $(FOIR_LIB)
 LOCAL_CPP_FEATURES     := exceptions
 LOCAL_ARM_MODE         := arm
 LOCAL_ARM_NEON         := true
