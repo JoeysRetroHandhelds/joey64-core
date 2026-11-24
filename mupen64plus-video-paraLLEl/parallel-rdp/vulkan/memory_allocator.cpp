@@ -23,6 +23,16 @@
 #include "memory_allocator.hpp"
 #include "timeline_trace_file.hpp"
 #include "device.hpp"
+#include <stdlib.h>
+
+// Joey64 dev switch N64_VK_ALLOC_LOG=1: log GPU memory allocations of 1 MB and up (what parallel-RDP holds on
+// low-RAM devices).
+static bool joey64_vk_alloc_log()
+{
+	static int on = -1;
+	if (on < 0) { const char *e = getenv("N64_VK_ALLOC_LOG"); on = e && e[0] == '1'; }
+	return on == 1;
+}
 #include <algorithm>
 
 #ifndef _WIN32
@@ -305,10 +315,17 @@ Allocator::Allocator(Util::ObjectPool<MiniHeap> &object_pool)
 		get_class_allocator(MemoryClass::Large, mode).set_sub_block_size(
 			128 * Util::LegionAllocator::NumSubBlocks *
 			Util::LegionAllocator::NumSubBlocks);
-		// 2M chunk
-		get_class_allocator(MemoryClass::Huge, mode).set_sub_block_size(
-			64 * Util::LegionAllocator::NumSubBlocks * Util::LegionAllocator::NumSubBlocks *
-			Util::LegionAllocator::NumSubBlocks);
+		// 2M chunk (Joey64 dev switch N64_VK_HUGE_KB=<n>: n KB, at least the Large class block of 128 KB * 32 / 32;
+		// every allocation mode takes its own block of 32 of these from the device, 64 MB by default).
+		uint32_t huge_sub = 64 * Util::LegionAllocator::NumSubBlocks * Util::LegionAllocator::NumSubBlocks *
+		                    Util::LegionAllocator::NumSubBlocks;
+		if (const char *hk = getenv("N64_VK_HUGE_KB"))
+		{
+			uint32_t kb = uint32_t(strtoul(hk, nullptr, 0));
+			if (kb >= 128 && kb <= 2048 && (kb & (kb - 1)) == 0)
+				huge_sub = kb * 1024;
+		}
+		get_class_allocator(MemoryClass::Huge, mode).set_sub_block_size(huge_sub);
 	}
 }
 
@@ -747,6 +764,9 @@ bool DeviceAllocator::internal_allocate(
 	{
 		heap.size += size;
 		*memory = device_memory;
+		if (joey64_vk_alloc_log())
+			LOGI("vk alloc: new block %.1f MB, memory type %u, heap now %.1f MB\n", double(size) / 1048576.0,
+			     unsigned(memory_type), double(heap.size) / 1048576.0);
 
 		if (host_visible)
 		{

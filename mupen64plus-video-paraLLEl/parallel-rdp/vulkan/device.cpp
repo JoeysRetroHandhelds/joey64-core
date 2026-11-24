@@ -22,6 +22,16 @@
 
 #define NOMINMAX
 #include "device.hpp"
+#include <stdlib.h>
+
+// Joey64 dev switch N64_VK_ALLOC_LOG=1: log GPU memory allocations of 1 MB and up (what parallel-RDP holds on
+// low-RAM devices).
+static bool joey64_vk_alloc_log()
+{
+	static int on = -1;
+	if (on < 0) { const char *e = getenv("N64_VK_ALLOC_LOG"); on = e && e[0] == '1'; }
+	return on == 1;
+}
 #ifdef GRANITE_VULKAN_FOSSILIZE
 #include "device_fossilize.hpp"
 #endif
@@ -3775,6 +3785,9 @@ bool Device::allocate_image_memory(DeviceAllocation *allocation, const ImageCrea
 				return false;
 			}
 		}
+		if (joey64_vk_alloc_log() && reqs.size >= (1u << 20))
+			LOGI("vk alloc: image %ux%ux%u fmt %d levels %u layers %u usage 0x%x: %.1f MB\n", info.width, info.height,
+			     info.depth, int(info.format), info.levels, info.layers, unsigned(info.usage), double(reqs.size) / 1048576.0);
 
 		if (table->vkBindImageMemory(device, image, allocation->get_memory(),
 		                             allocation->get_offset()) != VK_SUCCESS)
@@ -4632,6 +4645,9 @@ BufferHandle Device::create_buffer(const BufferCreateInfo &create_info, const vo
 		}
 	}
 
+	if (joey64_vk_alloc_log() && reqs.memoryRequirements.size >= (1u << 20))
+		LOGI("vk alloc: buffer usage 0x%x domain %d: %.1f MB\n", unsigned(create_info.usage), int(create_info.domain),
+		     double(reqs.memoryRequirements.size) / 1048576.0);
 	if (table->vkBindBufferMemory(device, buffer, allocation.get_memory(), allocation.get_offset()) != VK_SUCCESS)
 	{
 		{
