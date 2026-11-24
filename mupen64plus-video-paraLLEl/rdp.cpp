@@ -47,8 +47,10 @@ static inline bool cpucopy_active() { return false; }
 static inline void cpucopy_reset() {}
 static inline void cpucopy_verify(uint32_t, uint32_t, uint64_t) {}
 static inline void cpucopy_report(char *buf, int n) { if (n) buf[0] = 0; }
+static inline bool cpucopy_answer(uint32_t, uint8_t *) { return false; }
 #endif
 static bool cpucopy_verify_on;
+static bool cpucopy_answer_on; // N64_RDP_CPUCOPY_ANSWER=1 (stage 2): a dynarec load of a page still being drawn gets foir's page
 static uint64_t cpucopy_stamp; // N64_RDP_CPUCOPY: the timeline value the GPU has reached for the pages being unlocked
 // new_dynarec's code cache (weak: absent without the dynarec); its size is NEW_DYNAREC_CACHE_SIZE
 extern "C" __attribute__((weak)) void *base_addr_rx;
@@ -1121,6 +1123,23 @@ static void handler(int sig, siginfo_t *info, void *uc)
 		}
 		bool inside = !(precise || debug || emulate) || touches_locked_range(offset, offset + 8);
 		bool single = (precise || debug || emulate) && from_dynarec(uc);
+		if (cpucopy_answer_on && single && !(locked[offset >> page_shift] & 4) && dynarec_load(uc))
+		{
+			// Stage 2 (N64_RDP_CPUCOPY_ANSWER): foir's bytes for the page instead of the GPU's. The page turns read-only
+			// as a split page (& 8): loads run free, a store waits for the page's SyncFull, and the GPU then writes the
+			// same bytes. A later draw there locks it again (dirty pages with & 8 go back to PROT_NONE at SyncFull).
+			size_t p = offset >> page_shift;
+			uint32_t lo = uint32_t(p << page_shift);
+			if (cpucopy_answer(lo, static_cast<uint8_t *>(g_rdram_alias)))
+			{
+				{
+					Guard g;
+					mprotect(rdram + lo, size_t(1) << page_shift, PROT_READ);
+					locked[p] = (locked[p] & 3) | 8;
+				}
+				return; // the load is retried on the read-only page
+			}
+		}
 		if (emulate && !inside && single && emulate_access(uc, offset))
 		{
 			faults_emulated++;
@@ -1394,9 +1413,15 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 			else if (active_upscaling > 1)
 				log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: cpu copy: 1x only, off at %ux.\n", active_upscaling);
 			else if (cpucopy_init(static_cast<const uint8_t *>(g_rdram_alias), uint32_t(size), cct ? atoi(cct) : 2))
-				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: cpu copy on (foir, %d workers%s).\n", cct ? atoi(cct) : 2,
-				       cpucopy_verify_on ? ", compare" : "");
+			{
+				const char *cca = getenv("N64_RDP_CPUCOPY_ANSWER");
+				cpucopy_answer_on = cca && cca[0] == '1' && !cpucopy_verify_on && precise;
+				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: cpu copy on (foir, %d workers%s%s).\n", cct ? atoi(cct) : 2,
+				       cpucopy_verify_on ? ", compare" : "", cpucopy_answer_on ? ", answers reads" : "");
+			}
 		}
+		else
+			cpucopy_answer_on = false;
 	}
 	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync on (%ld-byte pages%s%s).\n", ps, precise ? (open_window ? ", precise, open window" : ", precise") : "",
 	       stamped ? (split_on ? ", per-SyncFull waits, split waits" : ", per-SyncFull waits") : "");

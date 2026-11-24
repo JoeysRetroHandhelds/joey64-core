@@ -39,6 +39,7 @@ static _Atomic uint64_t cc_ver_pages, cc_ver_bytes, cc_ver_bad, cc_ver_badpages,
     cc_ver_suspect_bad;
 static _Atomic uint32_t cc_ver_first_bad = 0xffffffffu;
 static uint64_t cc_cmds, cc_seed_pages, cc_tex_bytes, cc_ns, cc_released;
+static uint64_t cc_answered, cc_answer_ns;
 
 static uint64_t now_ns(void)
 {
@@ -152,6 +153,19 @@ void cpucopy_reset(void)
     rdp_sync(&cc_rdp);
     memset(cc_owned, 0, (cc_size >> CC_PAGE_SHIFT) + 1);
     memset(cc_suspect, 0, (cc_size >> CC_PAGE_SHIFT) + 1);
+}
+
+/* Stage 2: foir's 4 KB page at `page` into dst + page (real RDRAM through the alias), once foir's pending jobs that write
+ * it are done. False when foir doesn't own the page (its bytes there may be stale): the caller waits for the GPU. */
+bool cpucopy_answer(uint32_t page, uint8_t *dst)
+{
+    if (!cc_on || page + CC_PAGE > cc_size || !cc_owned[page >> CC_PAGE_SHIFT]) return false;
+    uint64_t t0 = now_ns();
+    mt_sync_range(&cc_rdp, page, page + CC_PAGE);
+    memcpy(dst + page, cc_shadow + page, CC_PAGE);
+    cc_answered++;
+    cc_answer_ns += now_ns() - t0;
+    return true;
 }
 
 void cpucopy_release(uint32_t start, uint32_t end)
@@ -337,11 +351,12 @@ void cpucopy_report(char *buf, int n)
     uint32_t first = atomic_exchange(&cc_ver_first_bad, 0xffffffffu);
     snprintf(buf, (size_t)n,
              "cpu copy: %llu commands, %.2f ms of foir on the emulation thread (foir %s), %llu pages seeded, %llu KB of texture copied, "
-             "%llu pages released; verify: %llu pages compared, %llu bytes differ on %llu pages (first 0x%06x), %llu pages not foir's, "
+             "%llu pages released, %llu reads answered (%.2f ms); verify: %llu pages compared, %llu bytes differ on %llu pages (first 0x%06x), %llu pages not foir's, "
              "%llu drawn past the GPU, %llu differ after such a release; bad pages c16/c32/c8/z/? %llu/%llu/%llu/%llu/%llu, "
              "16-bit pixels differ %llu (%llu a step apart), depth words differ %llu; first: foir %016llx gpu %016llx (kind %u)",
              (unsigned long long)cc_cmds, cc_ns / 1e6, mt_stats_delta(&cc_rdp), (unsigned long long)cc_seed_pages, (unsigned long long)(cc_tex_bytes >> 10),
-             (unsigned long long)cc_released, (unsigned long long)atomic_exchange(&cc_ver_pages, 0),
+             (unsigned long long)cc_released, (unsigned long long)cc_answered, cc_answer_ns / 1e6,
+             (unsigned long long)atomic_exchange(&cc_ver_pages, 0),
              (unsigned long long)atomic_exchange(&cc_ver_bad, 0), (unsigned long long)atomic_exchange(&cc_ver_badpages, 0),
              first == 0xffffffffu ? 0 : first, (unsigned long long)atomic_exchange(&cc_ver_unowned, 0),
              (unsigned long long)atomic_exchange(&cc_ver_newer, 0), (unsigned long long)atomic_exchange(&cc_ver_suspect_bad, 0),
@@ -352,5 +367,5 @@ void cpucopy_report(char *buf, int n)
              (unsigned long long)atomic_load(&cc_sample_s), (unsigned long long)atomic_load(&cc_sample_g),
              (unsigned)atomic_load(&cc_sample_kind));
     atomic_exchange(&cc_ver_bytes, 0);
-    cc_cmds = cc_seed_pages = cc_tex_bytes = cc_ns = cc_released = 0;
+    cc_cmds = cc_seed_pages = cc_tex_bytes = cc_ns = cc_released = cc_answered = cc_answer_ns = 0;
 }

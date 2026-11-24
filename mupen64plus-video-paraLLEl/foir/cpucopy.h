@@ -21,6 +21,7 @@ __attribute__((visibility("default"))) void cpucopy_deinit(void);
 __attribute__((visibility("default"))) void cpucopy_command(const uint32_t *words, uint64_t timeline);
 /* The CPU may change [start, end) from now on (smart sync unlocked it, or a store went through the alias). */
 __attribute__((visibility("default"))) void cpucopy_release(uint32_t start, uint32_t end);
+__attribute__((visibility("default"))) bool cpucopy_answer(uint32_t page, uint8_t *dst);
 /* A CPU store done through the alias while the page stays locked (smart sync's emulate path): the same bytes go
  * into the shadow when foir owns the page. Async-signal-safe. */
 __attribute__((visibility("default"))) void cpucopy_store(uint32_t offset, uint32_t bytes, uint64_t value);
