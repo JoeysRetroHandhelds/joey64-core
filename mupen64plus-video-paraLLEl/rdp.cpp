@@ -1440,12 +1440,28 @@ static bool native_now;
 // hidden real frames are now drawn at native size, and whether that was turned off for good.
 static unsigned drew_run;
 static bool real_native, real_off;
+// set_hidden_frame's own: whether the frontend draws skip frames at native size now, and the 1200-frame log's counts.
+static bool skip_set;
+static unsigned frames, native;
+// A new game in the same process starts over (release audit 0.2.7, item 4): after Smash had turned the shown extra frames
+// native, the next game's started native at once, before its own 600 clean frames. RDP::init calls it, as FSkip::init.
+static void init()
+{
+	cur_av = 3;
+	off = false;
+	clean = warm = 0;
+	native_now = false;
+	drew_run = 0;
+	real_native = real_off = false;
+	skip_set = false; // the new frontend draws everything upscaled
+	frames = native = 0;
+}
 }
 void set_hidden_frame(int av)
 {
 	static int allow = -1;
-	static bool last;
-	static unsigned frames, native;
+	bool &last = RaNative::skip_set;
+	unsigned &frames = RaNative::frames, &native = RaNative::native;
 	if (allow < 0)
 	{
 		const char *e = getenv("N64_RA_NATIVE_HIDDEN");
@@ -3375,6 +3391,7 @@ bool init()
 	const char *dup = getenv("N64_RDP_SKIP_DUP");
 	Dup::enabled = !(dup && *dup == '0') && (!Smart::enabled || g_rdram_alias);
 	FSkip::init();
+	RaNative::init();
 	return true;
 }
 
