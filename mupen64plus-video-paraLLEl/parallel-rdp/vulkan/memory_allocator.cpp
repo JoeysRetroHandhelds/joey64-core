@@ -117,8 +117,12 @@ void DeviceAllocation::free_immediate(DeviceAllocator &allocator)
 		free_immediate();
 	else if (base)
 	{
-		allocator.internal_free_no_recycle(size, memory_type, base);
+		if (recyclable_global)
+			allocator.internal_free_global(size, memory_type, mode, base, host_base != nullptr);
+		else
+			allocator.internal_free_no_recycle(size, memory_type, base);
 		base = VK_NULL_HANDLE;
+		recyclable_global = false;
 	}
 }
 
@@ -212,6 +216,7 @@ bool Allocator::allocate_global(uint32_t size, AllocationMode mode, DeviceAlloca
 	alloc->alloc = nullptr;
 	alloc->memory_type = memory_type;
 	alloc->size = size;
+	alloc->recyclable_global = true;
 	return true;
 }
 
@@ -232,6 +237,7 @@ bool Allocator::allocate_dedicated(uint32_t size, AllocationMode mode, DeviceAll
 	alloc->alloc = nullptr;
 	alloc->memory_type = memory_type;
 	alloc->size = size;
+	alloc->recyclable_global = false;
 
 	// If we imported memory instead, do not allow handle export.
 	if (external && !(*external))
@@ -315,10 +321,11 @@ Allocator::Allocator(Util::ObjectPool<MiniHeap> &object_pool)
 		get_class_allocator(MemoryClass::Large, mode).set_sub_block_size(
 			128 * Util::LegionAllocator::NumSubBlocks *
 			Util::LegionAllocator::NumSubBlocks);
-		// 2M chunk (Joey64 dev switch N64_VK_HUGE_KB=<n>: n KB, at least the Large class block of 128 KB * 32 / 32;
-		// every allocation mode takes its own block of 32 of these from the device, 64 MB by default).
-		uint32_t huge_sub = 64 * Util::LegionAllocator::NumSubBlocks * Util::LegionAllocator::NumSubBlocks *
-		                    Util::LegionAllocator::NumSubBlocks;
+		// Joey64: 256 KB chunks, so every allocation mode takes an 8 MB block from the device (Granite's 2 MB chunks
+		// made it 64 MB: parallel-RDP's ~83 MB of buffers held 320-390 MB, real RAM on Mali; 2026-11-24, RG353P / Flip /
+		// Pocket Block / RG 55G1 / RG477M 240-290 MB less, same speed). Dev switch N64_VK_HUGE_KB=<n>: n KB (128-2048,
+		// a power of two), 2048 for Granite's own size.
+		uint32_t huge_sub = 256 * 1024;
 		if (const char *hk = getenv("N64_VK_HUGE_KB"))
 		{
 			uint32_t kb = uint32_t(strtoul(hk, nullptr, 0));
@@ -486,6 +493,44 @@ void DeviceAllocator::internal_free_no_recycle(uint32_t size, uint32_t memory_ty
 	auto &heap = heaps[mem_props.memoryTypes[memory_type].heapIndex];
 	table->vkFreeMemory(device->get_device(), memory, nullptr);
 	heap.size -= size;
+}
+
+// Joey64: a freed allocate_global allocation (bigger than a class block) is kept for the next allocation of the same
+// size (internal_allocate's exact-size reuse), up to kKeepGlobalMax bytes and kKeepGlobalPerSize of one size; bigger
+// ones are freed as before. With 8 MB Huge blocks (N64_VK_HUGE_KB=256) parallel-RDP's 4x scanout image (2560x960, 9.4 MB)
+// is one, made and freed every scanout: freed each time it was a vkAllocateMemory + vkFreeMemory 30 times a second
+// (Odin 2 Portal Turnip, Snap 4x: +0.6 ms a frame).
+void DeviceAllocator::internal_free_global(uint32_t size, uint32_t memory_type, AllocationMode mode, VkDeviceMemory memory, bool is_mapped)
+{
+	static constexpr uint32_t kKeepGlobalMax = 48u * 1024u * 1024u;
+	static constexpr unsigned kKeepGlobalPerSize = 2;
+	if (size > kKeepGlobalMax)
+	{
+		if (is_mapped)
+			table->vkUnmapMemory(device->get_device(), memory);
+		internal_free_no_recycle(size, memory_type, memory);
+		return;
+	}
+
+	internal_free(size, memory_type, mode, memory, is_mapped);
+
+	auto &heap = heaps[mem_props.memoryTypes[memory_type].heapIndex];
+	unsigned same = 0;
+	for (auto &b : heap.blocks)
+		if (b.size == size && b.type == memory_type && b.mode == mode)
+			same++;
+	for (auto itr = heap.blocks.begin(); same > kKeepGlobalPerSize && itr != heap.blocks.end();)
+	{
+		if (itr->size == size && itr->type == memory_type && itr->mode == mode)
+		{
+			table->vkFreeMemory(device->get_device(), itr->memory, nullptr);
+			heap.size -= itr->size;
+			itr = heap.blocks.erase(itr);
+			same--;
+		}
+		else
+			++itr;
+	}
 }
 
 void DeviceAllocator::garbage_collect()

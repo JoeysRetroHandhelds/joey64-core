@@ -140,6 +140,9 @@ private:
 
 	AllocationMode mode = AllocationMode::Count;
 	uint8_t memory_type = 0;
+	// Joey64: a whole-memory allocation made by Allocator::allocate_global (too big for a class block, not dedicated
+	// to an object), which DeviceAllocator may keep for an allocation of the same size instead of freeing it.
+	bool recyclable_global = false;
 
 	void free_global(DeviceAllocator &allocator, uint32_t size, uint32_t memory_type);
 	void free_immediate();
@@ -275,6 +278,7 @@ public:
 	                       VkObjectType object_type, uint64_t dedicated_object, ExternalHandle *external);
 	void internal_free(uint32_t size, uint32_t memory_type, AllocationMode mode, VkDeviceMemory memory, bool is_mapped);
 	void internal_free_no_recycle(uint32_t size, uint32_t memory_type, VkDeviceMemory memory);
+	void internal_free_global(uint32_t size, uint32_t memory_type, AllocationMode mode, VkDeviceMemory memory, bool is_mapped);
 
 private:
 	Util::ObjectPool<MiniHeap> object_pool;
