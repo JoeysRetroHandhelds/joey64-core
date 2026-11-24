@@ -6276,7 +6276,9 @@ static void cop1_assemble(int i,struct regstat *i_regs)
     if(copr==31)
     {
       if(fs>=0) emit_mov(sl,fs);
-      else emit_storereg(FSREG,sl);
+      // Always store fcr31 as well (dento 45de646): the C conversion helpers (cvt.w/l.s/d in fconv_assemble)
+      // read the rounding mode from memory, which stayed stale while FSREG lived in a host register.
+      emit_storereg(FSREG,sl);
       set_rounding_mode(sl,temp);
     }
   }
