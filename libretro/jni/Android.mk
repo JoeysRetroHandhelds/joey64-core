@@ -117,7 +117,7 @@ ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
   LOCAL_MODULE         := foir
   LOCAL_SRC_FILES      := $(addprefix $(FOIR_DIR)/,config.c log.c parser.c setup.c raster.c mt.c stats.c overdraw.c tmem.c \
                           kernels_scalar.c kernels_tex.c kernels_neon.c kneon_comb.c kneon_blend.c kneon_mem.c kneon_tex.c \
-                          spec.c vi.c vi_filter.c)
+                          spec.c vi.c vi_filter.c cpucopy.c)
   LOCAL_C_INCLUDES     := $(FOIR_DIR)
   LOCAL_CFLAGS         := -O3 -fwrapv -fno-strict-aliasing -fvisibility=hidden -DFOIR_NEON=1 -DNDEBUG \
                           -include $(FOIR_DIR)/rename-foir.h -Wno-unused-parameter -Wno-sign-compare

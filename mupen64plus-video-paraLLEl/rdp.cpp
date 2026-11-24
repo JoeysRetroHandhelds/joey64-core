@@ -34,6 +34,21 @@ using namespace std;
 extern retro_log_printf_t log_cb;
 extern retro_environment_t environ_cb;
 extern "C" void *g_rdram_alias;
+// N64_RDP_CPUCOPY: foir's CPU copy of the RDP (foir/cpucopy.h). Stage 1 compares only (N64_RDP_CPUCOPY_VERIFY=1).
+#if defined(__aarch64__) && defined(__ANDROID__)
+#include "foir/cpucopy.h"
+#else
+static inline bool cpucopy_init(const uint8_t *, uint32_t, int) { return false; }
+static inline void cpucopy_deinit() {}
+static inline void cpucopy_command(const uint32_t *) {}
+static inline void cpucopy_release(uint32_t, uint32_t) {}
+static inline void cpucopy_store(uint32_t, uint32_t, uint64_t) {}
+static inline bool cpucopy_active() { return false; }
+static inline void cpucopy_reset() {}
+static inline void cpucopy_verify(uint32_t, uint32_t) {}
+static inline void cpucopy_report(char *buf, int n) { if (n) buf[0] = 0; }
+#endif
+static bool cpucopy_verify_on;
 // new_dynarec's code cache (weak: absent without the dynarec); its size is NEW_DYNAREC_CACHE_SIZE
 extern "C" __attribute__((weak)) void *base_addr_rx;
 
@@ -582,6 +597,7 @@ static bool emulate_access(void *uc, uint32_t offset)
 		case 4: *reinterpret_cast<volatile uint32_t *>(mem) = uint32_t(v); break;
 		default: *reinterpret_cast<volatile uint64_t *>(mem) = v; break;
 		}
+		cpucopy_store(offset, bytes, v); // N64_RDP_CPUCOPY: the page stays locked, so foir's copy takes the store too
 	}
 	else
 	{
@@ -784,6 +800,14 @@ static void protect_runs(F pick, int prot)
 		size_t q = p;
 		while (q < n && pick(q))
 			q++;
+		if ((prot & PROT_WRITE) && cpucopy_active())
+		{
+			// N64_RDP_CPUCOPY: the CPU may write these pages from now on. The GPU is done with them, so compare foir's
+			// copy with what it wrote (_VERIFY), then let foir copy them in again when it next needs them.
+			if (cpucopy_verify_on)
+				cpucopy_verify(uint32_t(p << page_shift), uint32_t(q << page_shift));
+			cpucopy_release(uint32_t(p << page_shift), uint32_t(q << page_shift));
+		}
 		mprotect(rdram + (p << page_shift), (q - p) << page_shift, prot);
 		p = q;
 	}
@@ -929,6 +953,12 @@ static void on_sync_full()
 	if (++sync_count % 600 == 0)
 	{
 		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync: %u CPU waits in the last 600 SyncFulls.\n", faults);
+		if (cpucopy_active())
+		{
+			char ccb[400];
+			cpucopy_report(ccb, sizeof(ccb));
+			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: %s (600 SyncFulls).\n", ccb);
+		}
 		if (early)
 		{
 			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart early: %u waits on pages drawn before their SyncFull, last at 0x%06x\n",
@@ -1155,6 +1185,7 @@ static void handler(int sig, siginfo_t *info, void *uc)
 			size_t p = offset >> page_shift;
 			{
 				Guard g;
+				cpucopy_release(uint32_t(p << page_shift), uint32_t((p + 1) << page_shift));
 				mprotect(rdram + (p << page_shift), size_t(1) << page_shift, PROT_READ | PROT_WRITE);
 				locked[p] = 0;
 				opened[p] = 1;
@@ -1211,6 +1242,7 @@ static void reset_after_drain()
 {
 	if (!enabled)
 		return;
+	cpucopy_reset();
 	unlock_all();
 	fill(dirty.begin(), dirty.end(), 0);
 	drawn.clear();
@@ -1320,6 +1352,26 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 	}
 	enabled = true;
 	::RDP::native_first_allowed.store(true, std::memory_order_relaxed);
+	{
+		// N64_RDP_CPUCOPY=1 (dev, off by default): foir draws every command into its own copy of RDRAM.
+		// Stage 1: N64_RDP_CPUCOPY_VERIFY=1 compares it with the GPU's bytes whenever a page goes back to the CPU.
+		// 1x only (upscaled, RDRAM may hold a downsample); needs the alias (not host-imported RDRAM).
+		const char *cc = getenv("N64_RDP_CPUCOPY");
+		const char *ccv = getenv("N64_RDP_CPUCOPY_VERIFY");
+		const char *cct = getenv("N64_RDP_CPUCOPY_THREADS");
+		cpucopy_verify_on = ccv && ccv[0] == '1';
+		cpucopy_deinit();
+		if (cc && cc[0] == '1')
+		{
+			if (host_imported || !g_rdram_alias)
+				log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: cpu copy: needs the RDRAM alias (not host-imported RDRAM), off.\n");
+			else if (active_upscaling > 1)
+				log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: cpu copy: 1x only, off at %ux.\n", active_upscaling);
+			else if (cpucopy_init(static_cast<const uint8_t *>(g_rdram_alias), uint32_t(size), cct ? atoi(cct) : 2))
+				log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: cpu copy on (foir, %d workers%s).\n", cct ? atoi(cct) : 2,
+				       cpucopy_verify_on ? ", compare" : "");
+		}
+	}
 	log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync on (%ld-byte pages%s%s).\n", ps, precise ? (open_window ? ", precise, open window" : ", precise") : "",
 	       stamped ? (split_on ? ", per-SyncFull waits, split waits" : ", per-SyncFull waits") : "");
 }
@@ -3230,6 +3282,8 @@ void process_commands()
 		{
 			frontend->enqueue_command(cmd_length * 2, &cmd_data[2 * cmd_cur]);
 			words_since_frame_context += cmd_length * 2;
+			if (Smart::enabled && synchronous)
+				cpucopy_command(&cmd_data[2 * cmd_cur]); // N64_RDP_CPUCOPY: foir gets the same commands, in order
 		}
 		if (Smart::enabled && synchronous)
 			Smart::track(RDP::Op(command), w1, cmd_data[2 * cmd_cur + 1]);
