@@ -127,6 +127,8 @@ public:
 	// Synchronization.
 	void flush();
 	uint64_t signal_timeline();
+	// Joey64 (N64_RDP_CPUCOPY): the value the last signal_timeline() returned.
+	uint64_t current_timeline() const { return timeline_value; }
 	void wait_for_timeline(uint64_t index);
 	// Non-blocking: has the GPU work up to this timeline value finished (results written back to RDRAM)?
 	bool timeline_reached(uint64_t index) const { return __atomic_load_n(&thread_timeline_value, __ATOMIC_ACQUIRE) >= index; }

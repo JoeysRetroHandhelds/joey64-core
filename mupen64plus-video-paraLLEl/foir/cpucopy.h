@@ -17,8 +17,8 @@ extern "C" {
 /* alias: a never-protected view of RDRAM (g_rdram_alias). threads: foir workers (0 = none). */
 __attribute__((visibility("default"))) bool cpucopy_init(const uint8_t *alias, uint32_t size, int threads);
 __attribute__((visibility("default"))) void cpucopy_deinit(void);
-/* One RDP command (its words, as given to parallel-RDP), in order. */
-__attribute__((visibility("default"))) void cpucopy_command(const uint32_t *words);
+/* One RDP command (its words, as given to parallel-RDP), in order; timeline: parallel-RDP's last signalled timeline value. */
+__attribute__((visibility("default"))) void cpucopy_command(const uint32_t *words, uint64_t timeline);
 /* The CPU may change [start, end) from now on (smart sync unlocked it, or a store went through the alias). */
 __attribute__((visibility("default"))) void cpucopy_release(uint32_t start, uint32_t end);
 /* A CPU store done through the alias while the page stays locked (smart sync's emulate path): the same bytes go
@@ -28,9 +28,9 @@ __attribute__((visibility("default"))) void cpucopy_store(uint32_t offset, uint3
 __attribute__((visibility("default"))) bool cpucopy_active(void);
 /* Forget everything (a state load, a reset, an upscale change): every page is copied in again when next used. */
 __attribute__((visibility("default"))) void cpucopy_reset(void);
-/* After the GPU finished everything up to now: compare foir's owned bytes in [start, end) with real RDRAM.
+/* After the GPU reached timeline value reached: compare foir's owned bytes in [start, end) with real RDRAM.
  * Async-signal-safe (counters only). */
-__attribute__((visibility("default"))) void cpucopy_verify(uint32_t start, uint32_t end);
+__attribute__((visibility("default"))) void cpucopy_verify(uint32_t start, uint32_t end, uint64_t reached);
 /* A log line's worth of counters since the last call (writes up to n bytes into buf). */
 __attribute__((visibility("default"))) void cpucopy_report(char *buf, int n);
 

@@ -40,15 +40,16 @@ extern "C" void *g_rdram_alias;
 #else
 static inline bool cpucopy_init(const uint8_t *, uint32_t, int) { return false; }
 static inline void cpucopy_deinit() {}
-static inline void cpucopy_command(const uint32_t *) {}
+static inline void cpucopy_command(const uint32_t *, uint64_t) {}
 static inline void cpucopy_release(uint32_t, uint32_t) {}
 static inline void cpucopy_store(uint32_t, uint32_t, uint64_t) {}
 static inline bool cpucopy_active() { return false; }
 static inline void cpucopy_reset() {}
-static inline void cpucopy_verify(uint32_t, uint32_t) {}
+static inline void cpucopy_verify(uint32_t, uint32_t, uint64_t) {}
 static inline void cpucopy_report(char *buf, int n) { if (n) buf[0] = 0; }
 #endif
 static bool cpucopy_verify_on;
+static uint64_t cpucopy_stamp; // N64_RDP_CPUCOPY: the timeline value the GPU has reached for the pages being unlocked
 // new_dynarec's code cache (weak: absent without the dynarec); its size is NEW_DYNAREC_CACHE_SIZE
 extern "C" __attribute__((weak)) void *base_addr_rx;
 
@@ -805,7 +806,7 @@ static void protect_runs(F pick, int prot)
 			// N64_RDP_CPUCOPY: the CPU may write these pages from now on. The GPU is done with them, so compare foir's
 			// copy with what it wrote (_VERIFY), then let foir copy them in again when it next needs them.
 			if (cpucopy_verify_on)
-				cpucopy_verify(uint32_t(p << page_shift), uint32_t(q << page_shift));
+				cpucopy_verify(uint32_t(p << page_shift), uint32_t(q << page_shift), cpucopy_stamp);
 			cpucopy_release(uint32_t(p << page_shift), uint32_t(q << page_shift));
 		}
 		mprotect(rdram + (p << page_shift), (q - p) << page_shift, prot);
@@ -813,9 +814,24 @@ static void protect_runs(F pick, int prot)
 	}
 }
 
-static void unlock_all()
+// N64_RDP_CPUCOPY_VERIFY=2 (diagnosis, slow): before pages are given back, the GPU finishes everything queued, so the
+// compare sees both copies at the same point. Returns that timeline value, else 0. Same signal + wait as the early path.
+static bool cpucopy_strict;
+static uint64_t cpucopy_catch_up()
 {
+	if (!cpucopy_strict || !frontend || !cpucopy_active())
+		return 0;
+	uint64_t v = frontend->signal_timeline();
+	frontend->wait_for_timeline(v);
+	return v;
+}
+
+// reached: the timeline value the GPU is known to have reached (0 = sync_signal, what every plain wait waits for).
+static void unlock_all(uint64_t reached = 0, bool catch_up = true)
+{
+	uint64_t all = catch_up ? cpucopy_catch_up() : 0;
 	Guard g;
+	cpucopy_stamp = all ? all : reached ? reached : sync_signal;
 	if (any_opened)
 	{
 		fill(opened.begin(), opened.end(), 0);
@@ -832,7 +848,9 @@ static void unlock_all()
 // Unlocks the pages (and ranges) locked by SyncFulls up to stamp, which the GPU has reached.
 static void unlock_upto(uint64_t stamp)
 {
+	uint64_t all = cpucopy_catch_up();
 	Guard g;
+	cpucopy_stamp = all ? all : stamp;
 	if (any_opened)
 	{
 		bool still = false;
@@ -955,7 +973,7 @@ static void on_sync_full()
 		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync: %u CPU waits in the last 600 SyncFulls.\n", faults);
 		if (cpucopy_active())
 		{
-			char ccb[400];
+			char ccb[900];
 			cpucopy_report(ccb, sizeof(ccb));
 			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: %s (600 SyncFulls).\n", ccb);
 		}
@@ -1055,6 +1073,13 @@ static void on_sync_full()
 			dirty[p] = 0;
 			any_locked = true;
 		}
+	// N64_RDP_CPUCOPY: a page foir owns that stays unlocked can be written by the CPU, the RSP or a DMA without a fault,
+	// so foir's copy of it can't be trusted: foir copies it in again when it next draws there. (Snap: compare mode found
+	// pages foir owned by the scissor rows that parallel-RDP drew nothing into.)
+	if (cpucopy_active())
+		for (size_t p = 0; p < locked.size(); p++)
+			if (!locked[p])
+				cpucopy_release(uint32_t(p << page_shift), uint32_t((p + 1) << page_shift));
 }
 
 // A rule for new code (audit 3 L6): this handler waits for the GPU (a mutex and condition variable) and posts a
@@ -1127,7 +1152,7 @@ static void handler(int sig, siginfo_t *info, void *uc)
 			frontend->wait_for_timeline(v);
 			faults_early++;
 			early_last = offset;
-			unlock_all();
+			unlock_all(v);
 			faults++;
 			faults_total.fetch_add(1, std::memory_order_relaxed);
 			return;
@@ -1243,7 +1268,7 @@ static void reset_after_drain()
 	if (!enabled)
 		return;
 	cpucopy_reset();
-	unlock_all();
+	unlock_all(0, false);
 	fill(dirty.begin(), dirty.end(), 0);
 	drawn.clear();
 	drawn_split.clear();
@@ -1359,7 +1384,8 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 		const char *cc = getenv("N64_RDP_CPUCOPY");
 		const char *ccv = getenv("N64_RDP_CPUCOPY_VERIFY");
 		const char *cct = getenv("N64_RDP_CPUCOPY_THREADS");
-		cpucopy_verify_on = ccv && ccv[0] == '1';
+		cpucopy_verify_on = ccv && (ccv[0] == '1' || ccv[0] == '2');
+		cpucopy_strict = ccv && ccv[0] == '2';
 		cpucopy_deinit();
 		if (cc && cc[0] == '1')
 		{
@@ -1379,7 +1405,7 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 static void deinit()
 {
 	if (enabled)
-		unlock_all();
+		unlock_all(0, false);
 	enabled = false;
 }
 
@@ -1442,7 +1468,7 @@ void smart_settle()
 		return;
 	if (Smart::any_locked || Smart::any_opened)
 		frontend->wait_for_timeline(Smart::sync_signal);
-	Smart::unlock_all();
+	Smart::unlock_all(0, false);
 }
 
 // Run-ahead's take and put back (libretro.c ra_cow_allowed, audit 3 M2): smart sync's settle, or else a wait for all
@@ -3283,7 +3309,7 @@ void process_commands()
 			frontend->enqueue_command(cmd_length * 2, &cmd_data[2 * cmd_cur]);
 			words_since_frame_context += cmd_length * 2;
 			if (Smart::enabled && synchronous)
-				cpucopy_command(&cmd_data[2 * cmd_cur]); // N64_RDP_CPUCOPY: foir gets the same commands, in order
+				cpucopy_command(&cmd_data[2 * cmd_cur], frontend->current_timeline()); // N64_RDP_CPUCOPY: foir gets the same commands, in order
 		}
 		if (Smart::enabled && synchronous)
 			Smart::track(RDP::Op(command), w1, cmd_data[2 * cmd_cur + 1]);
