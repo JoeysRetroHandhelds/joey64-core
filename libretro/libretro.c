@@ -2464,6 +2464,60 @@ static int ra_cow_allowed(void)
    return 0;
 }
 
+/* Joey64 netplay rollback prototype (2026-11-24): GET_SAVESTATE_CONTEXT ROLLBACK_NETPLAY. The app keeps many and
+ * loads one from several frames back, so none of run-ahead's one-step shortcuts: a full RDRAM copy (no copy-on-write),
+ * no RSP side copy (a state with an RSP task running is refused; the app goes back to an earlier one), the RDP's
+ * drawing settled into RDRAM before the take and the put back. The RDP's own hidden state (registers, TMEM) isn't
+ * kept: a known gap of the prototype, it changes the picture only. */
+static bool rb_context(void)
+{
+   int ctx = 0;
+   return environ_cb(RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT, &ctx) && ctx == RETRO_SAVESTATE_CONTEXT_ROLLBACK_NETPLAY;
+}
+static int rb_ra_context(void)
+{
+   ra_cow_allowed(); /* sets savestates_rdp_settle */
+   return 1;
+}
+/* What a state file leaves out (the RSP's registers and DMA queue, the audio queue, the HLE audio lists), kept for
+ * each rollback state by its number (savestates_ra_gen) and put back with it: the loader's guesses changed when
+ * audio interrupts came, and the games went out of step. */
+#define RB_SIDE_SLOTS 64
+static struct { uint32_t gen, task_locked, unsafe; int rsp_ok, hle_ok; unsigned char rsp[2048];
+   struct sp_dma sp_fifo[SP_DMA_FIFO_SIZE]; struct ai_dma ai_fifo[AI_DMA_FIFO_SIZE]; unsigned ai_format_changed;
+   unsigned char hle[0x3000]; } rb_side[RB_SIDE_SLOTS];
+static void rb_side_save(uint32_t gen)
+{
+   typeof(rb_side[0]) *s = &rb_side[gen % RB_SIDE_SLOTS];
+   s->gen = gen;
+   s->task_locked = g_dev.sp.rsp_task_locked;
+   s->unsafe = g_dev.r4300.cp0.interrupt_unsafe_state;
+   s->rsp_ok = current_rsp_type == RSP_PLUGIN_PARALLEL && parallel_rsp_state_size() <= sizeof(s->rsp);
+   if (s->rsp_ok)
+      parallel_rsp_state_save(s->rsp);
+   s->hle_ok = hle_ra_state_size() <= sizeof(s->hle);
+   if (s->hle_ok)
+      hle_ra_state_save(s->hle);
+   memcpy(s->sp_fifo, g_dev.sp.fifo, sizeof(s->sp_fifo));
+   memcpy(s->ai_fifo, g_dev.ai.fifo, sizeof(s->ai_fifo));
+   s->ai_format_changed = g_dev.ai.samples_format_changed;
+}
+static void rb_side_load(uint32_t gen)
+{
+   typeof(rb_side[0]) *s = &rb_side[gen % RB_SIDE_SLOTS];
+   if (!gen || s->gen != gen)
+      return;
+   g_dev.sp.rsp_task_locked = s->task_locked;
+   g_dev.r4300.cp0.interrupt_unsafe_state = s->unsafe;
+   if (s->rsp_ok)
+      parallel_rsp_state_load(s->rsp);
+   if (s->hle_ok)
+      hle_ra_state_load(s->hle);
+   memcpy(g_dev.sp.fifo, s->sp_fifo, sizeof(s->sp_fifo));
+   memcpy(g_dev.ai.fifo, s->ai_fifo, sizeof(s->ai_fifo));
+   g_dev.ai.samples_format_changed = s->ai_format_changed;
+}
+
 bool retro_serialize(void *data, size_t size)
 {
    if (initializing)
@@ -2516,13 +2570,14 @@ bool retro_serialize(void *data, size_t size)
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
       hle_ctx = ra_hle_context();
+      const bool rb = !same && rb_context();
       savestates_ra_gen = 0;
-      if (same || hle_ctx)
+      if (same || hle_ctx || rb)
       {
          if (++ra_gen_next == 0) ++ra_gen_next;
          savestates_ra_gen = ra_gen_next;
       }
-      savestates_ra_context = same ? 1 + ra_cow_allowed() : 0;
+      savestates_ra_context = same ? 1 + ra_cow_allowed() : rb_context() ? rb_ra_context() : 0;
       ok = savestates_save_m64p(&g_dev, data) && retro_savestate_result;
       savestates_ra_context = 0;
       ra_side.valid = 0;
@@ -2547,6 +2602,8 @@ bool retro_serialize(void *data, size_t size)
          ra_side.gen = savestates_ra_gen;
          ra_side.valid = 1;
       }
+      if (ok && rb)
+         rb_side_save(savestates_ra_gen);
       savestates_ra_gen = 0;
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
@@ -2610,7 +2667,7 @@ bool retro_unserialize(const void *data, size_t size)
       uint32_t gen;
       if (current_rdp_type == RDP_PLUGIN_GLIDEN64)
          glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
-      savestates_ra_context = ra_same_instance() ? 1 + ra_cow_allowed() : 0;
+      savestates_ra_context = ra_same_instance() ? 1 + ra_cow_allowed() : rb_context() ? rb_ra_context() : 0;
       ret = savestates_load_m64p(&g_dev, data);
       savestates_ra_context = 0;
       /* ra_side and ra_hle only with the run-ahead state they were taken with (audit 3 L2) */
@@ -2627,6 +2684,8 @@ bool retro_unserialize(const void *data, size_t size)
       }
       if (ret && gen && ra_hle.valid && ra_hle.gen == gen && ra_hle_context())
          hle_ra_state_load(ra_hle.buf);
+      if (ret && gen && rb_context())
+         rb_side_load(gen);
       /* states at the frame's end are taken with no display list in part (retro_serialize): none now either */
       if (ret && current_rdp_type == RDP_PLUGIN_PARALLEL)
       {

@@ -182,6 +182,107 @@ static struct { int have; uint32_t r, h; int off_r; uint8_t n; uint32_t at[12]; 
 static int l_own_local = 1;
 static int np_after(uint32_t a, uint32_t b) { return (int32_t)(a - b) > 0; }
 
+//Joey64 (2026-11-24, rollback prototype; Joey: "Yes, prototype it"; dev switch N64_NETPLAY_ROLLBACK=<counts>, 2-60):
+//an input not here yet is guessed (that player's newest one heard) instead of waited for, up to <counts> past the
+//first count still missing. Every input used, heard or guessed, is kept by count in l_hist. When one heard later
+//differs from the guess used, l_rb_bad keeps the earliest such count; the app then loads the state it took before
+//that count (joey64_netplay_rb_mark / _restore) and runs the frames again with what was heard. While it does
+//(l_rb_replaying) nothing goes out: our inputs went the first time, and requests and the desync check wait.
+#define NP_HIST 256
+struct np_hist { uint32_t count, keys, used_keys; uint8_t real, used, plugin, used_plugin; };
+static struct np_hist l_hist[4][NP_HIST];
+static int l_rb_window;
+static int l_rb_replaying;
+static uint32_t l_rb_done[4];                      // every input below this count is heard
+static uint32_t l_rb_last_keys[4], l_rb_last_count[4];
+static uint8_t l_rb_last_plugin[4], l_rb_have_last[4];
+static uint8_t l_rb_bad_mask;
+static uint32_t l_rb_bad[4];
+static uint64_t l_rb_rtt_us;                       // smoothed round trip of input requests
+static uint32_t l_rb_stall_vi;                     // the VI of the last frame held back to let the others catch up
+static uint32_t l_rb_floor[4];                     // the input counts of the oldest state the app keeps
+static int l_rb_floor_set;
+//One input per player per frame with rollback (the room's counts are frames): a game reads the pad 0, 1 or more times
+//a frame, so counts per read made "how far back" in inputs differ from frames (Mario Kart 64 reads every other frame;
+//wrong guesses older than every kept state, and both games holding frames for each other). Reads in a frame all get
+//that frame's input; the frame's end uses (and sends our own) one for any player the game didn't read.
+static uint8_t l_rb_read[4], l_rb_sent[4];
+static uint32_t l_rb_frame_keys[4], l_rb_own_last[4];
+static struct { uint32_t guessed, wrong, stalls, waits; } l_rbs;
+//the desync check's CP0 copy waits until every input before it is heard and none was guessed wrong
+static struct { int have; uint32_t vi, counts[4]; int len; uint8_t data[CP0_REGS_COUNT * 4 + 5]; } l_rb_sync;
+static uint32_t l_rb_sync_sent_vi;
+static int l_rb_sync_sent;
+
+static struct np_hist *hist_at(uint8_t p, uint32_t c)
+{
+    struct np_hist *h = &l_hist[p][c % NP_HIST];
+    return h->count == c && (h->real || h->used) ? h : NULL;
+}
+
+static struct np_hist *hist_new(uint8_t p, uint32_t c)
+{
+    struct np_hist *h = &l_hist[p][c % NP_HIST];
+    if (h->count != c || !(h->real || h->used))
+    {
+        memset(h, 0, sizeof *h);
+        h->count = c;
+    }
+    return h;
+}
+
+//a heard input (from the room, or our own placed where the room puts it)
+static void rb_put(uint8_t p, uint32_t c, uint32_t keys, uint8_t plugin)
+{
+    const uint32_t n = l_cin_compats[p].netplay_count;
+    if ((int32_t)(c - n) >= NP_HIST / 2 || (int32_t)(n - c) >= NP_HIST / 2)
+        return; // outside what the history holds
+    struct np_hist *h = hist_new(p, c);
+    if (h->real)
+    {
+        ++l_ns.dup;
+        return;
+    }
+    h->real = 1;
+    h->keys = keys;
+    h->plugin = plugin;
+    ++l_ns.heard;
+    if (h->used && (h->used_keys != keys || h->used_plugin != plugin))
+    {
+        if (!(l_rb_bad_mask & (1u << p)) || np_after(l_rb_bad[p], c))
+            l_rb_bad[p] = c;
+        l_rb_bad_mask |= (uint8_t)(1u << p);
+        ++l_rbs.wrong;
+    }
+    if (!l_rb_have_last[p] || np_after(c, l_rb_last_count[p]))
+    {
+        l_rb_have_last[p] = 1;
+        l_rb_last_count[p] = c;
+        l_rb_last_keys[p] = keys;
+        l_rb_last_plugin[p] = plugin;
+    }
+    struct np_hist *d;
+    while ((d = hist_at(p, l_rb_done[p])) != NULL && d->real)
+        ++l_rb_done[p];
+}
+
+static np_packet *l_check_sync_packet;
+
+static void rb_try_sync(void)
+{
+    if (!l_rb_sync.have || l_rb_replaying || l_rb_bad_mask)
+        return;
+    for (int p = 0; p < 4; ++p)
+        if (Controls[p].Present && np_after(l_rb_sync.counts[p], l_rb_done[p]))
+            return;
+    memcpy(l_check_sync_packet->data, l_rb_sync.data, l_rb_sync.len);
+    l_check_sync_packet->len = l_rb_sync.len;
+    SDLNet_UDP_Send(l_udpSocket, l_udpChannel, l_check_sync_packet);
+    l_rb_sync_sent_vi = l_rb_sync.vi;
+    l_rb_sync_sent = 1;
+    l_rb_sync.have = 0;
+}
+
 //UDP packets
 static np_packet l_packets[4];
 static np_packet *l_request_input_packet;
@@ -277,6 +378,28 @@ m64p_error netplay_start(const char* host, int port)
         l_own_local = !(e && e[0] == '0');
         log_cb(RETRO_LOG_INFO, "Netplay: own inputs %s\n", l_own_local ? "used at once where the room says they go" : "through the room (N64_NETPLAY_LOCAL=0)");
     }
+    {
+        const char *e = getenv("N64_NETPLAY_ROLLBACK");
+        l_rb_window = e && *e ? atoi(e) : 0;
+        if (l_rb_window && l_rb_window < 2) l_rb_window = 2;
+        if (l_rb_window > 60) l_rb_window = 60;
+        memset(l_hist, 0, sizeof l_hist);
+        memset(l_rb_done, 0, sizeof l_rb_done);
+        memset(l_rb_have_last, 0, sizeof l_rb_have_last);
+        memset(&l_rbs, 0, sizeof l_rbs);
+        memset(&l_rb_sync, 0, sizeof l_rb_sync);
+        l_rb_bad_mask = 0;
+        l_rb_replaying = 0;
+        l_rb_rtt_us = 0;
+        l_rb_stall_vi = 0;
+        l_rb_sync_sent = 0;
+        l_rb_floor_set = 0;
+        memset(l_rb_read, 0, sizeof l_rb_read);
+        memset(l_rb_sent, 0, sizeof l_rb_sent);
+        memset(l_rb_own_last, 0, sizeof l_rb_own_last);
+        if (l_rb_window)
+            log_cb(RETRO_LOG_INFO, "Netplay: rollback on, guessing up to %d inputs ahead (N64_NETPLAY_ROLLBACK)\n", l_rb_window);
+    }
 
     l_canFF = 0;
     l_netplay_controller = 0;
@@ -340,6 +463,14 @@ static uint8_t buffer_size(uint8_t control_id)
 {
     //This function returns the size of the local input buffer
     uint8_t counter = 0;
+    if (l_rb_window)
+    {
+        const uint32_t n = l_cin_compats[control_id].netplay_count;
+        struct np_hist *h;
+        while (counter < 250 && (h = hist_at(control_id, n + counter)) != NULL && h->real)
+            ++counter;
+        return counter;
+    }
     struct netplay_event* current = l_cin_compats[control_id].event_first;
     while (current != NULL)
     {
@@ -372,7 +503,14 @@ static void netplay_request_input(uint8_t control_id)
     l_request_input_packet->data[0] = UDP_REQUEST_KEY_INFO;
     l_request_input_packet->data[1] = control_id; //The player we need input for
     SDLNet_Write32(l_reg_id, &l_request_input_packet->data[2]); //our registration ID
-    SDLNet_Write32(l_cin_compats[control_id].netplay_count, &l_request_input_packet->data[6]); //the current event count
+    //Joey64 rollback: from the first input still missing, not the current count: a guessed one lost on the way
+    //(passed without waiting) would otherwise never be sent again
+    {
+        uint32_t from = l_cin_compats[control_id].netplay_count;
+        if (l_rb_window && np_after(from, l_rb_done[control_id]))
+            from = l_rb_done[control_id];
+        SDLNet_Write32(from, &l_request_input_packet->data[6]); //the current event count
+    }
     l_request_input_packet->data[10] = l_spectator; //whether we are a spectator
     l_request_input_packet->data[11] = buffer_size(control_id); //our local buffer size
     l_request_input_packet->len = 12;
@@ -435,6 +573,7 @@ static void netplay_process()
                     {
                         uint64_t rtt = np_us() - l_ns.req_at[player];
                         l_ns.rtt_sum += rtt; ++l_ns.rtt_n;
+                        l_rb_rtt_us = l_rb_rtt_us ? (l_rb_rtt_us * 7 + rtt) / 8 : rtt;
                         if (rtt > l_ns.rtt_max) l_ns.rtt_max = rtt;
                         l_ns.req_at[player] = 0;
                     }
@@ -466,6 +605,15 @@ static void netplay_process()
                 {
                     count = SDLNet_Read32(&l_process_packet->data[curr]);
                     curr += 4;
+
+                    if (l_rb_window)
+                    {
+                        keys = SDLNet_Read32(&l_process_packet->data[curr]);
+                        plugin = netplay_validate_plugin(player, l_process_packet->data[curr + 4]);
+                        curr += 5;
+                        rb_put(player, count, keys, plugin);
+                        continue;
+                    }
 
                     if (((count - l_cin_compats[player].netplay_count) > (UINT32_MAX / 2)) || (check_valid(player, count))) //event doesn't need to be recorded
                     {
@@ -531,12 +679,67 @@ static void netplay_process()
 
 static void netplay_resend_inputs(void);
 
+//Joey64: with rollback, the input is here, or near enough past the first missing one to be guessed
+static int have_input(uint8_t control_id)
+{
+    const uint32_t c = l_cin_compats[control_id].netplay_count;
+    if (!l_rb_window)
+        return check_valid(control_id, c);
+    struct np_hist *h = hist_at(control_id, c);
+    if (h && h->real)
+        return 1;
+    //guess only while the app still keeps a state from before the first missing input (else a wrong guess there
+    //couldn't be undone: the games would go out of step)
+    //(2 to spare: the app drops its oldest state every frame while the input may still be missing, and a game that
+    //reads the pad every other frame moves on 2 frames between reads; seen 2026-11-24: count 114 guessed wrong with the
+    //oldest state at 115)
+    if (!l_rb_floor_set || np_after(l_rb_floor[control_id] + 2, l_rb_done[control_id]))
+        return 0;
+    return (int32_t)(c - l_rb_done[control_id]) < l_rb_window;
+}
+
+/* Joey64 rollback: for each player, the first input still missing when a guess past it was used (else its next
+ * count: nothing to undo). A state from before it has to stay; the app holds the frame while it would drop the last. */
+__attribute__((visibility("default"))) void joey64_netplay_rb_need(uint32_t *out)
+{
+    for (int p = 0; p < 4; ++p)
+    {
+        const uint32_t n = l_cin_compats ? l_cin_compats[p].netplay_count : 0;
+        out[p] = Controls[p].Present && np_after(n, l_rb_done[p]) ? l_rb_done[p] : n;
+    }
+}
+
+/* Joey64 rollback: read the room for up to ms (asking for what's missing), while the app holds a frame */
+__attribute__((visibility("default"))) int joey64_netplay_rb_pump(int ms)
+{
+    if (l_udpChannel == -1)
+        return 0;
+    netplay_resend_inputs();
+    for (uint8_t p = 0; p < 4; ++p)
+        if (Controls[p].Present && l_cin_compats && np_after(l_cin_compats[p].netplay_count, l_rb_done[p]))
+            netplay_request_input(p);
+    struct pollfd pfd = { np_udp, POLLIN, 0 };
+    poll(&pfd, 1, ms);
+    netplay_process();
+    return np_ticks() - l_last_heard < 10000;
+}
+
+/* Joey64 rollback: the input counts of the oldest state the app keeps, each frame */
+__attribute__((visibility("default"))) void joey64_netplay_rb_floor(const uint32_t *counts)
+{
+    for (int p = 0; p < 4; ++p)
+        l_rb_floor[p] = counts[p];
+    l_rb_floor_set = 1;
+}
+
 static int netplay_ensure_valid(uint8_t control_id)
 {
     //This function makes sure we have data for a certain event
     //If we don't have the data, it will create a new thread that will request the data
-    if (check_valid(control_id, l_cin_compats[control_id].netplay_count))
+    if (have_input(control_id))
         return 1;
+    if (l_rb_window)
+        ++l_rbs.waits;
 
     if (l_udpChannel == -1)
         return 0;
@@ -549,7 +752,7 @@ static int netplay_ensure_valid(uint8_t control_id)
     uint32_t asked = start;
     int said = 0;
     l_last_heard = start;
-    while (!check_valid(control_id, l_cin_compats[control_id].netplay_count))
+    while (!have_input(control_id))
     {
         const uint32_t now = np_ticks();
         if (l_udpChannel == -1 || now - l_last_heard > 10000)
@@ -610,6 +813,22 @@ static void netplay_log_stats(void)
            "%u inputs heard, %u copies, %u requests, %u packets, %u own placed in %.1f s, lag %u/%u/%u/%u\n",
            l_ns.waits, l_ns.wait_ms, l_ns.wait_max, l_ns.heard, l_ns.dup, l_ns.sent_req, l_ns.packets, l_ns.own,
            (now - l_ns.since) / 1000.0, l_player_lag[0], l_player_lag[1], l_player_lag[2], l_player_lag[3]);
+    if (l_rb_window)
+    {
+        log_cb(RETRO_LOG_INFO, "Netplay: rollback: %u inputs guessed, %u guessed wrong, %u waits (too far ahead), "
+               "%u frames held back, round trip %.1f ms\n",
+               l_rbs.guessed, l_rbs.wrong, l_rbs.waits, l_rbs.stalls, l_rb_rtt_us / 1000.0);
+        for (int p = 0; p < 4; ++p)
+        {
+            if (!Controls[p].Present || !l_cin_compats)
+                continue;
+            const uint32_t n = l_cin_compats[p].netplay_count, d = l_rb_done[p];
+            struct np_hist *h = &l_hist[p][d % NP_HIST];
+            log_cb(RETRO_LOG_INFO, "Netplay: rollback: player %d at %u, all heard below %u (slot holds %u real %u used %u), newest heard %u\n",
+                   p + 1, n, d, h->count, h->real, h->used, l_rb_last_count[p]);
+        }
+        memset(&l_rbs, 0, sizeof l_rbs);
+    }
     uint64_t keep[4];
     memcpy(keep, l_ns.req_at, sizeof keep);
     memset(&l_ns, 0, sizeof l_ns);
@@ -617,10 +836,83 @@ static void netplay_log_stats(void)
     l_ns.since = now;
 }
 
+//Joey64 rollback: hold this frame back (about a frame's wait) when we're well ahead of player p's game: where it is
+//now is its newest input heard, less the room's delay, plus half the round trip. Both games run at the same rate,
+//so without this one that started first stays ahead and guesses (and rolls back) for both. At most every 20 VIs.
+static void rb_time_sync(uint8_t p, uint32_t c)
+{
+    if (!l_rb_have_last[p] || l_vi_counter - l_rb_stall_vi < 20)
+        return;
+    int delay = 0;
+    for (int i = 0; i < 4; ++i)
+        if (l_netplay_control[i] != -1 && l_plan[i].have) { delay = l_plan[i].off_r; break; }
+    const double half = l_rb_rtt_us / 2.0 / 16683.0;
+    const double lead = (double)(int32_t)(c - l_rb_last_count[p]) + delay - half;
+    if (lead < 1.5)
+        return;
+    l_rb_stall_vi = l_vi_counter;
+    ++l_rbs.stalls;
+    const uint32_t start = np_ticks();
+    while (np_ticks() - start < 16)
+    {
+        struct pollfd pfd = { np_udp, POLLIN, 0 };
+        poll(&pfd, 1, 2);
+        netplay_process();
+    }
+}
+
+static uint32_t rb_get_input(uint8_t p)
+{
+    const uint32_t c = l_cin_compats[p].netplay_count;
+    struct np_hist *h = hist_at(p, c);
+    if (!l_rb_replaying && !(h && h->real))
+    {
+        rb_time_sync(p, c);
+        if (!netplay_ensure_valid(p))
+        {
+            log_cb(RETRO_LOG_INFO, "Netplay: lost connection to server\n");
+            main_core_state_set(M64CORE_EMU_STATE, M64EMU_STOPPED);
+            return 0;
+        }
+        h = hist_at(p, c);
+    }
+    uint32_t keys;
+    uint8_t plugin;
+    if (h && h->real)
+    {
+        keys = h->keys;
+        plugin = h->plugin;
+    }
+    else
+    {
+        keys = l_rb_have_last[p] ? l_rb_last_keys[p] : 0;
+        plugin = l_rb_have_last[p] ? l_rb_last_plugin[p] : Controls[p].Plugin;
+        ++l_rbs.guessed;
+    }
+    h = hist_new(p, c);
+    h->used = 1;
+    h->used_keys = keys;
+    h->used_plugin = plugin;
+    Controls[p].Plugin = plugin;
+    ++l_cin_compats[p].netplay_count;
+    rb_try_sync();
+    return keys;
+}
+
 static uint32_t netplay_get_input(uint8_t control_id)
 {
     uint32_t keys;
     struct retro_fastforwarding_override ff_override;
+
+    if (l_rb_window && l_rb_read[control_id])
+        return l_rb_frame_keys[control_id]; // this frame's input, read again
+    if (l_rb_window && l_rb_replaying)
+    {
+        netplay_process();
+        l_rb_frame_keys[control_id] = rb_get_input(control_id);
+        l_rb_read[control_id] = 1;
+        return l_rb_frame_keys[control_id];
+    }
 
     netplay_log_stats();
 
@@ -652,6 +944,13 @@ static uint32_t netplay_get_input(uint8_t control_id)
         environ_cb(RETRO_ENVIRONMENT_SET_FASTFORWARDING_OVERRIDE, &ff_override);
 
         l_canFF = 0;
+    }
+
+    if (l_rb_window)
+    {
+        l_rb_frame_keys[control_id] = rb_get_input(control_id);
+        l_rb_read[control_id] = 1;
+        return l_rb_frame_keys[control_id];
     }
 
     if (netplay_ensure_valid(control_id))
@@ -717,6 +1016,13 @@ static void netplay_resend_inputs(void)
 
 static void np_add_event(uint8_t id, uint32_t slot, uint32_t keys, uint8_t plugin)
 {
+    if (l_rb_window)
+    {
+        if (!check_valid(id, slot) && !np_after(l_cin_compats[id].netplay_count, slot))
+            ++l_ns.own;
+        rb_put(id, slot, keys, plugin);
+        return;
+    }
     if (np_after(l_cin_compats[id].netplay_count, slot) || check_valid(id, slot) || buffer_size(id) >= NETPLAY_MAX_PENDING_EVENTS)
         return;
     struct netplay_event* e = (struct netplay_event*)malloc(sizeof(struct netplay_event));
@@ -940,6 +1246,22 @@ void netplay_check_sync(struct cp0* cp0)
     if (!netplay_is_init())
         return;
 
+    if (l_rb_window && l_cin_compats)
+    {
+        //the frame's end (see l_rb_read): our own input goes out for this frame's count if the game didn't read the
+        //pad, and every player's count moves on by one
+        for (uint8_t p = 0; p < 4; ++p)
+        {
+            if (!Controls[p].Present)
+                continue;
+            if (l_netplay_control[p] != -1 && !l_rb_sent[p] && !l_rb_replaying)
+                netplay_send_input(p, l_rb_own_last[p]);
+            if (!l_rb_read[p])
+                ++l_cin_compats[p].netplay_count; // an input nobody reads: no guess to check, nothing to wait for
+            l_rb_read[p] = l_rb_sent[p] = 0;
+        }
+    }
+
     if (l_vi_counter % 600 == 0)
     {
         const uint32_t* cp0_regs = r4300_cp0_regs(cp0);
@@ -951,10 +1273,62 @@ void netplay_check_sync(struct cp0* cp0)
             SDLNet_Write32(cp0_regs[i], &l_check_sync_packet->data[(i * 4) + 5]);
         }
         l_check_sync_packet->len = l_check_sync_packet_size;
-        SDLNet_UDP_Send(l_udpSocket, l_udpChannel, l_check_sync_packet);
+        if (!l_rb_window)
+            SDLNet_UDP_Send(l_udpSocket, l_udpChannel, l_check_sync_packet);
+        else if (!l_rb_sync_sent || np_after(l_vi_counter, l_rb_sync_sent_vi))
+        {
+            //rollback: kept until every input before here is heard and right (a frame run again replaces it)
+            l_rb_sync.have = 1;
+            l_rb_sync.vi = l_vi_counter;
+            for (int p = 0; p < 4; ++p)
+                l_rb_sync.counts[p] = l_cin_compats ? l_cin_compats[p].netplay_count : 0;
+            l_rb_sync.len = l_check_sync_packet_size;
+            memcpy(l_rb_sync.data, l_check_sync_packet->data, l_check_sync_packet_size);
+        }
     }
 
     ++l_vi_counter;
+    if (l_rb_window)
+        rb_try_sync();
+}
+
+/* Joey64 rollback (see l_hist): the app keeps each frame's state with these numbers and puts them back with it. */
+__attribute__((visibility("default"))) int joey64_netplay_rb_window(void)
+{
+    return l_netplay_is_init ? l_rb_window : 0;
+}
+
+/* out[0-3]: each player's next input count, out[4]: the VI count */
+__attribute__((visibility("default"))) void joey64_netplay_rb_mark(uint32_t *out)
+{
+    for (int p = 0; p < 4; ++p)
+        out[p] = l_cin_compats ? l_cin_compats[p].netplay_count : 0;
+    out[4] = l_vi_counter;
+}
+
+__attribute__((visibility("default"))) void joey64_netplay_rb_restore(const uint32_t *in)
+{
+    if (l_cin_compats)
+        for (int p = 0; p < 4; ++p)
+            l_cin_compats[p].netplay_count = in[p];
+    l_vi_counter = in[4];
+    memset(l_rb_read, 0, sizeof l_rb_read);
+    memset(l_rb_sent, 0, sizeof l_rb_sent);
+}
+
+/* the players with an input guessed wrong since the last call, and for each the earliest such count */
+__attribute__((visibility("default"))) unsigned joey64_netplay_rb_bad(uint32_t *counts)
+{
+    unsigned m = l_rb_bad_mask;
+    for (int p = 0; p < 4; ++p)
+        counts[p] = l_rb_bad[p];
+    l_rb_bad_mask = 0;
+    return m;
+}
+
+__attribute__((visibility("default"))) void joey64_netplay_rb_replaying(int on)
+{
+    l_rb_replaying = on;
 }
 
 void netplay_read_registration(struct controller_input_compat* cin_compats)
@@ -1002,6 +1376,8 @@ void netplay_read_registration(struct controller_input_compat* cin_compats)
 
 static void netplay_send_raw_input(struct pif* pif)
 {
+    if (l_rb_replaying)
+        return; // a frame run again: its inputs went out the first time
     for (int i = 0; i < 4; ++i)
     {
         if (l_netplay_control[i] != -1)
@@ -1010,7 +1386,16 @@ static void netplay_send_raw_input(struct pif* pif)
              && (*pif->channels[i].tx & 0x3f) == 1
              && (*pif->channels[i].rx & 0x3f) == 4
              && pif->channels[i].tx_buf[0] == JCMD_CONTROLLER_READ)
+            {
+                if (l_rb_window)
+                {
+                    if (l_rb_sent[i])
+                        continue; // one input a frame
+                    l_rb_sent[i] = 1;
+                    l_rb_own_last[i] = *(uint32_t*)pif->channels[i].rx_buf;
+                }
                 netplay_send_input(i, *(uint32_t*)pif->channels[i].rx_buf);
+            }
         }
     }
 }
