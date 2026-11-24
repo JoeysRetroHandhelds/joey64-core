@@ -47,7 +47,7 @@ static inline bool cpucopy_active() { return false; }
 static inline void cpucopy_reset() {}
 static inline void cpucopy_verify(uint32_t, uint32_t, uint64_t) {}
 static inline void cpucopy_report(char *buf, int n) { if (n) buf[0] = 0; }
-static inline bool cpucopy_answer(uint32_t, uint8_t *) { return false; }
+static inline const uint8_t *cpucopy_answer(uint32_t) { return nullptr; }
 #endif
 static bool cpucopy_verify_on;
 static bool cpucopy_answer_on; // N64_RDP_CPUCOPY_ANSWER=1 (stage 2): a dynarec load of a page still being drawn gets foir's page
@@ -1130,8 +1130,18 @@ static void handler(int sig, siginfo_t *info, void *uc)
 			// same bytes. A later draw there locks it again (dirty pages with & 8 go back to PROT_NONE at SyncFull).
 			size_t p = offset >> page_shift;
 			uint32_t lo = uint32_t(p << page_shift);
-			if (cpucopy_answer(lo, static_cast<uint8_t *>(g_rdram_alias)))
+			const uint8_t *src = cpucopy_answer(lo);
+			if (src)
 			{
+				uint8_t *alias = static_cast<uint8_t *>(g_rdram_alias);
+				uint32_t hi = lo + (1u << page_shift);
+				for (auto &r : locked_ranges)
+				{
+					uint32_t s = max(r.start, lo), e = min(r.end, hi);
+					if (s < e)
+						memcpy(alias + s, src + s, e - s);
+				}
+
 				{
 					Guard g;
 					mprotect(rdram + lo, size_t(1) << page_shift, PROT_READ);

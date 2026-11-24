@@ -155,17 +155,17 @@ void cpucopy_reset(void)
     memset(cc_suspect, 0, (cc_size >> CC_PAGE_SHIFT) + 1);
 }
 
-/* Stage 2: foir's 4 KB page at `page` into dst + page (real RDRAM through the alias), once foir's pending jobs that write
- * it are done. False when foir doesn't own the page (its bytes there may be stale): the caller waits for the GPU. */
-bool cpucopy_answer(uint32_t page, uint8_t *dst)
+/* Stage 2: foir's copy, once foir's pending jobs that write the 4 KB page at `page` are done; the caller copies the
+ * drawn ranges from it (only those: other bytes of the page may have been written since foir took it). NULL when foir
+ * doesn't own the page: the caller waits for the GPU. */
+const uint8_t *cpucopy_answer(uint32_t page)
 {
-    if (!cc_on || page + CC_PAGE > cc_size || !cc_owned[page >> CC_PAGE_SHIFT]) return false;
+    if (!cc_on || page + CC_PAGE > cc_size || !cc_owned[page >> CC_PAGE_SHIFT]) return NULL;
     uint64_t t0 = now_ns();
     mt_sync_range(&cc_rdp, page, page + CC_PAGE);
-    memcpy(dst + page, cc_shadow + page, CC_PAGE);
     cc_answered++;
     cc_answer_ns += now_ns() - t0;
-    return true;
+    return cc_shadow;
 }
 
 void cpucopy_release(uint32_t start, uint32_t end)
