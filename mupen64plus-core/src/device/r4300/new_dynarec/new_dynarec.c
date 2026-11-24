@@ -9669,18 +9669,26 @@ int new_recompile_block_worker(int addr)
   static int enabled = -1;
   static double window_start, total_ms, worst_ms;
   static unsigned blocks;
+  static uint64_t code_bytes, code_sum; // emitted code this window: a compiler change that must not change the output compares these
   if (enabled < 0) {
     const char* e = getenv("N64_DRC_STATS");
     enabled = e && *e == '1';
   }
   if (enabled) {
     double t0 = drc_now_ms();
+    u_char *out0 = out;
     int r = new_recompile_block_impl(addr);
     double t1 = drc_now_ms(), d = t1 - t0;
+    if (out > out0) {
+      code_bytes += out - out0;
+      for (u_char *p = out0; p < out; p++) code_sum = code_sum * 31 + *p;
+    }
     total_ms += d; blocks++;
     if (d > worst_ms) worst_ms = d;
     if (window_start == 0) window_start = t0;
     if (t1 - window_start >= 5000) {
+      DebugMessage(M64MSG_INFO, "dynarec: code %llu bytes, sum %016llx", (unsigned long long)code_bytes, (unsigned long long)code_sum);
+      code_bytes = code_sum = 0;
       DebugMessage(M64MSG_INFO, "dynarec: %u blocks compiled in the last %.0f ms, %.2f ms total, worst %.2f ms; %u blocks invalidated, %u full flushes, %u expiry steps; interpreted %u stretches, %u instructions, %u compiled at once; thread %u queued, %u waited for (%.1f ms), %u dropped",
                    blocks, t1 - window_start, total_ms, worst_ms, drc_stat_inv_blocks, drc_stat_inv_all, drc_stat_expire, DRC_STAT_RUNS, DRC_STAT_INS, DRC_STAT_FORCED, DRC_STAT_TASYNC, DRC_STAT_TSYNC, DRC_STAT_TWAIT, DRC_STAT_TDROP);
       drc_stat_inv_blocks = drc_stat_inv_all = drc_stat_expire = 0;
