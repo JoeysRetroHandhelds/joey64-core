@@ -2,6 +2,7 @@
 #include "cpucopy.h"
 #include "rdp.h"
 #include "config.h"
+#include "mt.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -165,10 +166,13 @@ void cpucopy_release(uint32_t start, uint32_t end)
 void cpucopy_command(const uint32_t *a, uint64_t timeline)
 {
     if (!cc_on) return;
+    unsigned id = (a[0] >> 24) & 0x3f;
+    /* SYNC_FULL: foir's would wait for its workers to finish the frame (mt_sync_frame) on the emulation thread, and
+       run frame bookkeeping (skip, callbacks) this copy doesn't use. Whoever reads foir's copy waits for it instead. */
+    if (id == 0x29) return;
     uint64_t t0 = now_ns();
     cc_epoch = timeline;
     struct rdp *r = &cc_rdp;
-    unsigned id = (a[0] >> 24) & 0x3f;
     bool draw = id >= 0x08 && id <= 0x0f;             /* triangles */
     draw |= id == 0x24 || id == 0x25 || id == 0x36;    /* texture rectangles, fill rectangle */
     if (draw) {
@@ -332,11 +336,11 @@ void cpucopy_report(char *buf, int n)
     maybe_dump();
     uint32_t first = atomic_exchange(&cc_ver_first_bad, 0xffffffffu);
     snprintf(buf, (size_t)n,
-             "cpu copy: %llu commands, %.2f ms of foir on the emulation thread, %llu pages seeded, %llu KB of texture copied, "
+             "cpu copy: %llu commands, %.2f ms of foir on the emulation thread (foir %s), %llu pages seeded, %llu KB of texture copied, "
              "%llu pages released; verify: %llu pages compared, %llu bytes differ on %llu pages (first 0x%06x), %llu pages not foir's, "
              "%llu drawn past the GPU, %llu differ after such a release; bad pages c16/c32/c8/z/? %llu/%llu/%llu/%llu/%llu, "
              "16-bit pixels differ %llu (%llu a step apart), depth words differ %llu; first: foir %016llx gpu %016llx (kind %u)",
-             (unsigned long long)cc_cmds, cc_ns / 1e6, (unsigned long long)cc_seed_pages, (unsigned long long)(cc_tex_bytes >> 10),
+             (unsigned long long)cc_cmds, cc_ns / 1e6, mt_stats_delta(&cc_rdp), (unsigned long long)cc_seed_pages, (unsigned long long)(cc_tex_bytes >> 10),
              (unsigned long long)cc_released, (unsigned long long)atomic_exchange(&cc_ver_pages, 0),
              (unsigned long long)atomic_exchange(&cc_ver_bad, 0), (unsigned long long)atomic_exchange(&cc_ver_badpages, 0),
              first == 0xffffffffu ? 0 : first, (unsigned long long)atomic_exchange(&cc_ver_unowned, 0),

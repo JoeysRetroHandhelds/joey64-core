@@ -119,7 +119,7 @@ ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
                           kernels_scalar.c kernels_tex.c kernels_neon.c kneon_comb.c kneon_blend.c kneon_mem.c kneon_tex.c \
                           spec.c vi.c vi_filter.c cpucopy.c)
   LOCAL_C_INCLUDES     := $(FOIR_DIR)
-  LOCAL_CFLAGS         := -O3 -fwrapv -fno-strict-aliasing -fvisibility=hidden -DFOIR_NEON=1 -DNDEBUG \
+  LOCAL_CFLAGS         := -O3 -fwrapv -fno-strict-aliasing -fvisibility=hidden -DFOIR_NEON=1 -DNDEBUG -DMT_SPIN_US=$(or $(FOIR_SPIN_US),50) \
                           -include $(FOIR_DIR)/rename-foir.h -Wno-unused-parameter -Wno-sign-compare
   LOCAL_CONLYFLAGS     := -std=gnu11
   LOCAL_ARM_MODE       := arm

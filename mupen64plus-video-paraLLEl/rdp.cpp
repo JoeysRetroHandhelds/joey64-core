@@ -973,7 +973,7 @@ static void on_sync_full()
 		log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: smart sync: %u CPU waits in the last 600 SyncFulls.\n", faults);
 		if (cpucopy_active())
 		{
-			char ccb[900];
+			char ccb[1400];
 			cpucopy_report(ccb, sizeof(ccb));
 			log_cb(RETRO_LOG_INFO, "paraLLEl-RDP: %s (600 SyncFulls).\n", ccb);
 		}
