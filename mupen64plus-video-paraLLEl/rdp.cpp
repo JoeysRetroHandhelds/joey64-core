@@ -1420,7 +1420,9 @@ static void init(void *rdram_ptr, size_t size, bool host_imported)
 		{
 			if (host_imported || !g_rdram_alias)
 				log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: cpu copy: needs the RDRAM alias (not host-imported RDRAM), off.\n");
-			else if (active_upscaling > 1)
+			else if (active_upscaling > 1 && !(getenv("N64_RDP_CPUCOPY_UPSCALED") && getenv("N64_RDP_CPUCOPY_UPSCALED")[0] == '1' && !cpucopy_verify_on))
+				// N64_RDP_CPUCOPY_UPSCALED=1 (measurement): answer reads upscaled too. foir draws 1x, so reads get native
+				// bytes where the GPU would give its downsample; the compare is meaningless there, so not with VERIFY.
 				log_cb(RETRO_LOG_WARN, "paraLLEl-RDP: cpu copy: 1x only, off at %ux.\n", active_upscaling);
 			else if (cpucopy_init(static_cast<const uint8_t *>(g_rdram_alias), uint32_t(size), cct ? atoi(cct) : 2))
 			{
