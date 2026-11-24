@@ -368,6 +368,10 @@ static uint64_t constmap[MAXBLOCK][HOST_REGS];
 static struct regstat regs[MAXBLOCK];
 static struct regstat branch_regs[MAXBLOCK];
 static signed char minimum_free_regs[MAXBLOCK];
+// count_free_regs() memo for the loop-preload scan (valid while cfr_epoch is unchanged)
+static signed char cfr_val[2][MAXBLOCK];
+static u_int cfr_stamp[2][MAXBLOCK];
+static u_int cfr_epoch;
 static u_int needed_reg[MAXBLOCK];
 static uint64_t requires_32bit[MAXBLOCK];
 static u_int wont_dirty[MAXBLOCK];
@@ -439,6 +443,20 @@ static signed char get_reg(signed char regmap[],int r)
   return -1;
 }
 
+// Presence set of the non-negative values in regmap, so that a loop over hr testing
+// get_reg(regmap,x)>=0 for many x does one scan instead of one per x.
+static void regmap_presence(const signed char regmap[],uint64_t m[2])
+{
+  int hr;
+  m[0]=m[1]=0;
+  for (hr=0;hr<HOST_REGS;hr++) if(hr!=EXCLUDE_REG&&regmap[hr]>=0) m[regmap[hr]>>6]|=1ULL<<(regmap[hr]&63);
+}
+
+static int regmap_has(const uint64_t m[2],int r)
+{
+  return (m[r>>6]>>(r&63))&1;
+}
+
 // Find a register that is available for two consecutive cycles
 static signed char get_reg2(signed char regmap1[],signed char regmap2[],int r)
 {
@@ -458,6 +476,15 @@ static int count_free_regs(signed char regmap[])
     }
   }
   return count;
+}
+
+static int count_free_regs_memo(int branch,int j)
+{
+  if(cfr_stamp[branch][j]!=cfr_epoch) {
+    cfr_stamp[branch][j]=cfr_epoch;
+    cfr_val[branch][j]=count_free_regs(branch?branch_regs[j].regmap:regs[j].regmap);
+  }
+  return cfr_val[branch][j];
 }
 
 static void dirty_reg(struct regstat *cur,signed char reg)
@@ -11435,9 +11462,11 @@ static int new_recompile_block_once(int addr)
       {
         if(i<slen-2) {
           nr|=needed_reg[i+2];
+          uint64_t entry_set[2];
+          regmap_presence(regs[i+2].regmap_entry,entry_set);
           for(hr=0;hr<HOST_REGS;hr++)
           {
-            if(regmap_pre[i+2][hr]>=0&&get_reg(regs[i+2].regmap_entry,regmap_pre[i+2][hr])<0) nr&=~(1LL<<hr);
+            if(regmap_pre[i+2][hr]>=0&&!regmap_has(entry_set,regmap_pre[i+2][hr])) nr&=~(1LL<<hr);
             //if((regmap_entry[i+2][hr])>=0) if(!((nr>>hr)&1)) DebugMessage(M64MSG_VERBOSE, "%x-bogus(%d=%d)",start+i*4,hr,regmap_entry[i+2][hr]);
           }
         }
@@ -11490,8 +11519,10 @@ static int new_recompile_block_once(int addr)
     else // Non-branch
     {
       if(i<slen-1) {
+        uint64_t entry_set[2];
+        regmap_presence(regs[i+1].regmap_entry,entry_set);
         for(hr=0;hr<HOST_REGS;hr++) {
-          if(regmap_pre[i+1][hr]>=0&&get_reg(regs[i+1].regmap_entry,regmap_pre[i+1][hr])<0) nr&=~(1LL<<hr);
+          if(regmap_pre[i+1][hr]>=0&&!regmap_has(entry_set,regmap_pre[i+1][hr])) nr&=~(1LL<<hr);
           if(regs[i].regmap[hr]!=regmap_pre[i+1][hr]) nr&=~(1LL<<hr);
           if(regs[i].regmap[hr]!=regmap_pre[i][hr]) nr&=~(1LL<<hr);
           if(regs[i].regmap[hr]<0) nr&=~(1LL<<hr);
@@ -11551,6 +11582,54 @@ static int new_recompile_block_once(int addr)
     needed_reg[i]=nr;
 
     // Deallocate unneeded registers
+    // The lookups below do not depend on hr: the loop never clears the entries they look for,
+    // except through the branch-likely clearing, where they are redone per register (P4_BRANCH_PARAMS)
+#define P4_BRANCH_PARAMS() do { \
+      p4d1=p4d2=0; p4map=0; p4temp=0; \
+      if(get_reg(regs[i].regmap,rt1[i+1]|64)>=0||get_reg(branch_regs[i].regmap,rt1[i+1]|64)>=0) \
+      { \
+        p4d1=dep1[i+1]; \
+        p4d2=dep2[i+1]; \
+      } \
+      if(using_tlb) { \
+        if(itype[i+1]==LOAD || itype[i+1]==LOADLR || \
+           itype[i+1]==STORE || itype[i+1]==STORELR || \
+           itype[i+1]==C1LS ) \
+        p4map=TLREG; \
+      } else \
+      if(itype[i+1]==STORE || itype[i+1]==STORELR || (opcode[i+1]&0x3b)==0x39) { \
+        p4map=INVCP; \
+      } \
+      if(itype[i+1]==LOADLR || itype[i+1]==STORELR || \
+         itype[i+1]==C1LS ) \
+        p4temp=FTEMP; \
+    } while(0)
+    const int is_branch_i=(itype[i]==RJUMP||itype[i]==UJUMP||itype[i]==CJUMP||itype[i]==SJUMP||itype[i]==FJUMP);
+    int p4d1=0,p4d2=0,p4map=0,p4temp=0;
+    if(is_branch_i)
+    {
+      P4_BRANCH_PARAMS();
+    }
+    else if(i>0)
+    {
+      p4map=-1;p4temp=-1;
+      if(get_reg(regs[i].regmap,rt1[i]|64)>=0)
+      {
+        p4d1=dep1[i];
+        p4d2=dep2[i];
+      }
+      if(using_tlb) {
+        if(itype[i]==LOAD || itype[i]==LOADLR ||
+           itype[i]==STORE || itype[i]==STORELR ||
+           itype[i]==C1LS )
+        p4map=TLREG;
+      } else if(itype[i]==STORE || itype[i]==STORELR || (opcode[i]&0x3b)==0x39) {
+        p4map=INVCP;
+      }
+      if(itype[i]==LOADLR || itype[i]==STORELR ||
+         itype[i]==C1LS )
+        p4temp=FTEMP;
+    }
     for(hr=0;hr<HOST_REGS;hr++)
     {
       if(!((nr>>hr)&1)) {
@@ -11571,36 +11650,19 @@ static int new_recompile_block_once(int addr)
             }
           }
         }
-        if(itype[i]==RJUMP||itype[i]==UJUMP||itype[i]==CJUMP||itype[i]==SJUMP||itype[i]==FJUMP)
+        if(is_branch_i)
         {
-          int d1=0,d2=0,map=0,temp=0;
-          if(get_reg(regs[i].regmap,rt1[i+1]|64)>=0||get_reg(branch_regs[i].regmap,rt1[i+1]|64)>=0)
-          {
-            d1=dep1[i+1];
-            d2=dep2[i+1];
-          }
-          if(using_tlb) {
-            if(itype[i+1]==LOAD || itype[i+1]==LOADLR ||
-               itype[i+1]==STORE || itype[i+1]==STORELR ||
-               itype[i+1]==C1LS )
-            map=TLREG;
-          } else
-          if(itype[i+1]==STORE || itype[i+1]==STORELR || (opcode[i+1]&0x3b)==0x39) {
-            map=INVCP;
-          }
-          if(itype[i+1]==LOADLR || itype[i+1]==STORELR ||
-             itype[i+1]==C1LS )
-            temp=FTEMP;
+          if(likely[i]) P4_BRANCH_PARAMS(); // regs[i].regmap may have been cleared above
           if((regs[i].regmap[hr]&63)!=rs1[i] && (regs[i].regmap[hr]&63)!=rs2[i] &&
              (regs[i].regmap[hr]&63)!=rt1[i] && (regs[i].regmap[hr]&63)!=rt2[i] &&
              (regs[i].regmap[hr]&63)!=rt1[i+1] && (regs[i].regmap[hr]&63)!=rt2[i+1] &&
              (regs[i].regmap[hr]^64)!=us1[i+1] && (regs[i].regmap[hr]^64)!=us2[i+1] &&
-             (regs[i].regmap[hr]^64)!=d1 && (regs[i].regmap[hr]^64)!=d2 &&
+             (regs[i].regmap[hr]^64)!=p4d1 && (regs[i].regmap[hr]^64)!=p4d2 &&
              regs[i].regmap[hr]!=rs1[i+1] && regs[i].regmap[hr]!=rs2[i+1] &&
-             (regs[i].regmap[hr]&63)!=temp && regs[i].regmap[hr]!=PTEMP &&
+             (regs[i].regmap[hr]&63)!=p4temp && regs[i].regmap[hr]!=PTEMP &&
              regs[i].regmap[hr]!=RHASH && regs[i].regmap[hr]!=RHTBL &&
              regs[i].regmap[hr]!=RTEMP && regs[i].regmap[hr]!=CCREG &&
-             regs[i].regmap[hr]!=map )
+             regs[i].regmap[hr]!=p4map )
           {
             regs[i].regmap[hr]=-1;
             regs[i].isconst&=~(1<<hr);
@@ -11608,12 +11670,12 @@ static int new_recompile_block_once(int addr)
                (branch_regs[i].regmap[hr]&63)!=rt1[i] && (branch_regs[i].regmap[hr]&63)!=rt2[i] &&
                (branch_regs[i].regmap[hr]&63)!=rt1[i+1] && (branch_regs[i].regmap[hr]&63)!=rt2[i+1] &&
                (branch_regs[i].regmap[hr]^64)!=us1[i+1] && (branch_regs[i].regmap[hr]^64)!=us2[i+1] &&
-               (branch_regs[i].regmap[hr]^64)!=d1 && (branch_regs[i].regmap[hr]^64)!=d2 &&
+               (branch_regs[i].regmap[hr]^64)!=p4d1 && (branch_regs[i].regmap[hr]^64)!=p4d2 &&
                branch_regs[i].regmap[hr]!=rs1[i+1] && branch_regs[i].regmap[hr]!=rs2[i+1] &&
-               (branch_regs[i].regmap[hr]&63)!=temp && branch_regs[i].regmap[hr]!=PTEMP &&
+               (branch_regs[i].regmap[hr]&63)!=p4temp && branch_regs[i].regmap[hr]!=PTEMP &&
                branch_regs[i].regmap[hr]!=RHASH && branch_regs[i].regmap[hr]!=RHTBL &&
                branch_regs[i].regmap[hr]!=RTEMP && branch_regs[i].regmap[hr]!=CCREG &&
-               branch_regs[i].regmap[hr]!=map)
+               branch_regs[i].regmap[hr]!=p4map)
             {
               branch_regs[i].regmap[hr]=-1;
               branch_regs[i].regmap_entry[hr]=-1;
@@ -11632,28 +11694,11 @@ static int new_recompile_block_once(int addr)
           // Non-branch
           if(i>0)
           {
-            int d1=0,d2=0,map=-1,temp=-1;
-            if(get_reg(regs[i].regmap,rt1[i]|64)>=0)
-            {
-              d1=dep1[i];
-              d2=dep2[i];
-            }
-            if(using_tlb) {
-              if(itype[i]==LOAD || itype[i]==LOADLR ||
-                 itype[i]==STORE || itype[i]==STORELR ||
-                 itype[i]==C1LS )
-              map=TLREG;
-            } else if(itype[i]==STORE || itype[i]==STORELR || (opcode[i]&0x3b)==0x39) {
-              map=INVCP;
-            }
-            if(itype[i]==LOADLR || itype[i]==STORELR ||
-               itype[i]==C1LS )
-              temp=FTEMP;
             if((regs[i].regmap[hr]&63)!=rt1[i] && (regs[i].regmap[hr]&63)!=rt2[i] &&
                (regs[i].regmap[hr]^64)!=us1[i] && (regs[i].regmap[hr]^64)!=us2[i] &&
-               (regs[i].regmap[hr]^64)!=d1 && (regs[i].regmap[hr]^64)!=d2 &&
+               (regs[i].regmap[hr]^64)!=p4d1 && (regs[i].regmap[hr]^64)!=p4d2 &&
                regs[i].regmap[hr]!=rs1[i] && regs[i].regmap[hr]!=rs2[i] &&
-               (regs[i].regmap[hr]&63)!=temp && regs[i].regmap[hr]!=map &&
+               (regs[i].regmap[hr]&63)!=p4temp && regs[i].regmap[hr]!=p4map &&
                (itype[i]!=SPAN||regs[i].regmap[hr]!=CCREG))
             {
               if(i<slen-1&&!is_ds[i]) {
@@ -11676,6 +11721,8 @@ static int new_recompile_block_once(int addr)
       }
     }
   }
+
+#undef P4_BRANCH_PARAMS
 
   /* Pass 5 - Pre-allocate registers */
 
@@ -12102,6 +12149,7 @@ static int new_recompile_block_once(int addr)
       // Possible match
       if(itype[i]==LOAD||itype[i]==LOADLR||
          itype[i]==STORE||itype[i]==STORELR||itype[i]==C1LS) {
+        cfr_epoch++; // regs/branch_regs are not modified while scanning, only after the loop
         for(hr=0;hr<HOST_REGS;hr++) {
           if(hr!=EXCLUDE_REG) {
             end[hr]=i-1;
@@ -12110,12 +12158,12 @@ static int new_recompile_block_once(int addr)
               if(itype[j]==UJUMP||itype[j]==RJUMP||itype[j]==CJUMP||itype[j]==SJUMP||itype[j]==FJUMP) {
                 if(branch_regs[j].regmap[hr]>=0) break;
                 if(ooo[j]) {
-                  if(count_free_regs(regs[j].regmap)<=minimum_free_regs[j+1]) break;
+                  if(count_free_regs_memo(0,j)<=minimum_free_regs[j+1]) break;
                 }else{
-                  if(count_free_regs(branch_regs[j].regmap)<=minimum_free_regs[j+1]) break;
+                  if(count_free_regs_memo(1,j)<=minimum_free_regs[j+1]) break;
                 }
               }
-              else if(count_free_regs(regs[j].regmap)<=minimum_free_regs[j]) break;
+              else if(count_free_regs_memo(0,j)<=minimum_free_regs[j]) break;
               if(itype[j]==UJUMP||itype[j]==RJUMP||itype[j]==CJUMP||itype[j]==SJUMP||itype[j]==FJUMP) {
                 int t=(ba[j]-start)>>2;
                 if(t<j&&t>=earliest_available[hr]) {
