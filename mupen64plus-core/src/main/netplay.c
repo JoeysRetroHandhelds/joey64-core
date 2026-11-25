@@ -209,6 +209,7 @@ static int l_rb_floor_set;
 static uint8_t l_rb_read[4], l_rb_sent[4];
 static uint32_t l_rb_frame_keys[4], l_rb_own_last[4];
 static struct { uint32_t guessed, wrong, stalls, waits; } l_rbs;
+static uint32_t l_send_gap_last, l_send_gap_max, l_send_gap_count; // rb22 diagnosis, see netplay_send_input
 //the desync check's CP0 copy waits until every input before it is heard and none was guessed wrong
 static struct { int have; uint32_t vi, counts[4]; int len; uint8_t data[CP0_REGS_COUNT * 4 + 5]; } l_rb_sync;
 static uint32_t l_rb_sync_sent_vi;
@@ -873,8 +874,9 @@ static void netplay_log_stats(void)
     if (l_rb_window)
     {
         log_cb(RETRO_LOG_INFO, "Netplay: rollback: %u inputs guessed, %u guessed wrong, %u waits (too far ahead), "
-               "%u frames held back, round trip %.1f ms\n",
-               l_rbs.guessed, l_rbs.wrong, l_rbs.waits, l_rbs.stalls, l_rb_rtt_us / 1000.0);
+               "%u frames held back, round trip %.1f ms; longest gap between our own sends %u ms (count %u)\n",
+               l_rbs.guessed, l_rbs.wrong, l_rbs.waits, l_rbs.stalls, l_rb_rtt_us / 1000.0, l_send_gap_max, l_send_gap_count);
+        l_send_gap_max = 0;
         for (int p = 0; p < 4; ++p)
         {
             if (!Controls[p].Present || !l_cin_compats)
@@ -906,11 +908,15 @@ static void rb_time_sync(uint8_t p, uint32_t c)
 {
     (void)c;
     if (!l_rb_my_have || l_rb_my_lead[p] == INT16_MIN || !l_rb_their_have[p] || l_rb_lead_frames - l_rb_their_frame[p] > 60 ||
-        l_rb_lead_frames - l_rb_stall_vi < 40)
+        l_rb_lead_frames - l_rb_stall_vi < 10)
         return;
     const int32_t ahead16 = ((int32_t)l_rb_my_lead[p] - l_rb_their_lead[p]) / 2;
     l_rb_ahead16[p] = ahead16;
-    if (ahead16 < 16)
+    //rb24: one hold every 40 frames moved the games 0.4 frames a second, so a game that started ~7 frames behind (the
+    //Retroid Pocket 5 joining) never caught up and the one ahead kept reaching the window's end (~900 ms of waits a
+    //minute). Far ahead, hold more often: 2+ frames every 20, 4+ every 10.
+    const uint32_t every = ahead16 >= 64 ? 10 : ahead16 >= 32 ? 20 : 40;
+    if (ahead16 < 16 || l_rb_lead_frames - l_rb_stall_vi < every)
         return;
     l_rb_stall_vi = l_rb_lead_frames;
     ++l_rbs.stalls;
@@ -1134,6 +1140,17 @@ static void netplay_send_input(uint8_t control_id, uint32_t keys)
         uint32_t cc = l_cin_compats[control_id].netplay_count;
         if (cc != prevc + 1 && told++ < 20)
             log_cb(RETRO_LOG_INFO, "Netplay: rollback: own input for count %u sent after %u (replaying %d)\n", cc, prevc, l_rb_replaying);
+    }
+    if (l_rb_window)
+    {
+        //rb22 diagnosis: the room sees 110-130 ms gaps in a joiner's inputs every 10 s with clean Wi-Fi: are they ours?
+        const uint32_t now = np_ticks();
+        if (l_send_gap_last && now - l_send_gap_last > l_send_gap_max)
+        {
+            l_send_gap_max = now - l_send_gap_last;
+            l_send_gap_count = l_cin_compats[control_id].netplay_count;
+        }
+        l_send_gap_last = now;
     }
     l_sent[control_id][pos].count = l_cin_compats[control_id].netplay_count;
     l_sent[control_id][pos].keys = keys;
