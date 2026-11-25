@@ -929,7 +929,6 @@ static uint32_t rb_get_input(uint8_t p)
     struct np_hist *h = hist_at(p, c);
     if (!l_rb_replaying && !(h && h->real))
     {
-        rb_time_sync(p, c);
         if (!netplay_ensure_valid(p))
         {
             log_cb(RETRO_LOG_INFO, "Netplay: lost connection to server\n");
@@ -1334,9 +1333,17 @@ void netplay_check_sync(struct cp0* cp0)
         //time sync: sample our lead over each other player, and every 10 frames send the averages
         if (!l_rb_replaying)
         {
+            //rb21: read the room every frame. Packets were read only when the game read a pad, so in stretches where it
+            //doesn't (Mario Kart 64's menus and loading, ~28 frames) nothing came in: the newest input heard froze,
+            //the leads swung to 15-30 frames, time sync couldn't act and a wrong guess was found 26-30 frames late.
+            netplay_process();
             int me = -1;
             for (int i = 0; i < 4; ++i)
                 if (l_netplay_control[i] != -1) { me = i; break; }
+            //and time sync every frame (it ran only on a pad read whose input wasn't here)
+            for (uint8_t p = 0; p < 4; ++p)
+                if (Controls[p].Present && p != me && l_rb_have_last[p])
+                    rb_time_sync(p, l_cin_compats[p].netplay_count);
             ++l_rb_lead_frames;
             ++l_rb_lead_n;
             for (uint8_t p = 0; p < 4; ++p)
