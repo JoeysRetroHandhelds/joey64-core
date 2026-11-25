@@ -39,6 +39,8 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <semaphore.h>
+#include <sched.h>
 #define SS_COW 1
 #endif
 #include <zlib.h>
@@ -275,20 +277,94 @@ static struct
     uint8_t* buf;
     const uint8_t* state; /* the start of the state buffer buf is in (audit 3 L1) */
     size_t shift, pages;
-    uint8_t copied[RDRAM_MAX_SIZE / 4096];
+    uint8_t copied[RDRAM_MAX_SIZE / 4096]; /* 0 not yet, 1 being copied, 2 in the state */
+    uint8_t open[RDRAM_MAX_SIZE / 4096];   /* copy-on-write let go of the page (made it writable again) */
     struct sigaction old;
     int installed;
     unsigned cpu, drawn, loads;
+    /* Joey64 rollback (mode 3, savestates_ra_context == 3, 2026-11-24): a whole state, its RDRAM copied by a worker
+     * thread after the take instead of on the emulation thread (RP5 1.4-2.1 ms, RG477M 1.3-2.0 ms a frame). Pages the
+     * game writes, and pages the RDP is about to draw, are copied first, as in mode 2. When the worker is done it
+     * opens every page copy-on-write still holds (smart sync's own locked pages were let go of when drawn). A load or
+     * the next take waits for it. */
+    int full, worker_started;
+    volatile int busy, lock;
+    sem_t go;
+    unsigned full_saves, full_cpu, full_drawn;
+    double full_wait_ms;
 } ss_cow;
 
-static void ss_cow_copy(size_t p)
+static pthread_t ss_cow_worker_tid;
+/* the page this thread's last fault was retried for (mode 3: see the handler) */
+static __thread size_t ss_cow_retried = (size_t)-1;
+
+static void ss_cow_lock(void)
+{
+    while (__atomic_exchange_n(&ss_cow.lock, 1, __ATOMIC_ACQUIRE)) {}
+}
+static void ss_cow_unlock(void)
+{
+    __atomic_store_n(&ss_cow.lock, 0, __ATOMIC_RELEASE);
+}
+
+/* the page's bytes into the state, once: 1 when this call copied them (the worker, the fault handler and a draw can
+ * reach the same page; a second caller waits for the first one's copy) */
+static int ss_cow_take(size_t p)
 {
     const size_t sz = (size_t)1 << ss_cow.shift;
-    memcpy(ss_cow.buf + p * sz, ss_cow.ram + p * sz, sz);
-    /* open before marking (audit 3 L7): a write from another thread in between then finds the page open; marked
-     * first, it found it marked and still shut, and went on to the default handler */
-    mprotect(ss_cow.ram + p * sz, sz, PROT_READ | PROT_WRITE);
-    ss_cow.copied[p] = 1;
+    uint8_t expect = 0;
+    if (__atomic_compare_exchange_n(&ss_cow.copied[p], &expect, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    {
+        memcpy(ss_cow.buf + p * sz, ss_cow.ram + p * sz, sz);
+        __atomic_store_n(&ss_cow.copied[p], 2, __ATOMIC_RELEASE);
+        return 1;
+    }
+    while (__atomic_load_n(&ss_cow.copied[p], __ATOMIC_ACQUIRE) != 2) {}
+    return 0;
+}
+
+/* writable again; marked open only after (audit 3 L7: a write from another thread in between finds it not open yet,
+ * comes here and finds it done) */
+static void ss_cow_open_page(size_t p)
+{
+    const size_t sz = (size_t)1 << ss_cow.shift;
+    ss_cow_lock();
+    if (!ss_cow.open[p])
+    {
+        mprotect(ss_cow.ram + p * sz, sz, PROT_READ | PROT_WRITE);
+        __atomic_store_n(&ss_cow.open[p], 1, __ATOMIC_RELEASE);
+    }
+    ss_cow_unlock();
+}
+
+static int ss_cow_done(size_t p)
+{
+    return __atomic_load_n(&ss_cow.copied[p], __ATOMIC_ACQUIRE) == 2 && __atomic_load_n(&ss_cow.open[p], __ATOMIC_ACQUIRE);
+}
+
+static void* ss_cow_worker(void* arg)
+{
+    (void)arg;
+    for (;;)
+    {
+        size_t p, q;
+        const size_t sz = (size_t)1 << ss_cow.shift;
+        while (sem_wait(&ss_cow.go) != 0) {}
+        for (p = 0; p < ss_cow.pages; ++p)
+            ss_cow_take(p);
+        ss_cow_lock();
+        for (p = 0; p < ss_cow.pages; )
+        {
+            if (ss_cow.open[p]) { ++p; continue; }
+            for (q = p; q < ss_cow.pages && !ss_cow.open[q]; ++q) {}
+            mprotect(ss_cow.ram + p * sz, (q - p) * sz, PROT_READ | PROT_WRITE);
+            for (; p < q; ++p)
+                __atomic_store_n(&ss_cow.open[p], 1, __ATOMIC_RELEASE);
+        }
+        ss_cow_unlock();
+        __atomic_store_n(&ss_cow.busy, 0, __ATOMIC_RELEASE);
+    }
+    return NULL;
 }
 
 static void ss_cow_handler(int sig, siginfo_t* info, void* uc)
@@ -297,13 +373,29 @@ static void ss_cow_handler(int sig, siginfo_t* info, void* uc)
     if (ss_cow.armed && a >= ss_cow.ram && a < ss_cow.ram + RDRAM_MAX_SIZE)
     {
         size_t p = (size_t)(a - ss_cow.ram) >> ss_cow.shift;
-        if (!ss_cow.copied[p])
+        /* the worker's own reads fault only on a page smart sync shut (PROT_NONE): smart sync's to answer; taking the
+         * page here would wait for the worker's own copy of it forever */
+        if (!(ss_cow.worker_started && pthread_equal(pthread_self(), ss_cow_worker_tid)))
         {
-            ss_cow_copy(p);
-            ss_cow.cpu++;
-            return; /* the write runs again, now on an open page */
+            if (!ss_cow_done(p))
+            {
+                if (ss_cow_take(p)) { ss_cow.cpu++; if (ss_cow.full) ss_cow.full_cpu++; }
+                ss_cow_open_page(p);
+                ss_cow_retried = (size_t)-1;
+                return; /* the write runs again, now on an open page */
+            }
+            /* Mode 3 (2026-11-24): the worker opens pages while the game runs, so a write can fault on a shut page
+             * that the worker opens before this handler looks (Odin 2 Portal: an RSP DMA into a page found copied and
+             * open, handed on, crashed). Run the access again once; if it faults on the same page again, someone else
+             * (smart sync) shut it. */
+            if (ss_cow.full && ss_cow_retried != p)
+            {
+                ss_cow_retried = p;
+                return;
+            }
         }
     }
+    ss_cow_retried = (size_t)-1;
     if (ss_cow.old.sa_flags & SA_SIGINFO)
     {
         if (ss_cow.old.sa_sigaction)
@@ -325,10 +417,10 @@ void ra_cow_drawn(uint32_t start, uint32_t end)
         return;
     if (end > RDRAM_MAX_SIZE) end = RDRAM_MAX_SIZE;
     for (p = start >> ss_cow.shift; p <= ((end - 1) >> ss_cow.shift); ++p)
-        if (!ss_cow.copied[p])
+        if (!ss_cow_done(p))
         {
-            ss_cow_copy(p);
-            ss_cow.drawn++;
+            if (ss_cow_take(p)) { ss_cow.drawn++; if (ss_cow.full) ss_cow.full_drawn++; }
+            ss_cow_open_page(p);
         }
 }
 
@@ -347,7 +439,7 @@ static int ss_cow_on(const struct device* dev)
             ss_cow.pages = RDRAM_MAX_SIZE >> ss_cow.shift;
         }
     }
-    if (!on || savestates_ra_context != 2 || !savestates_rdp_settle)
+    if (!on || (savestates_ra_context != 2 && savestates_ra_context != 3) || !savestates_rdp_settle)
         return 0;
     if (((uintptr_t)dev->rdram.dram & (((uintptr_t)1 << ss_cow.shift) - 1)) != 0)
         return 0;
@@ -362,6 +454,15 @@ static int ss_cow_on(const struct device* dev)
             return 0;
         ss_cow.installed = 1;
     }
+    if (savestates_ra_context == 3 && !ss_cow.worker_started)
+    {
+        pthread_t t;
+        if (sem_init(&ss_cow.go, 0, 0) != 0 || pthread_create(&t, NULL, ss_cow_worker, NULL) != 0)
+            return 0;
+        ss_cow_worker_tid = t;
+        pthread_detach(t);
+        ss_cow.worker_started = 1;
+    }
     return 1;
 }
 
@@ -370,6 +471,15 @@ static void ss_cow_disarm(void)
 {
     if (!ss_cow.armed)
         return;
+    if (__atomic_load_n(&ss_cow.busy, __ATOMIC_ACQUIRE))
+    {
+        struct timespec w0, w1;
+        clock_gettime(CLOCK_MONOTONIC, &w0);
+        while (__atomic_load_n(&ss_cow.busy, __ATOMIC_ACQUIRE))
+            sched_yield();
+        clock_gettime(CLOCK_MONOTONIC, &w1);
+        ss_cow.full_wait_ms += (w1.tv_sec - w0.tv_sec) * 1e3 + (w1.tv_nsec - w0.tv_nsec) / 1e6;
+    }
     ss_cow.armed = 0;
     __sync_synchronize();
     mprotect(ss_cow.ram, RDRAM_MAX_SIZE, PROT_READ | PROT_WRITE);
@@ -603,7 +713,7 @@ int savestates_load_m64p(struct device* dev, const void *data)
 #ifdef SS_COW
     /* run-ahead's copy-on-write state holds RDRAM only for the pages copied into it, so only its put back may load it
      * (audit 3 L1, 2026-11-11: anything else loaded it with whatever its other pages held, and only logged it) */
-    if (ss_cow.armed && ss_cow.state == (const uint8_t*)data && savestates_ra_context != 2)
+    if (ss_cow.armed && ss_cow.state == (const uint8_t*)data && savestates_ra_context != 2 && !ss_cow.full)
     {
         DebugMessage(M64MSG_ERROR, "copy-on-write state loaded outside run-ahead: refused");
 #ifdef USE_SDL
@@ -2300,18 +2410,55 @@ int savestates_save_m64p(const struct device* dev, void *data)
         ss_cow.buf = (uint8_t*)curr;
         ss_cow.state = (const uint8_t*)data;
         memset(ss_cow.copied, 0, sizeof(ss_cow.copied));
+        memset(ss_cow.open, 0, sizeof(ss_cow.open));
+        ss_cow.full = savestates_ra_context == 3;
         __sync_synchronize();
         if (mprotect(ss_cow.ram, RDRAM_MAX_SIZE, PROT_READ) == 0)
+        {
             ss_cow.armed = 1;
+            if (ss_cow.full)
+            {
+                __atomic_store_n(&ss_cow.busy, 1, __ATOMIC_RELEASE);
+                sem_post(&ss_cow.go);
+                if (++ss_cow.full_saves >= 600)
+                {
+                    DebugMessage(M64MSG_INFO, "rollback states: %u taken, pages copied first for CPU writes %.1f, for RDP draws %.1f a state; waited for the copy %.3f ms a state",
+                                 ss_cow.full_saves, (double)ss_cow.full_cpu / ss_cow.full_saves,
+                                 (double)ss_cow.full_drawn / ss_cow.full_saves, ss_cow.full_wait_ms / ss_cow.full_saves);
+                    ss_cow.full_saves = ss_cow.full_cpu = ss_cow.full_drawn = 0;
+                    ss_cow.full_wait_ms = 0;
+                }
+            }
+        }
         else
             memcpy(curr, dev->rdram.dram, RDRAM_MAX_SIZE);
         curr += RDRAM_MAX_SIZE;
     }
     else
     {
+        /* N64_RB_TIMING=1 (dev, 2026-11-24): split a full-copy state's cost into the RDP settle and the RDRAM copy */
+        static int rbt = -1;
+        static double rbt_settle, rbt_copy;
+        static unsigned rbt_n;
+        struct timespec t0, t1, t2;
+        if (rbt < 0) { const char* e = getenv("N64_RB_TIMING"); rbt = e && e[0] == '1'; }
+        if (rbt) clock_gettime(CLOCK_MONOTONIC, &t0);
         if (savestates_ra_context && savestates_rdp_settle)
             savestates_rdp_settle(); /* run-ahead's full copy: the RDP's drawing in RDRAM first (OoT drifted without) */
+        if (rbt) clock_gettime(CLOCK_MONOTONIC, &t1);
         PUTARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4); /* a macro of two statements */
+        if (rbt)
+        {
+            clock_gettime(CLOCK_MONOTONIC, &t2);
+            rbt_settle += (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+            rbt_copy += (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
+            if (++rbt_n >= 300)
+            {
+                DebugMessage(M64MSG_INFO, "state timing: %u full-copy saves, RDP settle %.3f ms, RDRAM copy %.3f ms a save",
+                             rbt_n, rbt_settle / rbt_n, rbt_copy / rbt_n);
+                rbt_n = 0; rbt_settle = rbt_copy = 0;
+            }
+        }
     }
 #else
     PUTARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
@@ -2842,6 +2989,14 @@ void savestates_init(void)
         DebugMessage(M64MSG_ERROR, "Could not create savestates list lock");
         return;
     }
+#endif
+}
+
+/* Joey64 (2026-11-24): before the game's memory goes (retro_unload_game): a rollback state's worker done, RDRAM open */
+void savestates_ra_release(void)
+{
+#ifdef SS_COW
+    ss_cow_disarm();
 #endif
 }
 

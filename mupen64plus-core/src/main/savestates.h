@@ -60,7 +60,8 @@ int savestates_load_m64p(struct device* dev, char *filepath);
 int savestates_save_m64p(const struct device* dev, void *data);
 int savestates_load_m64p(struct device* dev, const void *data);
 /* Joey64: set by libretro.c around run-ahead's own saves and loads (the TLB tables' skip) */
-extern int savestates_ra_context; /* 1: run-ahead's own state, 2: and copy-on-write (smart sync on) */
+void savestates_ra_release(void);
+extern int savestates_ra_context; /* 1: run-ahead's own state, 2: and copy-on-write (smart sync on), 3: netplay rollback's, RDRAM copied by a worker */
 extern void (*savestates_rdp_settle)(void); /* set by libretro.c: parallel-RDP's settle for run-ahead */
 /* audit 3 L2: the next save writes savestates_ra_gen into its mark (0: none); a load leaves the state's in
  * savestates_loaded_gen */

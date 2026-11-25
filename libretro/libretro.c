@@ -2152,6 +2152,7 @@ bool retro_load_game(const struct retro_game_info *game)
 
 void retro_unload_game(void)
 {
+    savestates_ra_release();
     if(current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer)
     {
        environ_clear_thread_waits_cb(1, NULL);
@@ -2476,8 +2477,11 @@ static bool rb_context(void)
 }
 static int rb_ra_context(void)
 {
-   ra_cow_allowed(); /* sets savestates_rdp_settle */
-   return 1;
+   /* Joey64 (2026-11-24): with smart sync, mode 3: RDRAM copied by a worker after the take (savestates.c ss_cow).
+    * N64_RB_COW=0: the full copy on the emulation thread. */
+   static int cow = -1;
+   if (cow < 0) { const char *e = getenv("N64_RB_COW"); cow = !(e && e[0] == '0'); }
+   return ra_cow_allowed() && cow ? 3 : 1; /* (ra_cow_allowed sets savestates_rdp_settle) */
 }
 /* What a state file leaves out (the RSP's registers and DMA queue, the audio queue, the HLE audio lists), kept for
  * each rollback state by its number (savestates_ra_gen) and put back with it: the loader's guesses changed when
