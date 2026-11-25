@@ -213,6 +213,20 @@ static struct { uint32_t guessed, wrong, stalls, waits; } l_rbs;
 static struct { int have; uint32_t vi, counts[4]; int len; uint8_t data[CP0_REGS_COUNT * 4 + 5]; } l_rb_sync;
 static uint32_t l_rb_sync_sent_vi;
 static int l_rb_sync_sent;
+//Time sync (2026-11-24, rb12): each game's lead over player p is its count less the newest input heard from p, averaged
+//over 10 frames. Alone it is biased by the network's one-way time (each game took itself to be ahead: both held a frame
+//every 20 VIs, the joiner's stutters). So games swap theirs through the room ([10, player, 0, 0, 4 x int16 lead*16
+//over players 1-4]); half the difference between ours over p and p's over us is how far ahead we really are, the
+//one-way times cancelling as in GGPO's frame advantage.
+#define UDP_JOEY_LEAD 10
+static int32_t l_rb_lead_sum[4];
+static uint32_t l_rb_lead_n, l_rb_lead_frames;
+static int16_t l_rb_my_lead[4];          // our averaged lead over each player, x16
+static int16_t l_rb_their_lead[4];       // player q's averaged lead over us, x16
+static uint8_t l_rb_their_have[4], l_rb_my_have;
+static uint32_t l_rb_their_frame[4];     // our frame count when q's lead came
+static int32_t l_rb_ahead16[4];          // the last advantage worked out, x16 (for the log)
+static uint32_t l_rb_prev_last[4], l_rb_quiet[4], l_rb_quiet_max[4]; // frames without a newer input heard (log)
 
 static struct np_hist *hist_at(uint8_t p, uint32_t c)
 {
@@ -253,9 +267,15 @@ static void rb_put(uint8_t p, uint32_t c, uint32_t keys, uint8_t plugin)
             l_rb_bad[p] = c;
         l_rb_bad_mask |= (uint8_t)(1u << p);
         ++l_rbs.wrong;
+        if ((int32_t)(n - c) > 20)
+            log_cb(RETRO_LOG_INFO, "Netplay: rollback: late wrong guess for player %u: count %u heard at %u, all heard below %u, floor %u, replaying %d\n",
+                   p + 1, c, n, l_rb_done[p], l_rb_floor[p], l_rb_replaying);
     }
     if (!l_rb_have_last[p] || np_after(c, l_rb_last_count[p]))
     {
+        if (l_rb_have_last[p] && (int32_t)(c - l_rb_last_count[p]) > 15)
+            log_cb(RETRO_LOG_INFO, "Netplay: rollback: player %u's newest input jumped %u -> %u at count %u (a burst after a quiet spell)\n",
+                   p + 1, l_rb_last_count[p], c, n);
         l_rb_have_last[p] = 1;
         l_rb_last_count[p] = c;
         l_rb_last_keys[p] = keys;
@@ -392,6 +412,10 @@ m64p_error netplay_start(const char* host, int port)
         l_rb_replaying = 0;
         l_rb_rtt_us = 0;
         l_rb_stall_vi = 0;
+        memset(l_rb_lead_sum, 0, sizeof l_rb_lead_sum);
+        l_rb_lead_n = l_rb_lead_frames = 0;
+        memset(l_rb_their_have, 0, sizeof l_rb_their_have);
+        l_rb_my_have = 0;
         l_rb_sync_sent = 0;
         l_rb_floor_set = 0;
         memset(l_rb_read, 0, sizeof l_rb_read);
@@ -509,6 +533,13 @@ static void netplay_request_input(uint8_t control_id)
         uint32_t from = l_cin_compats[control_id].netplay_count;
         if (l_rb_window && np_after(from, l_rb_done[control_id]))
             from = l_rb_done[control_id];
+        if (l_rb_window && (int32_t)(l_cin_compats[control_id].netplay_count - l_rb_done[control_id]) > 20 &&
+            l_cin_compats[control_id].netplay_count > 600)
+        {
+            static int told;
+            if (told++ < 40)
+                log_cb(RETRO_LOG_INFO, "Netplay: rollback: overdue: asking player %u's inputs from %u\n", control_id + 1, from);
+        }
         SDLNet_Write32(from, &l_request_input_packet->data[6]); //the current event count
     }
     l_request_input_packet->data[10] = l_spectator; //whether we are a spectator
@@ -599,6 +630,17 @@ static void netplay_process()
                     l_status = current_status;
                 }
                 curr = 5;
+                if (l_rb_window && l_process_packet->data[4] && l_cin_compats &&
+                    (int32_t)(l_cin_compats[player].netplay_count - l_rb_done[player]) > 20 && l_cin_compats[player].netplay_count > 600)
+                {
+                    //rb15 diagnosis: what comes while an input is overdue
+                    static int told;
+                    if (told++ < 60)
+                        log_cb(RETRO_LOG_INFO, "Netplay: rollback: overdue %u (at %u): packet kind %u player %u counts %u..%u\n",
+                               l_rb_done[player], l_cin_compats[player].netplay_count, l_process_packet->data[0], player + 1,
+                               SDLNet_Read32(&l_process_packet->data[5]),
+                               SDLNet_Read32(&l_process_packet->data[5]) + l_process_packet->data[4] - 1);
+                }
                 //this loop processes input data from the server, inserting new events into the linked list for each player
                 //it skips events that we have already recorded, or if we receive data for an event that has already happened
                 for (uint8_t i = 0; i < l_process_packet->data[4]; ++i)
@@ -648,6 +690,21 @@ static void netplay_process()
                     l_cin_compats[player].event_first = new_event;
                 }
                 break;
+            case UDP_JOEY_LEAD:
+            {
+                const uint8_t *d = l_process_packet->data;
+                if (!netplay_packet_has_data(l_process_packet, 0, 12) || d[1] >= 4)
+                    break;
+                int me = -1;
+                for (int i = 0; i < 4; ++i)
+                    if (l_netplay_control[i] != -1) { me = i; break; }
+                if (me < 0 || d[1] == me)
+                    break;
+                l_rb_their_lead[d[1]] = (int16_t)(d[4 + me * 2] << 8 | d[5 + me * 2]);
+                l_rb_their_have[d[1]] = l_rb_their_lead[d[1]] != INT16_MIN;
+                l_rb_their_frame[d[1]] = l_rb_lead_frames;
+                break;
+            }
             case UDP_JOEY_OWN_PLAN:
             {
                 const uint8_t *d = l_process_packet->data;
@@ -824,8 +881,12 @@ static void netplay_log_stats(void)
                 continue;
             const uint32_t n = l_cin_compats[p].netplay_count, d = l_rb_done[p];
             struct np_hist *h = &l_hist[p][d % NP_HIST];
-            log_cb(RETRO_LOG_INFO, "Netplay: rollback: player %d at %u, all heard below %u (slot holds %u real %u used %u), newest heard %u\n",
-                   p + 1, n, d, h->count, h->real, h->used, l_rb_last_count[p]);
+            log_cb(RETRO_LOG_INFO, "Netplay: rollback: player %d at %u, all heard below %u (slot holds %u real %u used %u), newest heard %u; "
+                   "lead ours %.2f theirs %.2f, ahead %.2f; most frames without a newer input %u\n",
+                   p + 1, n, d, h->count, h->real, h->used, l_rb_last_count[p],
+                   l_rb_my_lead[p] / 16.0, l_rb_their_have[p] ? l_rb_their_lead[p] / 16.0 : 0.0, l_rb_ahead16[p] / 16.0,
+                   l_rb_quiet_max[p]);
+            l_rb_quiet_max[p] = 0;
         }
         memset(&l_rbs, 0, sizeof l_rbs);
     }
@@ -839,18 +900,19 @@ static void netplay_log_stats(void)
 //Joey64 rollback: hold this frame back (about a frame's wait) when we're well ahead of player p's game: where it is
 //now is its newest input heard, less the room's delay, plus half the round trip. Both games run at the same rate,
 //so without this one that started first stays ahead and guesses (and rolls back) for both. At most every 20 VIs.
+//(rb12: the leads swapped, see UDP_JOEY_LEAD; held at most every 40 frames, so the next decision sees both averages
+//taken after the last hold)
 static void rb_time_sync(uint8_t p, uint32_t c)
 {
-    if (!l_rb_have_last[p] || l_vi_counter - l_rb_stall_vi < 20)
+    (void)c;
+    if (!l_rb_my_have || l_rb_my_lead[p] == INT16_MIN || !l_rb_their_have[p] || l_rb_lead_frames - l_rb_their_frame[p] > 60 ||
+        l_rb_lead_frames - l_rb_stall_vi < 40)
         return;
-    int delay = 0;
-    for (int i = 0; i < 4; ++i)
-        if (l_netplay_control[i] != -1 && l_plan[i].have) { delay = l_plan[i].off_r; break; }
-    const double half = l_rb_rtt_us / 2.0 / 16683.0;
-    const double lead = (double)(int32_t)(c - l_rb_last_count[p]) + delay - half;
-    if (lead < 1.5)
+    const int32_t ahead16 = ((int32_t)l_rb_my_lead[p] - l_rb_their_lead[p]) / 2;
+    l_rb_ahead16[p] = ahead16;
+    if (ahead16 < 16)
         return;
-    l_rb_stall_vi = l_vi_counter;
+    l_rb_stall_vi = l_rb_lead_frames;
     ++l_rbs.stalls;
     const uint32_t start = np_ticks();
     while (np_ticks() - start < 16)
@@ -1065,6 +1127,15 @@ static void np_place_own(uint8_t id, uint32_t c, uint32_t keys, uint8_t plugin)
 static void netplay_send_input(uint8_t control_id, uint32_t keys)
 {
     uint8_t pos = l_sent_pos[control_id];
+    if (l_rb_window && l_sent_n[control_id])
+    {
+        //rb14 diagnosis: every count goes out once, in order
+        static int told;
+        uint32_t prevc = l_sent[control_id][(uint8_t)((pos + NP_RESEND - 1) % NP_RESEND)].count;
+        uint32_t cc = l_cin_compats[control_id].netplay_count;
+        if (cc != prevc + 1 && told++ < 20)
+            log_cb(RETRO_LOG_INFO, "Netplay: rollback: own input for count %u sent after %u (replaying %d)\n", cc, prevc, l_rb_replaying);
+    }
     l_sent[control_id][pos].count = l_cin_compats[control_id].netplay_count;
     l_sent[control_id][pos].keys = keys;
     l_sent[control_id][pos].plugin = l_plugin[control_id];
@@ -1259,6 +1330,43 @@ void netplay_check_sync(struct cp0* cp0)
             if (!l_rb_read[p])
                 ++l_cin_compats[p].netplay_count; // an input nobody reads: no guess to check, nothing to wait for
             l_rb_read[p] = l_rb_sent[p] = 0;
+        }
+        //time sync: sample our lead over each other player, and every 10 frames send the averages
+        if (!l_rb_replaying)
+        {
+            int me = -1;
+            for (int i = 0; i < 4; ++i)
+                if (l_netplay_control[i] != -1) { me = i; break; }
+            ++l_rb_lead_frames;
+            ++l_rb_lead_n;
+            for (uint8_t p = 0; p < 4; ++p)
+                if (Controls[p].Present && p != me && l_rb_have_last[p])
+                {
+                    l_rb_lead_sum[p] += (int32_t)(l_cin_compats[p].netplay_count - l_rb_last_count[p]);
+                    if (l_rb_last_count[p] != l_rb_prev_last[p]) { l_rb_prev_last[p] = l_rb_last_count[p]; l_rb_quiet[p] = 0; }
+                    else if (++l_rb_quiet[p] > l_rb_quiet_max[p]) l_rb_quiet_max[p] = l_rb_quiet[p];
+                }
+            if (l_rb_lead_n >= 10 && me >= 0)
+            {
+                uint8_t out[12] = { UDP_JOEY_LEAD, (uint8_t)me, 0, 0 };
+                for (int p = 0; p < 4; ++p)
+                {
+                    int16_t v = INT16_MIN;
+                    if (Controls[p].Present && p != me && l_rb_have_last[p])
+                    {
+                        int32_t a = l_rb_lead_sum[p] * 16 / (int32_t)l_rb_lead_n;
+                        v = (int16_t)(a < -32000 ? -32000 : a > 32000 ? 32000 : a);
+                    }
+                    l_rb_my_lead[p] = v;
+                    out[4 + p * 2] = (uint8_t)((uint16_t)v >> 8);
+                    out[5 + p * 2] = (uint8_t)v;
+                }
+                l_rb_my_have = 1;
+                if (np_udp >= 0)
+                    send(np_udp, out, sizeof out, 0);
+                memset(l_rb_lead_sum, 0, sizeof l_rb_lead_sum);
+                l_rb_lead_n = 0;
+            }
         }
     }
 
