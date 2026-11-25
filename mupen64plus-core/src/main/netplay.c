@@ -192,6 +192,8 @@ static int np_after(uint32_t a, uint32_t b) { return (int32_t)(a - b) > 0; }
 struct np_hist { uint32_t count, keys, used_keys; uint8_t real, used, plugin, used_plugin; };
 static struct np_hist l_hist[4][NP_HIST];
 static int l_rb_window;
+static int l_rb_forced; /* N64_NETPLAY_ROLLBACK set: the window is the dev switch's, the room isn't asked */
+static int l_room_rb;   /* the room answered the registration with 3 */
 static int l_rb_replaying;
 static uint32_t l_rb_done[4];                      // every input below this count is heard
 static uint32_t l_rb_last_keys[4], l_rb_last_count[4];
@@ -331,6 +333,11 @@ static const int32_t l_check_sync_packet_size = (CP0_REGS_COUNT * 4) + 5;
 /* Joey64 (2026-11-10): [0x40, the ROM's MD5 as 32 hex characters]; the room answers 2 when it is the host's
  * ROM, 1 when not. The host's own (it joins from this device, 127.0.0.1) is the one the others must have. */
 #define TCP_JOEY_ROM_CHECK 0x40
+/* Joey64 (2026-11-24, automatic rollback): a room that answers a registration with 3 decides rollback for every game:
+ * [0x41, the most inputs this device can guess ahead (N64_NETPLAY_RB_CAP, 0 = none)] right after the registration, and
+ * [0x42] after the room's registration list, answered with the room's window (0 = its shared input delay). */
+#define TCP_JOEY_RB_CAP 0x41
+#define TCP_JOEY_RB_MODE 0x42
 
 #define CS4 32
 
@@ -413,6 +420,8 @@ m64p_error netplay_start(const char* host, int port)
     {
         const char *e = getenv("N64_NETPLAY_ROLLBACK");
         l_rb_window = e && *e ? atoi(e) : 0;
+        l_rb_forced = e && *e;
+        l_room_rb = 0;
         if (l_rb_window && l_rb_window < 2) l_rb_window = 2;
         if (l_rb_window > 60) l_rb_window = 60;
         memset(l_hist, 0, sizeof l_hist);
@@ -1231,6 +1240,18 @@ uint8_t netplay_register_player(uint8_t player, uint8_t plugin, uint8_t rawdata,
     while (recv < 2)
         recv += SDLNet_TCP_Recv(l_tcpSocket, &response[recv], 2 - recv);
     l_buffer_target = response[1]; //local buffer size target
+    if (response[0] == 3 && !l_rb_forced)
+    {
+        const char *e = getenv("N64_NETPLAY_RB_CAP");
+        int cap = e && *e ? atoi(e) : 0;
+        if (cap < 0) cap = 0;
+        if (cap && cap < 2) cap = 2;
+        if (cap > 60) cap = 60;
+        char out[2] = { TCP_JOEY_RB_CAP, (char)cap };
+        SDLNet_TCP_Send(l_tcpSocket, out, 2);
+        l_room_rb = 1;
+        log_cb(RETRO_LOG_INFO, "Netplay: told the room this device can guess %d inputs ahead\n", cap);
+    }
     return response[0];
 }
 
@@ -1532,6 +1553,20 @@ void netplay_read_registration(struct controller_input_compat* cin_compats)
             Controls[i].RawData = input_data[curr];
             ++curr;
         }
+    }
+
+    if (l_room_rb)
+    {
+        char ask = TCP_JOEY_RB_MODE;
+        uint8_t w = 0;
+        SDLNet_TCP_Send(l_tcpSocket, &ask, 1);
+        if (SDLNet_TCP_Recv(l_tcpSocket, &w, 1) != 1) w = 0;
+        l_rb_window = w > 60 ? 60 : w;
+        if (l_rb_window == 1) l_rb_window = 2;
+        if (l_rb_window)
+            log_cb(RETRO_LOG_INFO, "Netplay: rollback on, the room's choice: guessing up to %d inputs ahead\n", l_rb_window);
+        else
+            log_cb(RETRO_LOG_INFO, "Netplay: the room's shared input delay, not rollback (a device can't afford it)\n");
     }
 }
 
