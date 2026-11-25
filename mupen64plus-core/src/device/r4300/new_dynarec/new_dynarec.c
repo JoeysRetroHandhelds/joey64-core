@@ -390,6 +390,9 @@ static char *copy;
 static int expirep;
 // N64_DRC_STATS: blocks thrown away (invalidation), whole-cache flushes and expiry steps per window
 static unsigned drc_stat_inv_blocks, drc_stat_inv_all, drc_stat_expire;
+/* Joey64 (2026-11-25): times the code cache's out pointer went back to the start (the block list stops its early
+ * compiles once it has, see new_dynarec_blocklist_tick). Written by whichever thread compiles. */
+static int drc_cache_wraps;
 #if NEW_DYNAREC == NEW_DYNAREC_ARM64
 #define DRC_STAT_RUNS drc_stat_runs
 #define DRC_STAT_INS drc_stat_ins
@@ -3102,6 +3105,12 @@ static int blk_n, blk_on = -1, blk_rr;
 static char blk_path[512];
 static double blk_last_poll, blk_last_save;
 static unsigned blk_loaded, blk_queued, blk_saves;
+/* Joey64 (2026-11-25): early compiles stop for the session once the code cache is half full (or has wrapped). The lists
+ * grow with every play (DK64 16k, MK64 13k blocks after many runs, ~8 KB of code a block = more than the cache), so
+ * compiling all of them pushed the game's own blocks out and early ones were thrown away and done again without end:
+ * MK64 on the RG477M 2.5-3.9 s of compile-thread time per 5 s for the first minute, DK64 on the Odin 3 Portal with the
+ * thread 11-15k blocks compiled in 40 s against 2.3k without the list. N64_DRC_LIST_CAP=0: no stop (dev, A/B). */
+static int blk_full, blk_cap = -1;
 /* The file is written only when the list grew (blk_saved_n: blk_n the file holds), and on a writer thread, so the
  * emulation thread only puts the text together (audit 3 part 6b L2: every 10 s it wrote the whole file inside a frame,
  * changed or not). blk_wr_* belong to the emulation thread except blk_wr_busy (atomic) and blk_wr_ok (read after the
@@ -3150,7 +3159,7 @@ static void blk_init(void)
   blk_hash = (u_int *)calloc(BLK_HASH, sizeof(*blk_hash));
   if (!blk_tab || !blk_hash) { free(blk_tab); free(blk_hash); blk_tab = NULL; blk_hash = NULL; return; }
   snprintf(blk_path, sizeof(blk_path), "%s", e);
-  blk_n = blk_rr = 0; blk_loaded = blk_queued = blk_saves = 0;
+  blk_n = blk_rr = 0; blk_loaded = blk_queued = blk_saves = 0; blk_full = 0;
   FILE *f = fopen(blk_path, "r");
   if (f) {
     u_int a, l, s;
@@ -3253,8 +3262,17 @@ void new_dynarec_blocklist_tick(void)
     if (blk_saved_n != before)
       DebugMessage(M64MSG_INFO, "dynarec: block list: %d blocks known (%u from the file), %u queued early so far", blk_n, blk_loaded, blk_queued);
   }
+  if (blk_cap < 0) { const char *c = getenv("N64_DRC_LIST_CAP"); blk_cap = !(c && !strcmp(c, "0")); }
+  if (!blk_full && blk_cap) {
+    intptr_t used = (intptr_t)__atomic_load_n(&out, __ATOMIC_RELAXED) - (intptr_t)base_addr;
+    if (__atomic_load_n(&drc_cache_wraps, __ATOMIC_RELAXED) > 0 || used > (intptr_t)(1 << TARGET_SIZE_2) / 2) {
+      blk_full = 1;
+      DebugMessage(M64MSG_INFO, "dynarec: block list: code cache half full (%d KB) after %u early compiles; no more early compiles this session",
+        (int)(used >> 10), blk_queued);
+    }
+  }
   int checked, queued = 0;
-  for (checked = 0; checked < 512 && blk_n > 0 && queued < 8 && ((drc_qt - drc_qh) & 4095) < 4; checked++) {
+  for (checked = 0; checked < 512 && blk_n > 0 && !blk_full && queued < 8 && ((drc_qt - drc_qh) & 4095) < 4; checked++) {
     struct blk_ent *b = &blk_tab[blk_rr];
     blk_rr = (blk_rr + 1) % blk_n;
     if (b->done) continue;
@@ -9596,6 +9614,7 @@ void new_dynarec_init(void)
 
   assert(((uintptr_t)g_dev.rdram.dram&7)==0); //8 bytes aligned
   out=(u_char *)base_addr;
+  drc_cache_wraps=0;
 
   g_dev.r4300.new_dynarec_hot_state.pc = &g_dev.r4300.new_dynarec_hot_state.fake_pc;
   g_dev.r4300.new_dynarec_hot_state.fake_pc.f.r.rs = &g_dev.r4300.new_dynarec_hot_state.rs;
@@ -12944,8 +12963,10 @@ static int new_recompile_block_once(int addr)
    * compiled on the compile thread, whose exits all get their own stubs, came to 606 KB for 4096 instructions, so one
    * started just under the old mark would write over the jump table at the end of the cache. Start over 2 MB before
    * the end instead: pass 10 keeps the quarter of the cache (8 MB) ahead of out expired, so the start is free then. */
-  if(out > (u_char *)((u_char *)base_addr+(1<<TARGET_SIZE_2)-DRC_WRAP_MARGIN-JUMP_TABLE_SIZE))
+  if(out > (u_char *)((u_char *)base_addr+(1<<TARGET_SIZE_2)-DRC_WRAP_MARGIN-JUMP_TABLE_SIZE)) {
     out=(u_char *)base_addr;
+    __atomic_add_fetch(&drc_cache_wraps, 1, __ATOMIC_RELAXED);
+  }
 
   // Trap writes to any of the pages we compiled
   for(i=start>>12;i<=(int)((start+slen*4-4)>>12);i++) {
