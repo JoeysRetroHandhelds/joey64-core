@@ -210,6 +210,7 @@ static uint8_t l_rb_read[4], l_rb_sent[4];
 static uint32_t l_rb_frame_keys[4], l_rb_own_last[4];
 static struct { uint32_t guessed, wrong, stalls, waits; } l_rbs;
 static uint32_t l_send_gap_last, l_send_gap_max, l_send_gap_count; // rb22 diagnosis, see netplay_send_input
+static int l_rb_host_holds, l_rb_hold_due; // rb25: the app takes time sync's holds (joey64_netplay_rb_hold)
 //the desync check's CP0 copy waits until every input before it is heard and none was guessed wrong
 static struct { int have; uint32_t vi, counts[4]; int len; uint8_t data[CP0_REGS_COUNT * 4 + 5]; } l_rb_sync;
 static uint32_t l_rb_sync_sent_vi;
@@ -356,8 +357,18 @@ m64p_error netplay_start(const char* host, int port)
         return M64ERR_SYSTEM_FAIL;
     }
     {
-        const int tos_local = CS4 << 2;
-        setsockopt(np_udp, IPPROTO_IP, IP_TOS, &tos_local, sizeof(tos_local));
+        //Joey64 (2026-11-24, rb25/rb26): 0xC0 (CS6), Wi-Fi's voice queue; upstream's CS4 (0x80) is the video queue, in which
+        //the Odin 2 Portal held a joiner's inputs back ~107 ms three times every 1.33 s (room gaps 112-215 ms -> 28-52 ms,
+        //A B A B in MK64). Dev switch N64_NETPLAY_TOS=<byte> picks another (0x80 = upstream's).
+        int tos_local = 0xC0;
+        const char *tos_env = getenv("N64_NETPLAY_TOS");
+        if (tos_env && *tos_env)
+            tos_local = (int)strtol(tos_env, NULL, 0);
+        int tos_ok = setsockopt(np_udp, IPPROTO_IP, IP_TOS, &tos_local, sizeof(tos_local));
+        int tos_got = -1; socklen_t tos_len = sizeof(tos_got);
+        getsockopt(np_udp, IPPROTO_IP, IP_TOS, &tos_got, &tos_len);
+        log_cb(RETRO_LOG_INFO, "Netplay: UDP packets marked 0x%02x (%s, reads back 0x%02x)\n", tos_local,
+               tos_ok == 0 ? "ok" : strerror(errno), tos_got);
     }
     np_tcp = socket(res->ai_family, SOCK_STREAM, 0);
     if (np_tcp < 0 || connect(np_tcp, res->ai_addr, res->ai_addrlen) != 0)
@@ -782,6 +793,16 @@ __attribute__((visibility("default"))) int joey64_netplay_rb_pump(int ms)
     return np_ticks() - l_last_heard < 10000;
 }
 
+/* Joey64 rollback (rb25): asked before each frame; 1 = time sync wants this frame held: the app skips it, playing the
+   last frame's sound again, so the game really falls a frame back (see rb_time_sync) */
+__attribute__((visibility("default"))) int joey64_netplay_rb_hold(void)
+{
+    l_rb_host_holds = 1;
+    const int due = l_rb_hold_due;
+    l_rb_hold_due = 0;
+    return due;
+}
+
 /* Joey64 rollback: the input counts of the oldest state the app keeps, each frame */
 __attribute__((visibility("default"))) void joey64_netplay_rb_floor(const uint32_t *counts)
 {
@@ -920,6 +941,14 @@ static void rb_time_sync(uint8_t p, uint32_t c)
         return;
     l_rb_stall_vi = l_rb_lead_frames;
     ++l_rbs.stalls;
+    //rb25: a host that paces by its sound made the 16 ms wait up in its next frames' audio waits (Odin 3 Portal: 60 fps
+    //while holding 5 times a second, 6 frames ahead all room long). Such a host takes the hold itself: it skips a frame
+    //and plays the last one's sound again (joey64_netplay_rb_hold).
+    if (l_rb_host_holds)
+    {
+        l_rb_hold_due = 1;
+        return;
+    }
     const uint32_t start = np_ticks();
     while (np_ticks() - start < 16)
     {
