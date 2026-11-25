@@ -32,7 +32,7 @@
 #define NEW_DYNAREC_ARM 3
 #define NEW_DYNAREC_ARM64 4
 
-#define NEW_DYNAREC_CACHE_SIZE       (1u << 25)
+#define NEW_DYNAREC_CACHE_SIZE       (1u << 26)
 #define NEW_DYNAREC_CACHE_PAGE_PAD   0x200000u
 
 #define WRITE_PROTECT ((uintptr_t)1<<((sizeof(uintptr_t)<<3)-2))
